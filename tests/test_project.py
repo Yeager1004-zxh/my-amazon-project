@@ -13,6 +13,11 @@ from openpyxl.formatting.rule import CellIsRule
 from openpyxl.styles import Border, Side
 
 from amazon_weekly_report.mcp_client import LingxingMcpClient, McpClientError, redact_sensitive
+from amazon_weekly_report.providers.lingxing_api import (
+    LingxingApiError,
+    LingxingApiNotReady,
+    LingxingOpenApiClient,
+)
 from amazon_weekly_report.report_generation import generate_reports
 from amazon_weekly_report.template_expansion import ensure_day_rows
 from amazon_weekly_report.template_inspection import inspect_template
@@ -358,6 +363,59 @@ class McpClientTests(unittest.TestCase):
 
     def test_secret_fields_are_redacted_for_display(self) -> None:
         self.assertEqual(redact_sensitive({"X-Mcp-Key": "private", "data": "ok"}), {"X-Mcp-Key": "[已隐藏]", "data": "ok"})
+
+
+class LingxingOpenApiTests(unittest.TestCase):
+    def test_token_exchange_uses_multipart_and_hides_token(self) -> None:
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(
+                200,
+                json={"code": 0, "data": {"access_token": "fixture-token-do-not-display", "expires_in": 3600}},
+            )
+
+        http = httpx.Client(transport=httpx.MockTransport(handler))
+        with LingxingOpenApiClient("fixture-app-id", "fixture-app-secret", http_client=http) as client:
+            result = client.request_access_token()
+        request = requests[0]
+        self.assertEqual(request.url.path, "/api/auth-server/oauth/access-token")
+        self.assertIn("multipart/form-data; boundary=", request.headers["Content-Type"])
+        body = request.content.decode("utf-8")
+        self.assertIn('name="appId"', body)
+        self.assertIn("fixture-app-id", body)
+        self.assertIn('name="appSecret"', body)
+        self.assertIn("fixture-app-secret", body)
+        self.assertEqual(result.expires_in_seconds, 3600)
+        self.assertNotIn("fixture-token-do-not-display", repr(result))
+        self.assertNotIn("fixture-token-do-not-display", result.safe_status())
+        http.close()
+
+    def test_signed_queries_fail_closed_without_sending_request(self) -> None:
+        requests: list[httpx.Request] = []
+        http = httpx.Client(transport=httpx.MockTransport(lambda request: requests.append(request) or httpx.Response(200)))
+        with LingxingOpenApiClient("fixture-app-id", "fixture-app-secret", http_client=http) as client:
+            with self.assertRaises(LingxingApiNotReady):
+                client.list_sellers("fixture-token")
+            with self.assertRaises(LingxingApiNotReady):
+                client.query_sku_sales(
+                    access_token="fixture-token",
+                    seller_id="fixture-seller",
+                    sku="ex3106",
+                    start_date="2026-08-01",
+                    end_date="2026-08-10",
+                )
+        self.assertEqual(requests, [])
+        http.close()
+
+    def test_token_http_error_does_not_echo_credentials(self) -> None:
+        http = httpx.Client(transport=httpx.MockTransport(lambda _request: httpx.Response(403, text="fixture-app-secret")))
+        with LingxingOpenApiClient("fixture-app-id", "fixture-app-secret", http_client=http) as client:
+            with self.assertRaises(LingxingApiError) as raised:
+                client.request_access_token()
+        self.assertNotIn("fixture-app-secret", str(raised.exception))
+        http.close()
 
 
 if __name__ == "__main__":

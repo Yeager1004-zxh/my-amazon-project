@@ -21,11 +21,12 @@ class WindowsCredentialStore:
 
     service_name = "my-amazon-project.lingxing-mcp"
 
-    def __init__(self) -> None:
+    def __init__(self, service_name: str | None = None) -> None:
         if os.name != "nt":
             raise CredentialStoreError(
                 "领星凭证只在 Windows Credential Manager 中保存；请在 Windows 10/11 上配置。"
             )
+        self._service_name = service_name or type(self).service_name
         try:
             import keyring
             from keyring.backends.Windows import WinVaultKeyring
@@ -38,22 +39,28 @@ class WindowsCredentialStore:
 
     def get(self, account: str) -> str | None:
         try:
-            return self._keyring.get_password(self.service_name, account)
+            return self._keyring.get_password(self._service_name, account)
         except Exception as exc:
             raise CredentialStoreError("从 Windows Credential Manager 读取凭证失败。") from exc
 
     def set(self, account: str, secret: str) -> None:
         if not secret or "\r" in secret or "\n" in secret:
-            raise CredentialStoreError("MCP 凭证为空或包含非法换行。")
+            raise CredentialStoreError("领星凭证为空或包含非法换行。")
         try:
-            self._keyring.set_password(self.service_name, account, secret)
+            self._keyring.set_password(self._service_name, account, secret)
         except Exception as exc:
             raise CredentialStoreError("写入 Windows Credential Manager 失败。") from exc
 
     def delete(self, account: str) -> None:
         try:
-            self._keyring.delete_password(self.service_name, account)
+            self._keyring.delete_password(self._service_name, account)
         except self._keyring.errors.PasswordDeleteError:
             return
         except Exception as exc:
             raise CredentialStoreError("从 Windows Credential Manager 删除凭证失败。") from exc
+
+
+class LingxingOpenApiCredentialStore(WindowsCredentialStore):
+    """Keep OpenAPI credentials separate from the existing MCP credential pair."""
+
+    service_name = "my-amazon-project.lingxing-openapi"

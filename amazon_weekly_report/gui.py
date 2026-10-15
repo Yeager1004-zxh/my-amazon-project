@@ -9,9 +9,14 @@ from tkinter import filedialog, messagebox, ttk
 import tkinter as tk
 from typing import Any
 
-from .credential_store import CredentialStoreError, WindowsCredentialStore
+from .credential_store import (
+    CredentialStoreError,
+    LingxingOpenApiCredentialStore,
+    WindowsCredentialStore,
+)
 from .local_settings import LocalSettingsError, load_settings, save_settings, validate_mcp_endpoint
 from .mcp_client import LingxingMcpClient, McpClientError, McpTool, redact_sensitive
+from .providers.lingxing_api import LingxingOpenApiClient
 from .report_generation import ReportGenerationError, generate_reports
 
 
@@ -33,10 +38,13 @@ class WeeklyReportApp(tk.Tk):
         notebook.pack(fill="both", expand=True, padx=10, pady=10)
         report_tab = ttk.Frame(notebook, padding=12)
         mcp_tab = ttk.Frame(notebook, padding=12)
+        openapi_tab = ttk.Frame(notebook, padding=12)
         notebook.add(report_tab, text="生成周报")
         notebook.add(mcp_tab, text="领星 MCP 连接")
+        notebook.add(openapi_tab, text="领星 OpenAPI 连接")
         self._build_report_tab(report_tab)
         self._build_mcp_tab(mcp_tab)
+        self._build_openapi_tab(openapi_tab)
 
     def _path_row(self, parent: ttk.Frame, row: int, label: str, variable: tk.StringVar, *, directory: bool = False) -> None:
         ttk.Label(parent, text=label, width=20).grid(row=row, column=0, sticky="w", pady=5)
@@ -128,6 +136,114 @@ class WeeklyReportApp(tk.Tk):
             wraplength=880,
         ).grid(row=9, column=0, columnspan=4, sticky="w", pady=6)
 
+    def _build_openapi_tab(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(1, weight=1)
+        parent.rowconfigure(9, weight=1)
+        self.openapi_app_id_var = tk.StringVar()
+        self.openapi_app_secret_var = tk.StringVar()
+        self.openapi_sku_var = tk.StringVar()
+        self.openapi_start_var = tk.StringVar()
+        self.openapi_end_var = tk.StringVar()
+
+        ttk.Label(parent, text="AppID", width=22).grid(row=0, column=0, sticky="w", pady=5)
+        ttk.Entry(parent, textvariable=self.openapi_app_id_var).grid(row=0, column=1, columnspan=2, sticky="ew", padx=6, pady=5)
+        ttk.Label(parent, text="AppSecret", width=22).grid(row=1, column=0, sticky="w", pady=5)
+        ttk.Entry(parent, textvariable=self.openapi_app_secret_var, show="*").grid(row=1, column=1, columnspan=2, sticky="ew", padx=6, pady=5)
+        ttk.Button(parent, text="安全保存凭证", command=self._save_openapi_credentials).grid(row=1, column=3, padx=4, pady=5)
+
+        actions = ttk.Frame(parent)
+        actions.grid(row=2, column=0, columnspan=4, sticky="ew", pady=8)
+        ttk.Button(actions, text="测试 API 身份验证", command=self._test_openapi_auth).pack(side="left")
+        ttk.Button(actions, text="获取店铺列表", command=self._openapi_seller_list).pack(side="left", padx=8)
+
+        ttk.Label(parent, text="店铺名称 / SID / 站点 / 广告授权状态").grid(row=3, column=0, columnspan=4, sticky="w", pady=(6, 2))
+        self.openapi_seller_tree = ttk.Treeview(
+            parent,
+            columns=("seller_name", "sid", "site", "ad_auth"),
+            show="headings",
+            height=3,
+        )
+        for column, heading, width in (
+            ("seller_name", "店铺名称", 260),
+            ("sid", "SID", 150),
+            ("site", "站点", 160),
+            ("ad_auth", "广告授权", 180),
+        ):
+            self.openapi_seller_tree.heading(column, text=heading)
+            self.openapi_seller_tree.column(column, width=width, anchor="w")
+        self.openapi_seller_tree.grid(row=4, column=0, columnspan=4, sticky="ew", pady=4)
+        ttk.Label(parent, text="SKU", width=22).grid(row=5, column=0, sticky="w", pady=5)
+        ttk.Entry(parent, textvariable=self.openapi_sku_var).grid(row=5, column=1, sticky="ew", padx=6, pady=5)
+        ttk.Label(parent, text="开始日期 (YYYY-MM-DD)").grid(row=5, column=2, sticky="e", padx=4)
+        ttk.Entry(parent, textvariable=self.openapi_start_var, width=14).grid(row=5, column=3, sticky="ew", padx=6, pady=5)
+        ttk.Label(parent, text="结束日期 (YYYY-MM-DD)").grid(row=6, column=2, sticky="e", padx=4)
+        ttk.Entry(parent, textvariable=self.openapi_end_var, width=14).grid(row=6, column=3, sticky="ew", padx=6, pady=5)
+        ttk.Button(parent, text="测试 SKU 数据", command=self._openapi_sku_query).grid(row=6, column=1, sticky="w", padx=6, pady=5)
+
+        self.openapi_status = tk.StringVar(value="OpenAPI 地址固定为官方域名；密钥仅保存在 Windows Credential Manager。")
+        ttk.Label(parent, textvariable=self.openapi_status, wraplength=900).grid(row=7, column=0, columnspan=4, sticky="w", pady=6)
+        ttk.Label(parent, text="结果 / 说明（不显示 Token，不写入日志）").grid(row=8, column=0, columnspan=4, sticky="w", pady=(8, 2))
+        self.openapi_output = tk.Text(parent, height=14, wrap="word", state="disabled")
+        self.openapi_output.grid(row=9, column=0, columnspan=4, sticky="nsew", pady=4)
+        ttk.Label(
+            parent,
+            text="目前仅启用 Token 身份验证测试。店铺列表和 SKU 查询依赖 app_key/timestamp/sign 规则及官方字段定义；在文档核实前，按钮不会发送查询请求。广告接口未接入。",
+            wraplength=900,
+        ).grid(row=10, column=0, columnspan=4, sticky="w", pady=6)
+
+    def _save_openapi_credentials(self) -> None:
+        app_id = self.openapi_app_id_var.get().strip()
+        app_secret = self.openapi_app_secret_var.get()
+        if not app_id or not app_secret:
+            messagebox.showwarning("缺少凭证", "请填写 AppID 和 AppSecret。")
+            return
+        try:
+            store = LingxingOpenApiCredentialStore()
+            store.set("AppID", app_id)
+            store.set("AppSecret", app_secret)
+        except CredentialStoreError as exc:
+            messagebox.showerror("保存失败", str(exc))
+            return
+        self.openapi_app_id_var.set("")
+        self.openapi_app_secret_var.set("")
+        self.openapi_status.set("AppID 与 AppSecret 已保存到 Windows Credential Manager。")
+
+    def _openapi_credentials(self) -> tuple[str, str]:
+        store = LingxingOpenApiCredentialStore()
+        app_id = store.get("AppID")
+        app_secret = store.get("AppSecret")
+        if not app_id or not app_secret:
+            raise CredentialStoreError("Windows Credential Manager 中没有 OpenAPI 凭证，请先安全保存。")
+        return app_id, app_secret
+
+    def _test_openapi_auth(self) -> None:
+        try:
+            app_id, app_secret = self._openapi_credentials()
+        except CredentialStoreError as exc:
+            messagebox.showerror("OpenAPI 配置错误", str(exc))
+            return
+
+        def authenticate() -> dict[str, str]:
+            with LingxingOpenApiClient(app_id, app_secret) as client:
+                token_result = client.request_access_token()
+            return {"message": token_result.safe_status()}
+
+        self._start_task(authenticate, self.openapi_status, "API 身份验证完成。")
+
+    def _openapi_seller_list(self) -> None:
+        self.openapi_status.set("未发送查询：官方 app_key/timestamp/sign 签名规则尚待核验。")
+        self._show_openapi_result(self.openapi_status.get())
+
+    def _openapi_sku_query(self) -> None:
+        self.openapi_status.set("未发送查询：销售接口路径、参数和字段尚待依据官方文档核验。")
+        self._show_openapi_result(self.openapi_status.get())
+
+    def _show_openapi_result(self, content: str) -> None:
+        self.openapi_output.configure(state="normal")
+        self.openapi_output.delete("1.0", "end")
+        self.openapi_output.insert("1.0", content)
+        self.openapi_output.configure(state="disabled")
+
     def _load_mcp_settings(self) -> None:
         try:
             settings = load_settings()
@@ -186,6 +302,9 @@ class WeeklyReportApp(tk.Tk):
                             if result["_tool_names"]:
                                 self.tool_combo.current(0)
                         self._show_mcp_result(result)
+                    elif status_var is self.openapi_status and isinstance(result, dict):
+                        status_var.set(result.get("message", title))
+                        self._show_openapi_result(status_var.get())
                     elif isinstance(result, dict):
                         status_var.set(result.get("message", title))
                         if result.get("output"):

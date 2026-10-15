@@ -17,6 +17,7 @@ if not exist ".venv\Scripts\python.exe" (
 ".venv\Scripts\python.exe" -m pip install --disable-pip-version-check -r requirements.txt
 if errorlevel 1 goto :error
 
+echo Starting the weekly report, MCP, and OpenAPI test interface...
 ".venv\Scripts\python.exe" -m amazon_weekly_report gui
 if errorlevel 1 goto :error
 exit /b 0

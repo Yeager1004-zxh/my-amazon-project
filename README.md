@@ -51,6 +51,12 @@ py -3.12 -m venv .venv
 
 当前没有已授权的官方地址、密钥或真实工具结果，因此 Codex 云端无法替你完成在线登录或 ex3106 业务验证。MCP 页面用于本机握手、列工具和人工发起只读查询；将领星工具结果稳定映射到日报字段，需要先用你的授权服务确认工具名称、参数和返回字段。完成这项实测前，周报生成器使用下述 Excel/CSV 导入流程，不声称 MCP 已自动提供销量或活动实际花费。
 
+## 领星 OpenAPI 本机测试
+
+OpenAPI 使用固定官方域名 `https://openapi.lingxing.com`。目前已实现 Token 请求：`POST /api/auth-server/oauth/access-token`，以 multipart/form-data 发送 `appId` 和 `appSecret`。在“领星 OpenAPI 连接”页分别填写两项凭证并点击“安全保存凭证”；凭证保存在 Windows Credential Manager 的 `my-amazon-project.lingxing-openapi` 服务项中，不写入配置文件、命令行或日志。之后点击“测试 API 身份验证”，界面只显示成功状态和响应中可识别的有效期，不显示 Access Token。
+
+店铺列表接口 `GET /erp/sc/data/seller/lists` 需要官方定义的 `access_token`、`app_key`、`timestamp`、`sign` 参数。签名规则、店铺响应字段和销售查询接口尚未完成官方文档核验，因此“获取店铺列表”和“测试 SKU 数据”当前会提示未发送请求，不会猜签名、读取模拟数据或把结果写入正式周报。广告接口也未接入。完整身份验证和数据查询仍需在 Windows 本机用你的授权凭证测试；不要将 AppID、AppSecret 或 Token 发到聊天或 GitHub。
+
 ## 配置 Excel/CSV 字段映射
 
 复制 `config/mapping.example.json` 到 `config/mapping.local.json`。本地映射文件已加入 `.gitignore`。根据领星真实导出文件填写：
