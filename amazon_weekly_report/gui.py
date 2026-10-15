@@ -15,7 +15,18 @@ from .credential_store import (
     WindowsCredentialStore,
 )
 from .local_settings import LocalSettingsError, load_settings, save_settings, validate_mcp_endpoint
-from .mcp_client import LingxingMcpClient, McpClientError, McpTool, redact_sensitive
+from .mcp_client import (
+    BusinessTool,
+    LingxingMcpClient,
+    McpClientError,
+    McpTool,
+    VerifiedReadOnlyGrant,
+    extract_business_tools,
+    is_action_wrapper_tool,
+    is_directory_search_tool,
+    is_read_only_query_candidate,
+    redact_sensitive,
+)
 from .providers.lingxing_api import LingxingOpenApiClient
 from .report_generation import ReportGenerationError, generate_reports
 
@@ -24,11 +35,14 @@ class WeeklyReportApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("亚马逊新品推广周报工具")
-        self.geometry("980x760")
-        self.minsize(850, 640)
+        self.geometry("1100x960")
+        self.minsize(920, 760)
         self._events: queue.Queue[tuple[str, Any]] = queue.Queue()
         self._busy = False
         self._tools: list[McpTool] = []
+        self._business_tools: list[BusinessTool] = []
+        self._verified_query_grants: dict[str, VerifiedReadOnlyGrant] = {}
+        self._viewed_business_fingerprints: set[str] = set()
         self._build_ui()
         self._load_mcp_settings()
         self.after(150, self._poll_events)
@@ -104,7 +118,7 @@ class WeeklyReportApp(tk.Tk):
 
     def _build_mcp_tab(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(1, weight=1)
-        parent.rowconfigure(8, weight=1)
+        parent.rowconfigure(13, weight=1)
         self.endpoint_var = tk.StringVar()
         self.mcp_key_var = tk.StringVar()
         self.tool_var = tk.StringVar()
@@ -119,22 +133,43 @@ class WeeklyReportApp(tk.Tk):
         ttk.Button(action_row, text="获取工具列表", command=self._refresh_tools).pack(side="left", padx=8)
         self.mcp_status = tk.StringVar(value="尚未连接。地址需从领星官方说明取得。")
         ttk.Label(parent, textvariable=self.mcp_status, wraplength=880).grid(row=3, column=0, columnspan=4, sticky="w", pady=4)
-        ttk.Label(parent, text="只读工具", width=25).grid(row=4, column=0, sticky="w", pady=5)
+        ttk.Label(parent, text="MCP 工具", width=25).grid(row=4, column=0, sticky="w", pady=5)
         self.tool_combo = ttk.Combobox(parent, textvariable=self.tool_var, state="readonly")
-        self.tool_combo.grid(row=4, column=1, columnspan=3, sticky="ew", padx=6, pady=5)
-        ttk.Label(parent, text="查询参数 JSON", width=25).grid(row=5, column=0, sticky="nw", pady=5)
-        self.arguments_text = tk.Text(parent, height=5, wrap="none")
+        self.tool_combo.grid(row=4, column=1, columnspan=2, sticky="ew", padx=6, pady=5)
+        ttk.Button(parent, text="查看工具参数", command=self._show_selected_mcp_tool).grid(row=4, column=3, sticky="w", padx=6, pady=5)
+        ttk.Label(parent, text="基础工具参数 JSON", width=25).grid(row=5, column=0, sticky="nw", pady=4)
+        self.arguments_text = tk.Text(parent, height=2, wrap="none")
         self.arguments_text.insert("1.0", "{}")
-        self.arguments_text.grid(row=5, column=1, columnspan=3, sticky="ew", padx=6, pady=5)
-        ttk.Button(parent, text="运行只读查询测试", command=self._query_tool).grid(row=6, column=1, sticky="w", padx=6, pady=6)
-        ttk.Label(parent, text="查询结果（仅显示，不写入日志或文件）").grid(row=7, column=0, columnspan=4, sticky="w", pady=(8, 2))
+        self.arguments_text.grid(row=5, column=1, columnspan=3, sticky="ew", padx=6, pady=4)
+        ttk.Button(parent, text="运行 readOnlyHint=true 基础只读工具", command=self._query_tool).grid(row=6, column=1, sticky="w", padx=6, pady=4)
+
+        ttk.Label(parent, text="search 参数 JSON", width=25).grid(row=7, column=0, sticky="nw", pady=4)
+        self.search_arguments_text = tk.Text(parent, height=2, wrap="none")
+        self.search_arguments_text.insert("1.0", "{}")
+        self.search_arguments_text.grid(row=7, column=1, columnspan=3, sticky="ew", padx=6, pady=4)
+        ttk.Button(parent, text="搜索业务工具", command=self._search_business_tools).grid(row=8, column=1, sticky="w", padx=6, pady=4)
+
+        ttk.Label(parent, text="search 返回的业务工具", width=25).grid(row=9, column=0, sticky="w", pady=4)
+        self.business_tool_var = tk.StringVar()
+        self.business_tool_combo = ttk.Combobox(parent, textvariable=self.business_tool_var, state="readonly")
+        self.business_tool_combo.grid(row=9, column=1, sticky="ew", padx=6, pady=4)
+        business_actions = ttk.Frame(parent)
+        business_actions.grid(row=9, column=2, columnspan=2, sticky="w", padx=6, pady=4)
+        ttk.Button(business_actions, text="查看工具参数", command=self._show_selected_business_tool).pack(side="left")
+        ttk.Button(business_actions, text="核验本次只读范围", command=self._verify_selected_business_tool).pack(side="left", padx=6)
+        ttk.Label(parent, text="业务查询参数 JSON", width=25).grid(row=10, column=0, sticky="nw", pady=4)
+        self.business_arguments_text = tk.Text(parent, height=3, wrap="none")
+        self.business_arguments_text.insert("1.0", "{}")
+        self.business_arguments_text.grid(row=10, column=1, columnspan=3, sticky="ew", padx=6, pady=4)
+        ttk.Button(parent, text="执行已验证的只读查询", command=self._execute_business_query).grid(row=11, column=1, sticky="w", padx=6, pady=4)
+        ttk.Label(parent, text="MCP 结果（仅显示在本机，不写入日志或文件）").grid(row=12, column=0, columnspan=4, sticky="w", pady=(6, 2))
         self.mcp_output = tk.Text(parent, height=14, wrap="word", state="disabled")
-        self.mcp_output.grid(row=8, column=0, columnspan=4, sticky="nsew", pady=4)
+        self.mcp_output.grid(row=13, column=0, columnspan=4, sticky="nsew", pady=4)
         ttk.Label(
             parent,
-            text="密钥只写入 Windows Credential Manager；配置文件只存服务地址。工具必须被 MCP 标记 readOnlyHint=true 才允许调用。",
+            text="search 仅在工具说明明确表示它只发现业务工具/Schema 时用于目录搜索。action 只接受本次会话中已核验、ID 与 Schema 指纹完全匹配的只读查询；不符合规则的工具会被阻止。",
             wraplength=880,
-        ).grid(row=9, column=0, columnspan=4, sticky="w", pady=6)
+        ).grid(row=14, column=0, columnspan=4, sticky="w", pady=6)
 
     def _build_openapi_tab(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(1, weight=1)
@@ -297,6 +332,18 @@ class WeeklyReportApp(tk.Tk):
                     status_var, title, result = payload
                     status_var.set(title)
                     if status_var is self.mcp_status:
+                        if isinstance(result, dict) and result.get("_tools") is not None:
+                            self._tools = result["_tools"]
+                        if isinstance(result, dict) and result.get("_business_tools") is not None:
+                            self._business_tools = result["_business_tools"]
+                            self.business_tool_combo.configure(
+                                values=tuple(
+                                    f"{tool.tool_id} — {tool.name} — {tool.description[:100]}"
+                                    for tool in self._business_tools
+                                )
+                            )
+                            if self._business_tools:
+                                self.business_tool_combo.current(0)
                         if isinstance(result, dict) and result.get("_tool_names") is not None:
                             self.tool_combo.configure(values=result["_tool_names"])
                             if result["_tool_names"]:
@@ -344,6 +391,9 @@ class WeeklyReportApp(tk.Tk):
         *,
         tool_name: str | None = None,
         arguments: dict[str, Any] | None = None,
+        search_arguments: dict[str, Any] | None = None,
+        business_tool: BusinessTool | None = None,
+        grant: VerifiedReadOnlyGrant | None = None,
     ):
         client = LingxingMcpClient(endpoint, key)
         try:
@@ -351,17 +401,50 @@ class WeeklyReportApp(tk.Tk):
             if action == "connect":
                 return {"_status": f"连接成功；协议版本 {init.get('protocolVersion')}。", "_output_text": "MCP 初始化握手成功。"}
             tools = client.list_tools()
-            self._tools = tools
             if action == "tools":
                 display = [
-                    {"name": tool.name, "read_only": tool.read_only, "description": tool.description, "input_schema": tool.input_schema}
+                    {"name": tool.name, "description": tool.description, "annotations": tool.annotations, "inputSchema": tool.input_schema}
                     for tool in tools
                 ]
-                read_only_names = tuple(f"{tool.name} — {tool.description[:100]}" for tool in tools if tool.read_only)
+                tool_names = tuple(
+                    f"{tool.name} [{self._tool_annotation_label(tool)}] — {tool.description[:80]}"
+                    for tool in tools
+                )
+                safe_search_count = sum(is_directory_search_tool(tool) for tool in tools)
+                read_only_count = sum(tool.read_only for tool in tools)
                 return {
-                    "_status": f"已获取 {len(tools)} 个工具；只读工具 {sum(tool.read_only for tool in tools)} 个。",
+                    "_status": f"已获取 {len(tools)} 个工具；readOnlyHint=true {read_only_count} 个；安全目录发现工具 {safe_search_count} 个。",
                     "_output_text": json.dumps(display, ensure_ascii=False, indent=2),
-                    "_tool_names": read_only_names,
+                    "_tool_names": tool_names,
+                    "_tools": tools,
+                }
+            if action == "search_business_tools":
+                search_tool = next((tool for tool in tools if tool.name.casefold() == "search"), None)
+                if search_tool is None:
+                    raise McpClientError("工具列表中没有名为 search 的发现工具。")
+                result = client.call_directory_search(search_tool, search_arguments or {})
+                business_tools = extract_business_tools(result)
+                return {
+                    "_status": f"search 已返回结果；解析出 {len(business_tools)} 个带 Schema 的业务工具。未解析的内容可在结果区查看。",
+                    "_output_text": json.dumps(result, ensure_ascii=False, indent=2, default=str),
+                    "_business_tools": business_tools,
+                }
+            if action == "business_query":
+                if business_tool is None or grant is None:
+                    raise McpClientError("缺少本次会话核验的业务工具许可，已阻止 action 调用。")
+                search_tool = next((tool for tool in tools if tool.name.casefold() == "search"), None)
+                action_tool = next((tool for tool in tools if is_action_wrapper_tool(tool)), None)
+                if search_tool is None or action_tool is None:
+                    raise McpClientError("工具列表缺少 search 或 action，已阻止查询。")
+                fresh_result = client.call_directory_search(search_tool, search_arguments or {})
+                fresh_tools = extract_business_tools(fresh_result)
+                fresh_spec = next((item for item in fresh_tools if item.tool_id == business_tool.tool_id), None)
+                if fresh_spec is None or fresh_spec.permission_fingerprint != business_tool.permission_fingerprint:
+                    raise McpClientError("search 返回的业务工具 ID/Schema 已变化，旧许可失效；请重新搜索并核验。")
+                result = client.call_verified_business_query(action_tool, fresh_spec, arguments or {}, grant)
+                return {
+                    "_status": f"已执行已核验的只读查询：{fresh_spec.tool_id}。结果仅显示在本机。",
+                    "_output_text": json.dumps(result, ensure_ascii=False, indent=2, default=str),
                 }
             selected = next((tool for tool in tools if tool.name == tool_name), None)
             if selected is None:
@@ -371,14 +454,41 @@ class WeeklyReportApp(tk.Tk):
         finally:
             client.close()
 
-    def _start_mcp_action(self, action: str, *, tool_name: str | None = None, arguments: dict[str, Any] | None = None) -> None:
+    @staticmethod
+    def _tool_annotation_label(tool: McpTool) -> str:
+        value = tool.annotations.get("readOnlyHint")
+        if value is True:
+            return "readOnlyHint=true"
+        if value is False:
+            return "readOnlyHint=false"
+        return "未提供 readOnlyHint"
+
+    def _start_mcp_action(
+        self,
+        action: str,
+        *,
+        tool_name: str | None = None,
+        arguments: dict[str, Any] | None = None,
+        search_arguments: dict[str, Any] | None = None,
+        business_tool: BusinessTool | None = None,
+        grant: VerifiedReadOnlyGrant | None = None,
+    ) -> None:
         try:
             endpoint, key = self._credentials()
         except (CredentialStoreError, LocalSettingsError) as exc:
             messagebox.showerror("MCP 配置错误", str(exc))
             return
         self._start_task(
-            lambda: self._run_mcp(endpoint, key, action, tool_name=tool_name, arguments=arguments),
+            lambda: self._run_mcp(
+                endpoint,
+                key,
+                action,
+                tool_name=tool_name,
+                arguments=arguments,
+                search_arguments=search_arguments,
+                business_tool=business_tool,
+                grant=grant,
+            ),
             self.mcp_status,
             "MCP 操作完成。",
         )
@@ -390,9 +500,13 @@ class WeeklyReportApp(tk.Tk):
         self._start_mcp_action("tools")
 
     def _query_tool(self) -> None:
-        selected = self.tool_var.get().split(" — ", 1)[0].strip()
-        if not selected:
-            messagebox.showwarning("请选择工具", "请先获取工具列表并选择标记为只读的工具。")
+        index = self.tool_combo.current()
+        if index < 0 or index >= len(self._tools):
+            messagebox.showwarning("请选择工具", "请先获取工具列表并选择工具。")
+            return
+        tool = self._tools[index]
+        if not tool.read_only:
+            messagebox.showwarning("工具未标记只读", "基础工具调用仍要求服务端明确标记 readOnlyHint=true。业务 action 请先使用搜索并核验流程。")
             return
         try:
             args = json.loads(self.arguments_text.get("1.0", "end").strip() or "{}")
@@ -402,7 +516,102 @@ class WeeklyReportApp(tk.Tk):
         if not isinstance(args, dict):
             messagebox.showerror("参数格式错误", "查询参数必须是 JSON 对象。")
             return
-        self._start_mcp_action("query", tool_name=selected, arguments=args)
+        self._start_mcp_action("query", tool_name=tool.name, arguments=args)
+
+    def _show_selected_mcp_tool(self) -> None:
+        index = self.tool_combo.current()
+        if index < 0 or index >= len(self._tools):
+            messagebox.showwarning("请选择工具", "请先获取工具列表。")
+            return
+        tool = self._tools[index]
+        self._show_json_window(
+            f"MCP 工具：{tool.name}",
+            {"name": tool.name, "description": tool.description, "annotations": tool.annotations, "inputSchema": tool.input_schema},
+        )
+
+    def _selected_business_tool(self) -> BusinessTool | None:
+        index = self.business_tool_combo.current()
+        if index < 0 or index >= len(self._business_tools):
+            return None
+        return self._business_tools[index]
+
+    def _show_selected_business_tool(self) -> None:
+        tool = self._selected_business_tool()
+        if tool is None:
+            messagebox.showwarning("请选择业务工具", "请先点击“搜索业务工具”并选择一项结果。")
+            return
+        self._viewed_business_fingerprints.add(tool.permission_fingerprint)
+        self._show_json_window(
+            f"业务工具参数：{tool.tool_id}",
+            {"id": tool.tool_id, "name": tool.name, "description": tool.description, "inputSchema": tool.input_schema},
+        )
+
+    def _verify_selected_business_tool(self) -> None:
+        tool = self._selected_business_tool()
+        if tool is None:
+            messagebox.showwarning("请选择业务工具", "请先搜索并选择一项业务工具。")
+            return
+        if tool.permission_fingerprint not in self._viewed_business_fingerprints:
+            messagebox.showwarning("请先查看 Schema", "请先打开并检查当前业务工具的名称、说明和完整参数 Schema，再登记只读范围。")
+            return
+        if not is_read_only_query_candidate(tool):
+            messagebox.showwarning("不能核验为只读", "该工具缺少明确查询描述，或 ID/描述包含写入操作，系统不会为它创建只读许可。")
+            return
+        approved = messagebox.askyesno(
+            "核验只读权限",
+            f"请先根据领星官方说明确认这项业务工具只读取数据，不创建、修改或删除数据。\n\n"
+            f"ID：{tool.tool_id}\n名称：{tool.name}\n描述：{tool.description}\nSchema 指纹：{tool.permission_fingerprint[:16]}…\n\n"
+            "许可仅在本次程序会话有效，并绑定当前 ID、说明和 Schema。确认后才允许通过 action 执行。",
+        )
+        if approved:
+            self._verified_query_grants[tool.tool_id] = VerifiedReadOnlyGrant(tool.tool_id, tool.permission_fingerprint)
+            self.mcp_status.set(f"已在本次会话核验只读范围：{tool.tool_id}。工具 Schema 变化后许可自动失效。")
+
+    def _search_business_tools(self) -> None:
+        try:
+            args = json.loads(self.search_arguments_text.get("1.0", "end").strip() or "{}")
+        except json.JSONDecodeError as exc:
+            messagebox.showerror("search 参数格式错误", f"JSON 第 {exc.lineno} 行：{exc.msg}")
+            return
+        if not isinstance(args, dict):
+            messagebox.showerror("search 参数格式错误", "search 参数必须是 JSON 对象。")
+            return
+        self._start_mcp_action("search_business_tools", search_arguments=args)
+
+    def _execute_business_query(self) -> None:
+        tool = self._selected_business_tool()
+        if tool is None:
+            messagebox.showwarning("请选择业务工具", "请先搜索并选择一项业务工具。")
+            return
+        grant = self._verified_query_grants.get(tool.tool_id)
+        if grant is None or grant.permission_fingerprint != tool.permission_fingerprint:
+            messagebox.showwarning("只读范围未核验", "请先查看参数并点击“核验本次只读范围”；没有许可时 action 调用会被阻止。")
+            return
+        try:
+            search_args = json.loads(self.search_arguments_text.get("1.0", "end").strip() or "{}")
+            args = json.loads(self.business_arguments_text.get("1.0", "end").strip() or "{}")
+        except json.JSONDecodeError as exc:
+            messagebox.showerror("参数格式错误", f"JSON 第 {exc.lineno} 行：{exc.msg}")
+            return
+        if not isinstance(search_args, dict) or not isinstance(args, dict):
+            messagebox.showerror("参数格式错误", "search 和业务查询参数都必须是 JSON 对象。")
+            return
+        self._start_mcp_action(
+            "business_query",
+            search_arguments=search_args,
+            business_tool=tool,
+            arguments=args,
+            grant=grant,
+        )
+
+    def _show_json_window(self, title: str, value: Any) -> None:
+        window = tk.Toplevel(self)
+        window.title(title)
+        window.geometry("760x600")
+        content = tk.Text(window, wrap="none")
+        content.pack(fill="both", expand=True, padx=8, pady=8)
+        content.insert("1.0", json.dumps(redact_sensitive(value), ensure_ascii=False, indent=2, default=str))
+        content.configure(state="disabled")
 
     def _parse_launch_dates(self) -> dict[str, date]:
         result: dict[str, date] = {}

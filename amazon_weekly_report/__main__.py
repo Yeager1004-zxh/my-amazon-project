@@ -133,9 +133,13 @@ def _mcp_command(command: str, tool_name: str | None = None, arguments: str = "{
             tools = client.list_tools()
             if command == "mcp-tools":
                 for tool in tools:
-                    marker = "只读" if tool.read_only else "未标为只读"
-                    print(f"{tool.name} [{marker}] — {tool.description}")
-                print(f"共 {len(tools)} 个工具，其中明确标记只读 {sum(tool.read_only for tool in tools)} 个。")
+                    marker = "readOnlyHint=true" if tool.read_only else f"readOnlyHint={tool.annotations.get('readOnlyHint', '未提供')}"
+                    print(f"\n{tool.name} [{marker}] — {tool.description}")
+                    print("annotations:")
+                    print(json.dumps(tool.annotations, ensure_ascii=False, indent=2))
+                    print("inputSchema:")
+                    print(json.dumps(tool.input_schema, ensure_ascii=False, indent=2))
+                print(f"\n共 {len(tools)} 个 MCP 工具；基础只读标记 {sum(tool.read_only for tool in tools)} 个。")
                 return 0
             selected = next((tool for tool in tools if tool.name == tool_name), None)
             if selected is None:

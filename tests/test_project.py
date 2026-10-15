@@ -12,7 +12,17 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.formatting.rule import CellIsRule
 from openpyxl.styles import Border, Side
 
-from amazon_weekly_report.mcp_client import LingxingMcpClient, McpClientError, redact_sensitive
+from amazon_weekly_report.mcp_client import (
+    BusinessTool,
+    LingxingMcpClient,
+    McpClientError,
+    McpTool,
+    VerifiedReadOnlyGrant,
+    extract_business_tools,
+    is_directory_search_tool,
+    is_read_only_query_candidate,
+    redact_sensitive,
+)
 from amazon_weekly_report.providers.lingxing_api import (
     LingxingApiError,
     LingxingApiNotReady,
@@ -338,6 +348,8 @@ class McpClientTests(unittest.TestCase):
         tools = client.list_tools()
         self.assertEqual([tool.name for tool in tools], ["read_report", "write_report"])
         self.assertTrue(tools[0].read_only)
+        self.assertEqual(tools[0].input_schema, {"type": "object"})
+        self.assertEqual(tools[0].annotations, {"readOnlyHint": True})
         self.assertEqual(client.call_read_only_tool(tools[0], {})["content"][0]["text"], "query ok")
         with self.assertRaises(McpClientError):
             client.call_read_only_tool(tools[1], {})
@@ -363,6 +375,161 @@ class McpClientTests(unittest.TestCase):
 
     def test_secret_fields_are_redacted_for_display(self) -> None:
         self.assertEqual(redact_sensitive({"X-Mcp-Key": "private", "data": "ok"}), {"X-Mcp-Key": "[已隐藏]", "data": "ok"})
+        self.assertEqual(redact_sensitive("echoed key", secret_values=("key",)), "echoed [已隐藏]")
+
+    def test_tool_directory_search_returns_business_schema_even_without_read_only_hint(self) -> None:
+        business = {
+            "toolId": "get_sku_daily_sales",
+            "name": "SKU每日销量与销售额",
+            "description": "查询 SKU 每日销量和销售额",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"sku": {"type": "string"}, "start_date": {"type": "string"}},
+                "required": ["sku"],
+                "additionalProperties": False,
+            },
+        }
+        requests: list[dict] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "DELETE":
+                return httpx.Response(200)
+            payload = json.loads(request.content) if request.content else {}
+            method = payload.get("method")
+            request_id = payload.get("id")
+            if method == "initialize":
+                return httpx.Response(200, headers={"Mcp-Session-Id": "s"}, json={"jsonrpc": "2.0", "id": request_id, "result": {"protocolVersion": "2025-03-26"}})
+            if method == "notifications/initialized":
+                return httpx.Response(202)
+            if method == "tools/list":
+                return httpx.Response(200, json={"jsonrpc": "2.0", "id": request_id, "result": {"tools": [
+                    {"name": "search", "description": "搜索领星业务工具目录并返回对应 Schema", "annotations": {"readOnlyHint": False}, "inputSchema": {"type": "object", "properties": {"keyword": {"type": "string"}}, "additionalProperties": False}},
+                    {"name": "action", "description": "执行指定业务工具；调用前必须通过 search 获取 Schema", "annotations": {}, "inputSchema": {"type": "object"}},
+                    {"name": "status", "description": "状态", "annotations": {}, "inputSchema": {"type": "object"}},
+                ]}})
+            if method == "tools/call":
+                requests.append(payload)
+                return httpx.Response(200, json={"jsonrpc": "2.0", "id": request_id, "result": {"structuredContent": {"tools": [business]}}})
+            return httpx.Response(405)
+
+        http = httpx.Client(transport=httpx.MockTransport(handler))
+        client = LingxingMcpClient("https://mcp.example.test/mcp", "fixture-key", http_client=http)
+        client.connect()
+        tools = client.list_tools()
+        self.assertEqual(len(tools), 3)
+        self.assertTrue(is_directory_search_tool(tools[0]))
+        self.assertFalse(tools[1].read_only)
+        result = client.call_directory_search(tools[0], {"keyword": "销量"})
+        specs = extract_business_tools(result)
+        self.assertEqual(len(specs), 1)
+        self.assertEqual(specs[0].tool_id, "get_sku_daily_sales")
+        self.assertEqual(specs[0].input_schema, business["inputSchema"])
+        self.assertEqual(requests[0]["params"]["name"], "search")
+        self.assertEqual(requests[0]["params"]["arguments"], {"keyword": "销量"})
+        client.close()
+        http.close()
+
+    def test_search_tool_without_catalog_contract_is_never_called(self) -> None:
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "DELETE":
+                return httpx.Response(200)
+            payload = json.loads(request.content) if request.content else {}
+            request_id = payload.get("id")
+            if payload.get("method") == "initialize":
+                return httpx.Response(200, headers={"Mcp-Session-Id": "s"}, json={"jsonrpc": "2.0", "id": request_id, "result": {"protocolVersion": "2025-03-26"}})
+            if payload.get("method") == "notifications/initialized":
+                return httpx.Response(202)
+            if payload.get("method") == "tools/call":
+                requests.append(payload)
+            return httpx.Response(200, json={"jsonrpc": "2.0", "id": request_id, "result": {"tools": []}})
+
+        http = httpx.Client(transport=httpx.MockTransport(handler))
+        client = LingxingMcpClient("https://mcp.example.test/mcp", "fixture-key", http_client=http)
+        client.connect()
+        unsafe_search = McpTool("search", "查询销售数据", {"type": "object", "properties": {}}, {})
+        with self.assertRaises(McpClientError):
+            client.call_directory_search(unsafe_search, {})
+        self.assertEqual(requests, [])
+        client.close()
+        http.close()
+
+    def test_action_requires_search_schema_user_grant_and_query_only_candidate(self) -> None:
+        business = BusinessTool(
+            "get_sku_daily_sales",
+            "SKU每日销量",
+            "查询 SKU 每日实际销量和销售额",
+            {
+                "type": "object",
+                "properties": {"sku": {"type": "string"}, "start_date": {"type": "string"}},
+                "required": ["sku", "start_date"],
+                "additionalProperties": False,
+            },
+        )
+        search_tool = McpTool(
+            "search", "搜索业务工具目录和 Schema", {"type": "object", "properties": {}, "additionalProperties": False}, {}
+        )
+        action_tool = McpTool(
+            "action",
+            "执行指定业务工具；调用前必须先通过 search 获取 Schema",
+            {
+                "type": "object",
+                "properties": {
+                    "toolId": {"type": "string"},
+                    "parameters": {"type": "object", "additionalProperties": True},
+                },
+                "required": ["toolId", "parameters"],
+                "additionalProperties": False,
+            },
+            {},
+        )
+        calls: list[dict] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "DELETE":
+                return httpx.Response(200)
+            payload = json.loads(request.content) if request.content else {}
+            method = payload.get("method")
+            request_id = payload.get("id")
+            if method == "initialize":
+                return httpx.Response(200, headers={"Mcp-Session-Id": "s"}, json={"jsonrpc": "2.0", "id": request_id, "result": {"protocolVersion": "2025-03-26"}})
+            if method == "notifications/initialized":
+                return httpx.Response(202)
+            if method == "tools/call":
+                params = payload["params"]
+                calls.append(params)
+                if params["name"] == "search":
+                    return httpx.Response(200, json={"jsonrpc": "2.0", "id": request_id, "result": {"structuredContent": {"tools": [{"id": business.tool_id, "name": business.name, "description": business.description, "inputSchema": business.input_schema}]}}})
+                return httpx.Response(200, json={"jsonrpc": "2.0", "id": request_id, "result": {"content": [{"type": "text", "text": "query complete"}]}})
+            return httpx.Response(200, json={"jsonrpc": "2.0", "id": request_id, "result": {"tools": []}})
+
+        http = httpx.Client(transport=httpx.MockTransport(handler))
+        client = LingxingMcpClient("https://mcp.example.test/mcp", "fixture-key", http_client=http)
+        client.connect()
+        client.call_directory_search(search_tool, {})
+        grant = VerifiedReadOnlyGrant(business.tool_id, business.permission_fingerprint)
+        with self.assertRaises(McpClientError):
+            client.call_verified_business_query(action_tool, business, {"sku": "ex3106", "start_date": "2026-08-01"}, VerifiedReadOnlyGrant("other_id", business.permission_fingerprint))
+        self.assertEqual(len(calls), 1, "unverified action must not be sent")
+        with self.assertRaises(McpClientError):
+            client.call_verified_business_query(action_tool, business, {"sku": "ex3106", "start_date": "2026-08-01", "unexpected": "value"}, grant)
+        result = client.call_verified_business_query(action_tool, business, {"sku": "ex3106", "start_date": "2026-08-01"}, grant)
+        self.assertIn("content", result)
+        self.assertEqual(calls[-1], {"name": "action", "arguments": {"toolId": business.tool_id, "parameters": {"sku": "ex3106", "start_date": "2026-08-01"}}})
+        unsafe = BusinessTool("update_listing", "修改Listing", "更新商品信息", business.input_schema)
+        self.assertFalse(is_read_only_query_candidate(unsafe))
+        camel_case_query = BusinessTool("getSkuDailySales", "SKU销量", "查询 SKU 每日销量", business.input_schema)
+        self.assertTrue(is_read_only_query_candidate(camel_case_query))
+        operation_schema = BusinessTool(
+            "get_report",
+            "查询报表",
+            "查询报表数据",
+            {"type": "object", "properties": {"update_listing": {"type": "boolean"}}},
+        )
+        self.assertFalse(is_read_only_query_candidate(operation_schema))
+        client.close()
+        http.close()
 
 
 class LingxingOpenApiTests(unittest.TestCase):
