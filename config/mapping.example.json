@@ -1,0 +1,84 @@
+{
+  "version": 1,
+  "status": "UNCONFIGURED",
+  "reports": {
+    "sales": {
+      "header_row": null,
+      "sheet_name": "",
+      "file_patterns": [],
+      "date_format": "",
+      "source_headers": {
+        "store": "",
+        "sku": "",
+        "date": "",
+        "units_sold": "",
+        "sales_amount": "",
+        "unit_price": "",
+        "organic_orders": ""
+      }
+    },
+    "actual_ad_spend": {
+      "header_row": null,
+      "sheet_name": "",
+      "sku_scope": "UNVERIFIED",
+      "file_patterns": [],
+      "date_format": "",
+      "source_headers": {
+        "store": "",
+        "sku": "",
+        "date": "",
+        "actual_spend": "",
+        "campaign_id": "",
+        "ad_group_id": "",
+        "campaign_name": "",
+        "campaign_disabled_at": ""
+      }
+    },
+    "ad_performance": {
+      "header_row": null,
+      "enabled": false,
+      "sheet_name": "",
+      "file_patterns": [],
+      "date_format": "",
+      "source_headers": {
+        "store": "",
+        "sku": "",
+        "date": "",
+        "ad_orders": "",
+        "ad_sales": "",
+        "impressions": "",
+        "clicks": "",
+        "campaign_id": "",
+        "ad_group_id": ""
+      }
+    },
+    "traffic": {
+      "header_row": null,
+      "enabled": false,
+      "sheet_name": "",
+      "file_patterns": [],
+      "date_format": "",
+      "source_headers": {
+        "store": "",
+        "sku": "",
+        "date": "",
+        "sessions": "",
+        "organic_clicks": ""
+      }
+    },
+    "product_snapshot": {
+      "header_row": null,
+      "enabled": false,
+      "sheet_name": "",
+      "file_patterns": [],
+      "source_headers": {
+        "store": "",
+        "sku": "",
+        "category": "",
+        "subcategory_rank": "",
+        "rating": "",
+        "review_count": ""
+      }
+    }
+  }
+}

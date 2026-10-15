@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.venv/
+output/
+logs/
+.env
+.env.*
+config/mapping.local.json
+config/mcp-profile.local.json
+*_数据校验.jsonl
+*.log
+build/
+dist/
+*.spec
