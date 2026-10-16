@@ -4,7 +4,7 @@ import os
 import tempfile
 from collections import defaultdict
 from dataclasses import asdict, dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
@@ -25,6 +25,7 @@ from .template_preparation import (
     prepare_sku_workbook,
 )
 from .timeline import LaunchDay, build_timeline
+from .providers.lingxing_api import MAX_PRODUCT_QUERY_DAYS, SkuDailySalesWindow
 
 
 class ReportGenerationError(RuntimeError):
@@ -40,7 +41,7 @@ class SkuGenerationResult:
     latest_covered_date: str | None
     days: int
     sales_units_total: float | None
-    sales_amount_total: float | None
+    sales_amount_total: float | str | None
     actual_ad_spend_total: float | None
     warnings: list[str]
 
@@ -64,6 +65,7 @@ class ReportData:
     all_skus: set[str] | None = None
     warnings: list[str] | None = None
     anomalies: list[str] | None = None
+    orders_by_sku_date: dict[str, dict[date, Decimal | None]] | None = None
 
 
 _NUMERIC_FIELDS = {
@@ -491,21 +493,127 @@ def _date_from_cell(value: Any) -> date | None:
     return None
 
 
+def _api_sales_report(
+    windows: list[SkuDailySalesWindow],
+    *,
+    skus: list[str],
+    store_sid: int,
+) -> ReportData:
+    """Convert complete API windows to report rows without treating absence as zero."""
+    if not windows:
+        raise ReportGenerationError("OpenAPI 没有返回任何完整查询日期段。")
+    requested = {sku.casefold(): sku for sku in skus}
+    daily_values: dict[str, dict[date, dict[str, Any]]] = defaultdict(dict)
+    coverage: dict[str, set[date]] = defaultdict(set)
+    orders: dict[str, dict[date, Decimal | None]] = defaultdict(dict)
+    currencies_by_sku: dict[str, set[str]] = defaultdict(set)
+    expected_next_date: date | None = None
+
+    for window in windows:
+        if not isinstance(window, SkuDailySalesWindow):
+            raise ReportGenerationError("OpenAPI 历史数据包含未知日期段结构。")
+        if (
+            window.end_date < window.start_date
+            or (window.end_date - window.start_date).days + 1 > MAX_PRODUCT_QUERY_DAYS
+        ):
+            raise ReportGenerationError("OpenAPI 历史数据日期段超过 92 天或日期无效。")
+        if expected_next_date is not None and window.start_date != expected_next_date:
+            raise ReportGenerationError("OpenAPI 历史日期段存在重叠或缺口；未生成周报。")
+        expected_next_date = window.end_date + timedelta(days=1)
+
+        mapping_by_sku: dict[str, Any] = {}
+        for mapping in window.mappings:
+            key = mapping.local_sku.casefold()
+            if key not in requested:
+                raise ReportGenerationError("OpenAPI 商品映射返回了未请求的 SKU；未生成周报。")
+            if key in mapping_by_sku:
+                raise ReportGenerationError("OpenAPI 同一日期段重复返回 SKU 映射；未生成周报。")
+            if not mapping.seller_skus or len(set(mapping.seller_skus)) != len(mapping.seller_skus):
+                raise ReportGenerationError(f"SKU {requested[key]} 的 MSKU 映射为空或重复；未生成周报。")
+            mapping_by_sku[key] = mapping
+        missing_mappings = set(requested) - set(mapping_by_sku)
+        if missing_mappings:
+            names = [requested[key] for key in sorted(missing_mappings)]
+            raise ReportGenerationError("OpenAPI 商品映射不完整：" + ", ".join(names) + "；未生成周报。")
+
+        expected: set[tuple[str, date, str]] = set()
+        day = window.start_date
+        while day <= window.end_date:
+            for key, mapping in mapping_by_sku.items():
+                for msku in mapping.seller_skus:
+                    expected.add((key, day, msku.casefold()))
+                    coverage[key].add(day)
+            day += timedelta(days=1)
+
+        indexed: dict[tuple[str, date, str], Any] = {}
+        for row in window.rows:
+            if row.sid != store_sid:
+                raise ReportGenerationError("OpenAPI 销售记录 SID 与所选店铺不一致；未生成周报。")
+            key = row.local_sku.casefold()
+            row_key = (key, row.event_date, row.seller_sku.casefold())
+            if row_key not in expected:
+                raise ReportGenerationError("OpenAPI 销售记录无法唯一匹配请求的店铺/SKU/MSKU/日期；未生成周报。")
+            if row_key in indexed:
+                raise ReportGenerationError("OpenAPI 销售记录存在重复店铺/SKU/MSKU/日期；未生成周报。")
+            indexed[row_key] = row
+            if row.currency_code:
+                currencies_by_sku[key].add(row.currency_code)
+        if set(indexed) != expected:
+            raise ReportGenerationError("OpenAPI 历史日期段未完整返回所有已映射 MSKU 的日期位置；未生成周报。")
+
+        for key, mapping in mapping_by_sku.items():
+            day = window.start_date
+            while day <= window.end_date:
+                day_rows = [indexed[(key, day, msku.casefold())] for msku in mapping.seller_skus]
+
+                def sum_if_complete(field: str) -> Decimal | None:
+                    values = [getattr(row, field) for row in day_rows]
+                    if any(value is None for value in values):
+                        return None
+                    if any(isinstance(value, bool) or not isinstance(value, (int, Decimal)) for value in values):
+                        raise ReportGenerationError(f"OpenAPI 销售字段 {field} 类型无效；未生成周报。")
+                    return sum((Decimal(value) for value in values), Decimal("0"))
+
+                daily_values[key][day] = {
+                    "units_sold": sum_if_complete("units_sold"),
+                    "sales_amount": sum_if_complete("sales_amount"),
+                }
+                orders[key][day] = sum_if_complete("order_count")
+                day += timedelta(days=1)
+
+    mixed_currencies = [requested[key] for key, codes in currencies_by_sku.items() if len(codes) > 1]
+    if mixed_currencies:
+        raise ReportGenerationError("同一 SKU 的销售记录出现多个币种，无法安全合计：" + ", ".join(mixed_currencies))
+    return ReportData(
+        name="sales",
+        rows_by_sku_date=dict(daily_values),
+        coverage=dict(coverage),
+        source_files=[],
+        all_skus=set(requested),
+        warnings=["来源为领星 OpenAPI；日期覆盖表示请求成功完成到该站点日期；缺失指标仍保持空白。"],
+        anomalies=[],
+        orders_by_sku_date=dict(orders),
+    )
+
+
 def generate_reports(
     *,
     template_path: Path,
-    data_folder: Path,
-    mapping_path: Path,
+    data_folder: Path | None,
+    mapping_path: Path | None,
     skus: list[str],
     output_path: Path,
     d01_mode: str = "first_sale",
     launch_dates: dict[str, date] | None = None,
     existing_report_path: Path | None = None,
+    api_sales_windows: list[SkuDailySalesWindow] | None = None,
+    api_store_sid: int | None = None,
+    api_store_name: str | None = None,
 ) -> GenerationResult:
-    """Build a workbook using explicit source mappings; unknown values stay blank."""
+    """Build from explicit file mappings or completed, validated OpenAPI windows."""
     template_path = template_path.expanduser().resolve()
-    data_folder = data_folder.expanduser().resolve()
-    mapping_path = mapping_path.expanduser().resolve()
+    data_folder = data_folder.expanduser().resolve() if data_folder is not None else None
+    mapping_path = mapping_path.expanduser().resolve() if mapping_path is not None else None
     output_path = output_path.expanduser().resolve()
     launch_dates = {key.casefold(): value for key, value in (launch_dates or {}).items()}
     try:
@@ -521,39 +629,59 @@ def generate_reports(
         raise ReportGenerationError("对应的数据校验日志已存在，为保护已有记录不覆盖。")
     if template_path == output_path or (existing_report_path and existing_report_path.resolve() == output_path):
         raise ReportGenerationError("输出路径不能覆盖模板或现有周报。")
-    if not data_folder.is_dir():
-        raise ReportGenerationError("数据文件夹不存在。")
     if d01_mode not in {"first_sale", "launch_date"}:
         raise ReportGenerationError("D01 方式必须是 first_sale 或 launch_date。")
-
-    try:
-        mapping = load_mapping(mapping_path)
-        issues = validate_mapping(mapping)
-    except (OSError, ValueError) as exc:
-        raise ReportGenerationError(f"映射配置无法读取：{exc}") from exc
-    if issues:
-        raise ReportGenerationError("字段映射尚未就绪：\n- " + "\n- ".join(issues))
+    api_mode = api_sales_windows is not None
+    if api_mode:
+        if d01_mode != "launch_date":
+            raise ReportGenerationError("OpenAPI 当前没有已核验的完整历史首单日期；请为每个 SKU 手动指定 D01。")
+        if isinstance(api_store_sid, bool) or not isinstance(api_store_sid, int):
+            raise ReportGenerationError("OpenAPI 周报必须绑定动态店铺 SID。")
+        if not isinstance(api_store_name, str) or not api_store_name.strip():
+            raise ReportGenerationError("OpenAPI 周报必须保留所选店铺名称。")
+    else:
+        if data_folder is None or not data_folder.is_dir():
+            raise ReportGenerationError("数据文件夹不存在。")
+        if mapping_path is None:
+            raise ReportGenerationError("离线 Excel/CSV 模式必须选择字段映射 JSON。")
+    mapping: dict[str, Any] | None = None
+    if not api_mode:
+        try:
+            mapping = load_mapping(mapping_path)
+            issues = validate_mapping(mapping)
+        except (OSError, ValueError) as exc:
+            raise ReportGenerationError(f"映射配置无法读取：{exc}") from exc
+        if issues:
+            raise ReportGenerationError("字段映射尚未就绪：\n- " + "\n- ".join(issues))
     try:
         summary = inspect_template(template_path)
     except TemplateInspectionError as exc:
         raise ReportGenerationError(str(exc)) from exc
 
-    reports_config = mapping["reports"]
     reports: dict[str, ReportData] = {}
-    reports["sales"] = _load_report(data_folder, "sales", reports_config["sales"], required=True)
-    spend_config = reports_config.get("actual_ad_spend", {})
-    if _report_is_configured("actual_ad_spend", spend_config):
-        reports["actual_ad_spend"] = _load_report(
-            data_folder, "actual_ad_spend", spend_config, required=False
+    if api_mode:
+        reports["sales"] = _api_sales_report(api_sales_windows or [], skus=skus, store_sid=api_store_sid)
+        reports["actual_ad_spend"] = ReportData(
+            "actual_ad_spend", {}, {}, [],
+            warnings=["本次 OpenAPI 流程尚未接入已核验的广告活动实际花费；相关单元格保持空白。"],
+            anomalies=[],
         )
     else:
-        reports["actual_ad_spend"] = ReportData(
-            "actual_ad_spend", {}, {}, [], warnings=["未配置广告实际花费来源；广告花费单元格保持空白。"], anomalies=[]
-        )
-    for optional_name in ("ad_performance", "traffic"):
-        config = reports_config.get(optional_name, {})
-        if config.get("enabled") and _report_is_configured(optional_name, config):
-            reports[optional_name] = _load_report(data_folder, optional_name, config, required=False)
+        reports_config = mapping["reports"]
+        reports["sales"] = _load_report(data_folder, "sales", reports_config["sales"], required=True)
+        spend_config = reports_config.get("actual_ad_spend", {})
+        if _report_is_configured("actual_ad_spend", spend_config):
+            reports["actual_ad_spend"] = _load_report(
+                data_folder, "actual_ad_spend", spend_config, required=False
+            )
+        else:
+            reports["actual_ad_spend"] = ReportData(
+                "actual_ad_spend", {}, {}, [], warnings=["未配置广告实际花费来源；广告花费单元格保持空白。"], anomalies=[]
+            )
+        for optional_name in ("ad_performance", "traffic"):
+            config = reports_config.get(optional_name, {})
+            if config.get("enabled") and _report_is_configured(optional_name, config):
+                reports[optional_name] = _load_report(data_folder, optional_name, config, required=False)
 
     sku_info: dict[str, dict[str, Any]] = {}
     failures: list[SkuGenerationResult] = []
@@ -570,7 +698,10 @@ def generate_reports(
             d01_source = "首个有正销量的销售报表日期" if d01 else None
         else:
             d01 = launch_dates.get(key)
-            d01_source = "用户填写的正式开售日期" if d01 else None
+            if d01:
+                d01_source = "用户手动核验的 D01 日期" if api_mode else "用户填写的正式开售日期"
+            else:
+                d01_source = None
         coverage_dates = set()
         for report in reports.values():
             coverage_dates.update(report.coverage.get(key, set()))
@@ -704,6 +835,10 @@ def generate_reports(
                 if values["spend"] is not None:
                     ad_spend_total += values["spend"]
                     has_spend = True
+                daily_orders = (
+                    reports["sales"].orders_by_sku_date.get(key, {}).get(item.date)
+                    if reports["sales"].orders_by_sku_date is not None else None
+                )
                 daily_audit_entries.append(
                     {
                         "record_type": "daily_metrics",
@@ -712,7 +847,17 @@ def generate_reports(
                         "date": item.date.isoformat(),
                         "sales_source_row_present": sales_source_present,
                         "units_sold": _excel_number(values["sales"]),
-                        "sales_amount": _excel_number(values["_sales_amount"]),
+                        "sales_amount": (
+                            format(values["_sales_amount"], "f")
+                            if api_mode and isinstance(values["_sales_amount"], Decimal)
+                            else _excel_number(values["_sales_amount"])
+                        ),
+                        "total_order_count": (
+                            format(daily_orders, "f")
+                            if api_mode and isinstance(daily_orders, Decimal)
+                            else _excel_number(daily_orders)
+                        ),
+                        "sales_source": "lingxing_openapi" if api_mode else "mapped_file",
                         "ad_spend_source_row_present": spend_source_present,
                         "actual_ad_spend": _excel_number(values["spend"]),
                     }
@@ -724,13 +869,16 @@ def generate_reports(
             successful.append(
                 SkuGenerationResult(
                     sku=sku,
-                    status="success",
+                    status="partial" if api_mode else "success",
                     d01=d01.isoformat(),
                     d01_source=info["d01_source"],
                     latest_covered_date=latest.isoformat(),
                     days=len(timeline),
                     sales_units_total=float(sales_units_total) if has_sales_units else None,
-                    sales_amount_total=float(sales_amount_total) if has_sales_amount else None,
+                    sales_amount_total=(
+                        format(sales_amount_total, "f") if api_mode and has_sales_amount
+                        else (float(sales_amount_total) if has_sales_amount else None)
+                    ),
                     actual_ad_spend_total=float(ad_spend_total) if has_spend else None,
                     warnings=sku_warnings,
                 )
@@ -763,9 +911,21 @@ def generate_reports(
             "record_type": "run",
             "output_file": output_path.name,
             "template_file": template_path.name,
-            "mapping_file": mapping_path.name,
+            "mapping_file": mapping_path.name if mapping_path is not None else None,
             "source_files": sorted({name for report in reports.values() for name in report.source_files}),
             "d01_mode": d01_mode,
+            "source_details": (
+                {
+                    "provider": "lingxing_openapi",
+                    "store_name": api_store_name,
+                    "store_sid": api_store_sid,
+                    "queried_start": api_sales_windows[0].start_date.isoformat(),
+                    "queried_end": api_sales_windows[-1].end_date.isoformat(),
+                    "data_status": "sales_only_partial; ad_actual_spend_not_verified",
+                    "d01_status": "manually_confirmed_per_sku; complete_first_sale_api_not_available",
+                }
+                if api_mode and api_sales_windows else None
+            ),
             "report_notes": [note for report in reports.values() for note in (report.warnings or [])],
             "anomalies": [note for report in reports.values() for note in (report.anomalies or [])],
         }

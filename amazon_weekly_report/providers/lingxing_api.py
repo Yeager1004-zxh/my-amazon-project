@@ -75,6 +75,31 @@ class SkuDailySales:
     sales_amount: Decimal | None = field(repr=False)
 
 
+@dataclass(frozen=True)
+class SkuDailySalesWindow:
+    """One successfully queried date window and its exact SKU/MSKU join map."""
+
+    start_date: date = field(repr=False)
+    end_date: date = field(repr=False)
+    mappings: tuple[SkuProductMapping, ...] = field(repr=False)
+    rows: tuple[SkuDailySales, ...] = field(repr=False)
+
+
+def split_date_windows(start_date: date, end_date: date, *, max_days: int = MAX_PRODUCT_QUERY_DAYS) -> list[tuple[date, date]]:
+    """Split an inclusive range into contiguous, non-overlapping API windows."""
+    if type(start_date) is not date or type(end_date) is not date or end_date < start_date:
+        raise LingxingApiError("查询日期范围无效。")
+    if isinstance(max_days, bool) or not isinstance(max_days, int) or max_days < 1:
+        raise LingxingApiError("查询窗口长度无效。")
+    windows: list[tuple[date, date]] = []
+    current = start_date
+    while current <= end_date:
+        window_end = min(end_date, current + timedelta(days=max_days - 1))
+        windows.append((current, window_end))
+        current = window_end + timedelta(days=1)
+    return windows
+
+
 def _business_code(payload: Any, endpoint_label: str, *, message_field: str) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise LingxingApiError(f"{endpoint_label}业务响应必须是 JSON 对象。")
@@ -851,6 +876,73 @@ class LingxingOpenApiClient:
                         )
                     )
         return result
+
+    def query_daily_sales_history(
+        self,
+        *,
+        access_token: str,
+        store_sid: int,
+        local_skus: list[str],
+        start_date: date,
+        end_date: date,
+    ) -> list[SkuDailySalesWindow]:
+        """Query a long date span in documented <=92-day product windows.
+
+        Each window keeps its own mapping because the documented API does not
+        promise that a local SKU's MSKU list is timeless. A missing mapping or
+        a rate-limit/error in any window aborts the whole result; callers must
+        not generate a partial-looking workbook from incomplete history.
+        """
+        if not isinstance(access_token, str) or not access_token.strip():
+            raise LingxingApiError("Access Token 为空，未发送历史销量查询。")
+        if isinstance(store_sid, bool) or not isinstance(store_sid, int):
+            raise LingxingApiError("历史销量查询必须使用动态店铺 SID。")
+        if not isinstance(local_skus, list) or not local_skus:
+            raise LingxingApiError("历史销量查询至少需要一个 local SKU。")
+        normalized_skus = list(dict.fromkeys(
+            sku.strip() for sku in local_skus if isinstance(sku, str) and sku.strip()
+        ))
+        if len(normalized_skus) != len(local_skus):
+            raise LingxingApiError("历史销量查询包含空白或重复 SKU，已停止。")
+
+        windows: list[SkuDailySalesWindow] = []
+        for window_start, window_end in split_date_windows(start_date, end_date):
+            mappings = self.query_product_mappings(
+                access_token=access_token,
+                store_sid=store_sid,
+                local_skus=normalized_skus,
+                start_date=window_start,
+                end_date=window_end,
+            )
+            mapping_by_sku = {item.local_sku.casefold(): item for item in mappings}
+            unresolved = [
+                sku for sku in normalized_skus
+                if not mapping_by_sku.get(sku.casefold())
+                or not mapping_by_sku[sku.casefold()].seller_skus
+            ]
+            if unresolved:
+                raise LingxingApiError(
+                    f"{window_start.isoformat()} 至 {window_end.isoformat()} 的 SKU→MSKU 映射不完整："
+                    + ", ".join(unresolved)
+                    + "。未生成部分历史结果。"
+                )
+            selected_mappings = [mapping_by_sku[sku.casefold()] for sku in normalized_skus]
+            rows = self.query_daily_sales(
+                access_token=access_token,
+                store_sid=store_sid,
+                mappings=selected_mappings,
+                start_date=window_start,
+                end_date=window_end,
+            )
+            windows.append(
+                SkuDailySalesWindow(
+                    start_date=window_start,
+                    end_date=window_end,
+                    mappings=tuple(selected_mappings),
+                    rows=tuple(rows),
+                )
+            )
+        return windows
 
     def list_sellers(self, access_token: str) -> list[LingxingSeller]:
         """Call SellerLists and return records only after business/schema validation."""

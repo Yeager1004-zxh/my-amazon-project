@@ -32,10 +32,12 @@ from amazon_weekly_report.providers.lingxing_api import (
     LingxingApiNotReady,
     LingxingOpenApiClient,
     SkuDailySales,
+    SkuDailySalesWindow,
     SkuProductMapping,
     parse_asin_daily_page,
     parse_product_performance_page,
     parse_seller_list_response,
+    split_date_windows,
 )
 from amazon_weekly_report.providers.lingxing_signing import (
     LingxingSignatureError,
@@ -44,7 +46,7 @@ from amazon_weekly_report.providers.lingxing_signing import (
     generate_signature,
     signed_post_query_parameters,
 )
-from amazon_weekly_report.report_generation import generate_reports
+from amazon_weekly_report.report_generation import ReportGenerationError, generate_reports
 from amazon_weekly_report.template_expansion import ensure_day_rows
 from amazon_weekly_report.template_inspection import inspect_template
 from amazon_weekly_report.timeline import build_timeline
@@ -326,6 +328,143 @@ class TemplateAndReportTests(unittest.TestCase):
             workbook.close()
             log_text = result.audit_path.read_text(encoding="utf-8")
             self.assertIn("相同活动/广告组花费重复关联多个 SKU", log_text)
+
+
+class ApiReportGenerationTests(unittest.TestCase):
+    def test_openapi_sales_generate_template_d61_and_keep_missing_distinct_from_zero(self) -> None:
+        start = date(2026, 1, 1)
+        end = start + timedelta(days=61)
+        mapping = SkuProductMapping("API-TEST", ("MSKU-A", "MSKU-B"), ("ASINTEST0001",))
+        rows: list[SkuDailySales] = []
+        for offset in range((end - start).days + 1):
+            event_date = start + timedelta(days=offset)
+            for seller_sku in mapping.seller_skus:
+                if offset == 0:
+                    units, orders, amount = 0, 0, Decimal("0.00")
+                elif offset == 1:
+                    units, orders, amount = None, None, None
+                else:
+                    units, orders, amount = 1, 1, Decimal("10.00") if seller_sku == "MSKU-A" else Decimal("11.00")
+                rows.append(SkuDailySales(
+                    sid=987654,
+                    local_sku="API-TEST",
+                    seller_sku=seller_sku,
+                    asin="ASINTEST0001",
+                    event_date=event_date,
+                    currency_code="USD",
+                    units_sold=units,
+                    order_count=orders,
+                    sales_amount=amount,
+                ))
+        window = SkuDailySalesWindow(start, end, (mapping,), tuple(rows))
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            template = root / "template.xlsx"
+            output = root / "api-report.xlsx"
+            create_template(template)
+            result = generate_reports(
+                template_path=template,
+                data_folder=None,
+                mapping_path=None,
+                skus=["API-TEST"],
+                output_path=output,
+                d01_mode="launch_date",
+                launch_dates={"API-TEST": start},
+                api_sales_windows=[window],
+                api_store_sid=987654,
+                api_store_name="Synthetic Shop",
+            )
+            self.assertEqual(result.sku_results[0].status, "partial")
+            self.assertEqual(result.sku_results[0].days, 62)
+            workbook = load_workbook(output, data_only=False)
+            sheet = workbook["API-TEST"]
+            self.assertEqual(sheet["E6"].value, 0)
+            self.assertIsNone(sheet["D6"].value)  # 0/0 is undefined, not zero price.
+            self.assertIsNone(sheet["E7"].value)  # Missing API records stay blank.
+            self.assertIsNone(sheet["D7"].value)
+            self.assertEqual(sheet["E8"].value, 2)
+            self.assertEqual(sheet["D8"].value, 10.5)
+            self.assertEqual(sheet["B66"].value, "D61")
+            self.assertEqual(sheet["E66"].value, 2)
+            self.assertIsNone(sheet["U6"].value)  # Actual ad spend is not yet connected.
+            self.assertIsNone(sheet["A2"].value)
+            self.assertIsNone(sheet["G2"].value)
+            self.assertIsNone(sheet["M6"].value)
+            workbook.close()
+
+            audit = [json.loads(line) for line in result.audit_path.read_text(encoding="utf-8").splitlines()]
+            run = next(item for item in audit if item.get("record_type") == "run")
+            self.assertEqual(run["source_details"]["provider"], "lingxing_openapi")
+            self.assertEqual(run["source_details"]["store_sid"], 987654)
+            first_day = next(item for item in audit if item.get("record_type") == "daily_metrics" and item["day_number"] == 1)
+            missing_day = next(item for item in audit if item.get("record_type") == "daily_metrics" and item["day_number"] == 2)
+            self.assertEqual(first_day["total_order_count"], "0")
+            self.assertEqual(first_day["sales_amount"], "0.00")
+            self.assertIsNone(missing_day["total_order_count"])
+            self.assertIsNone(missing_day["sales_amount"])
+            self.assertEqual(first_day["sales_source"], "lingxing_openapi")
+
+            workbook = load_workbook(output)
+            sheet = workbook["API-TEST"]
+            sheet["A2"] = "人工推广阶段"
+            sheet["G2"] = "人工发货时间"
+            sheet["M6"] = 4
+            sheet["M66"] = 8
+            workbook.save(output)
+            workbook.close()
+
+            added_date = end + timedelta(days=1)
+            added_rows = tuple(
+                SkuDailySales(987654, "API-TEST", seller_sku, "ASINTEST0001", added_date, "USD", 1, 1, Decimal("10.00"))
+                for seller_sku in mapping.seller_skus
+            )
+            updated_window = SkuDailySalesWindow(start, added_date, (mapping,), (*rows, *added_rows))
+            updated = root / "api-report-updated.xlsx"
+            generate_reports(
+                template_path=template,
+                data_folder=None,
+                mapping_path=None,
+                skus=["API-TEST"],
+                output_path=updated,
+                d01_mode="launch_date",
+                launch_dates={"API-TEST": start},
+                existing_report_path=output,
+                api_sales_windows=[updated_window],
+                api_store_sid=987654,
+                api_store_name="Synthetic Shop",
+            )
+            workbook = load_workbook(updated)
+            sheet = workbook["API-TEST"]
+            self.assertEqual(sheet["A2"].value, "人工推广阶段")
+            self.assertEqual(sheet["G2"].value, "人工发货时间")
+            self.assertEqual(sheet["M6"].value, 4)
+            self.assertEqual(sheet["M66"].value, 8)
+            self.assertEqual(sheet["B68"].value, "D63")
+            self.assertEqual(sheet["E68"].value, 2)
+            workbook.close()
+
+    def test_openapi_generation_rejects_unverified_automatic_first_sale_d01(self) -> None:
+        start = date(2026, 1, 1)
+        mapping = SkuProductMapping("API-TEST", ("MSKU-A",), ())
+        row = SkuDailySales(987654, "API-TEST", "MSKU-A", "", start, "USD", 1, 1, Decimal("9.99"))
+        window = SkuDailySalesWindow(start, start, (mapping,), (row,))
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            template = root / "template.xlsx"
+            create_template(template)
+            with self.assertRaisesRegex(ReportGenerationError, "没有已核验的完整历史首单日期"):
+                generate_reports(
+                    template_path=template,
+                    data_folder=None,
+                    mapping_path=None,
+                    skus=["API-TEST"],
+                    output_path=root / "blocked.xlsx",
+                    d01_mode="first_sale",
+                    api_sales_windows=[window],
+                    api_store_sid=987654,
+                    api_store_name="Synthetic Shop",
+                )
 
 
 class McpClientTests(unittest.TestCase):
@@ -718,6 +857,40 @@ class LingxingOpenApiTests(unittest.TestCase):
             ],
             "asins": [{"asin": f"ASINTEST{offset + 1:04d}", "sid": "987654"}],
         }
+
+    def test_long_sales_history_is_split_into_nonoverlapping_92_day_windows(self) -> None:
+        start = date(2026, 1, 1)
+        end = start + timedelta(days=93)
+        windows = split_date_windows(start, end)
+        self.assertEqual([(left, right) for left, right in windows], [
+            (start, start + timedelta(days=91)),
+            (start + timedelta(days=92), end),
+        ])
+        self.assertTrue(all((right - left).days + 1 <= 92 for left, right in windows))
+
+        mapping_calls: list[tuple[date, date]] = []
+        daily_calls: list[tuple[date, date]] = []
+        with LingxingOpenApiClient("synthetic-app-id", "synthetic-secret") as client:
+            def query_mappings(**kwargs):
+                mapping_calls.append((kwargs["start_date"], kwargs["end_date"]))
+                return [SkuProductMapping("local-test-a", ("MSKU-A",), ())]
+
+            def query_sales(**kwargs):
+                daily_calls.append((kwargs["start_date"], kwargs["end_date"]))
+                return []
+
+            with patch.object(client, "query_product_mappings", side_effect=query_mappings), \
+                    patch.object(client, "query_daily_sales", side_effect=query_sales):
+                result = client.query_daily_sales_history(
+                    access_token="synthetic-token",
+                    store_sid=987654,
+                    local_skus=["local-test-a"],
+                    start_date=start,
+                    end_date=end,
+                )
+        self.assertEqual(mapping_calls, windows)
+        self.assertEqual(daily_calls, windows)
+        self.assertEqual([(window.start_date, window.end_date) for window in result], windows)
 
     @staticmethod
     def _product_response(records: list[dict[str, object]], *, total: int | None = None) -> dict[str, object]:

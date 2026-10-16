@@ -33,6 +33,7 @@ from .providers.lingxing_api import (
     LingxingOpenApiClient,
     LingxingSeller,
     SkuDailySales,
+    SkuDailySalesWindow,
     SkuProductMapping,
 )
 from .report_generation import ReportGenerationError, generate_reports
@@ -151,9 +152,9 @@ class WeeklyReportApp(tk.Tk):
 
         mode_box = ttk.LabelFrame(parent, text="D01 规则", padding=8)
         mode_box.grid(row=9, column=0, columnspan=3, sticky="ew", pady=8)
-        ttk.Radiobutton(mode_box, text="SKU 首个有销量日期（需完整历史来源）", variable=self.d01_mode, value="first_sale").grid(row=0, column=0, sticky="w", padx=4)
-        ttk.Radiobutton(mode_box, text="正式开售日期", variable=self.d01_mode, value="launch_date").grid(row=0, column=1, sticky="w", padx=4)
-        ttk.Label(mode_box, text="选择正式开售日期时，每行填写 SKU=YYYY-MM-DD（不同 SKU 可用不同日期）").grid(row=1, column=0, columnspan=2, sticky="w", padx=4, pady=(5, 2))
+        ttk.Radiobutton(mode_box, text="首单日期（仅完整历史来源；须确认覆盖）", variable=self.d01_mode, value="first_sale").grid(row=0, column=0, sticky="w", padx=4)
+        ttk.Radiobutton(mode_box, text="手动指定 D01", variable=self.d01_mode, value="launch_date").grid(row=0, column=1, sticky="w", padx=4)
+        ttk.Label(mode_box, text="手动指定时，每行填写 SKU=YYYY-MM-DD；日期须由运营人员核实。OpenAPI 生成只能使用手动 D01。", wraplength=850).grid(row=1, column=0, columnspan=2, sticky="w", padx=4, pady=(5, 2))
         self.launch_dates_text = tk.Text(mode_box, height=3, wrap="none")
         self.launch_dates_text.grid(row=2, column=0, columnspan=2, sticky="ew", padx=4)
         mode_box.columnconfigure(1, weight=1)
@@ -166,6 +167,8 @@ class WeeklyReportApp(tk.Tk):
         buttons.grid(row=12, column=0, columnspan=3, sticky="ew", pady=10)
         self.generate_button = ttk.Button(buttons, text="开始生成周报", command=self._start_generation)
         self.generate_button.pack(side="left")
+        self.generate_api_button = ttk.Button(buttons, text="领星 OpenAPI 查询并生成", command=self._start_api_generation)
+        self.generate_api_button.pack(side="left", padx=8)
         ttk.Button(buttons, text="打开输出文件夹", command=self._open_output_folder).pack(side="left", padx=8)
         ttk.Label(
             parent,
@@ -566,6 +569,7 @@ class WeeklyReportApp(tk.Tk):
             return
         self._busy = True
         self.generate_button.configure(state="disabled")
+        self.generate_api_button.configure(state="disabled")
         self.report_query_button.configure(state="disabled")
         self.progress.start(10)
         status_var.set("处理中…")
@@ -628,6 +632,7 @@ class WeeklyReportApp(tk.Tk):
             self._busy = False
             self.progress.stop()
             self.generate_button.configure(state="normal")
+            self.generate_api_button.configure(state="normal")
             self.report_query_button.configure(state="normal")
         self.after(150, self._poll_events)
 
@@ -932,6 +937,110 @@ class WeeklyReportApp(tk.Tk):
             return {"message": message, "output": str(result.output_path)}
 
         self._start_task(generate, self.report_status, "周报生成完成。")
+
+    def _start_api_generation(self) -> None:
+        """Query real OpenAPI sales and send only validated rows to the workbook writer."""
+        if self._busy:
+            return
+        seller = self._selected_report_seller()
+        if seller is None:
+            messagebox.showwarning("请选择店铺", "请刷新并选择领星授权店铺。")
+            return
+        skus = list(dict.fromkeys(
+            value.strip()
+            for value in self.skus_var.get().replace("，", ",").split(",")
+            if value.strip()
+        ))
+        if not 1 <= len(skus) <= 50:
+            messagebox.showwarning("SKU 数量无效", "请输入 1–50 个不重复的本地 SKU，以逗号分隔。")
+            return
+        if self.d01_mode.get() != "launch_date":
+            messagebox.showwarning(
+                "需要手动指定 D01",
+                "当前已提供的官方接口不能证明完整历史首单日期。请切换到“手动指定 D01”，并为每个 SKU 填写经核实的日期。",
+            )
+            return
+        try:
+            launch_dates = {key.casefold(): value for key, value in self._parse_launch_dates().items()}
+        except ReportGenerationError as exc:
+            messagebox.showerror("D01 日期格式错误", str(exc))
+            return
+        missing_dates = [sku for sku in skus if sku.casefold() not in launch_dates]
+        if missing_dates:
+            messagebox.showwarning("缺少 D01", "请为以下 SKU 填写已核实的 D01：" + ", ".join(missing_dates))
+            return
+
+        start_text = self.query_start_date_var.get().strip()
+        end_text = self.query_end_date_var.get().strip()
+        try:
+            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", start_text) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", end_text):
+                raise ValueError
+            query_start = date.fromisoformat(start_text)
+            query_end = date.fromisoformat(end_text)
+        except ValueError:
+            messagebox.showwarning("日期格式错误", "OpenAPI 周报查询请输入有效的 YYYY-MM-DD 站点日期范围。")
+            return
+        if query_end < query_start:
+            messagebox.showwarning("日期范围错误", "查询结束日不能早于开始日。")
+            return
+        earliest_d01 = min(launch_dates[sku.casefold()] for sku in skus)
+        latest_d01 = max(launch_dates[sku.casefold()] for sku in skus)
+        if query_start > earliest_d01 or query_end < latest_d01:
+            messagebox.showwarning("查询范围不完整", "查询开始日须不晚于最早 D01，查询结束日须不早于每个 SKU 的 D01。")
+            return
+        if not self.template_var.get().strip() or not Path(self.template_var.get()).is_file():
+            messagebox.showwarning("缺少模板", "请选择现有《新品推广周报.xlsx》模板。")
+            return
+        output_dir = Path(self.output_var.get().strip()) if self.output_var.get().strip() else None
+        if output_dir is None:
+            messagebox.showwarning("缺少输出文件夹", "请选择周报输出文件夹。")
+            return
+        try:
+            app_id, app_secret = self._openapi_credentials()
+        except CredentialStoreError as exc:
+            messagebox.showerror("OpenAPI 配置错误", str(exc))
+            return
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_path = output_dir / f"新品推广周报_OpenAPI_{timestamp}.xlsx"
+        existing = Path(self.existing_var.get()) if self.existing_var.get().strip() else None
+        template_path = Path(self.template_var.get())
+
+        def generate_from_api() -> dict[str, Any]:
+            with LingxingOpenApiClient(app_id, app_secret) as client:
+                token_result = client.get_access_token()
+                windows = client.query_daily_sales_history(
+                    access_token=token_result.token,
+                    store_sid=seller.sid,
+                    local_skus=skus,
+                    start_date=query_start,
+                    end_date=query_end,
+                )
+            result = generate_reports(
+                template_path=template_path,
+                data_folder=None,
+                mapping_path=None,
+                skus=skus,
+                output_path=output_path,
+                d01_mode="launch_date",
+                launch_dates=launch_dates,
+                existing_report_path=existing,
+                api_sales_windows=windows,
+                api_store_sid=seller.sid,
+                api_store_name=seller.name,
+            )
+            complete = sum(item.status == "success" for item in result.sku_results)
+            partial = sum(item.status == "partial" for item in result.sku_results)
+            failed = sum(item.status == "failed" for item in result.sku_results)
+            state = "部分完成" if partial or failed else "完成"
+            message = (
+                f"{state}：完整 {complete} 个、仅销售数据 {partial} 个、失败 {failed} 个。\n"
+                f"查询日期：{query_start.isoformat()} 至 {query_end.isoformat()}（站点日期，按不超过 92 天分段）\n"
+                f"广告活动实际花费尚未接入，花费单元格留空。\n周报：{result.output_path}\n校验日志：{result.audit_path}"
+            )
+            return {"message": message, "output": str(result.output_path)}
+
+        self._start_task(generate_from_api, self.report_status, "OpenAPI 周报生成已完成。")
 
     def _open_output_folder(self) -> None:
         path = Path(self.output_var.get().strip())
