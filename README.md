@@ -1,6 +1,6 @@
 # 亚马逊新品推广周报工具
 
-面向 Windows 10/11 的本地新品推广周报工具。V1.0 数据路线为：领星 OpenAPI 作为主数据接口、官方 MCP 作为辅助查询/交叉核验、领星 Excel/CSV 导入作为应急备用；三种来源最终进入统一标准数据层，再复用原周报模板生成器。当前离线 Excel/CSV 周报功能可用。用户已在 Windows 真实验证 Token 和店铺列表接口；本分支现新增业务响应校验、店铺动态解析及 GUI 映射，更新后的客户端仍需在 Windows 本地复测。SKU 销量等 OpenAPI 查询和自动写入尚未接入。
+面向 Windows 10/11 的本地新品推广周报工具。V1.0 数据路线为：领星 OpenAPI 作为主数据接口、官方 MCP 作为辅助查询/交叉核验、领星 Excel/CSV 导入作为应急备用；三种来源最终进入统一标准数据层，再复用原周报模板生成器。当前离线 Excel/CSV 周报功能可用。用户已确认最新版在 Windows 真实验证并通过动态店铺列表验收；SKU 商品识别、每日销量查询和自动写入尚未接入。
 
 V1.0 分阶段任务、模块输入/输出、依赖、测试和验收门槛见 [正式实施清单](docs/V1_IMPLEMENTATION_PLAN.md)。当前版本仅聚焦新品推广周报。
 
@@ -68,25 +68,25 @@ OpenAPI 使用固定官方域名 `https://openapi.lingxing.com`。Token 请求�
 
 已根据本次上传的领星 **Java** SDK 源码实现签名和只读店铺列表请求：`GET /erp/sc/data/seller/lists`。签名按 ASCII 参数名排序、使用 SDK 的字符串转换/去空格规则拼接 `key=value`、计算大写 MD5，再用 AppID 执行 AES/ECB/PKCS5Padding，密文使用标准 Base64，并按 Java `URLEncoder` 的 UTF-8 规则编码查询参数。Python SDK 并未包含在压缩包内；本项目只移植与签名相关的 SDK 行为，没有复制其会输出签名输入的日志代码。签名向量已用独立 OpenSSL 结果核对，但当前环境没有 Java 编译器，未执行官方 Java SDK。
 
-店铺列表仅在业务 `code` 为整数 `0`、`data` 为直接数组且信封和每条店铺记录类型有效时才视为成功。名称、SID、站点会动态显示在 GUI 的店铺列表和周报页下拉框中；下拉框选项在内存中关联接口返回的 SID，不硬编码店铺。`status` 和 `has_ads_setting` 只显示接口返回的原始整数，不推断其业务含义。用户已在 Windows 报告过真实店铺列表接口成功；当前分支的结构解析与映射使用合成数据测试，更新后仍需按下文步骤在 Windows 本地复测。SKU→ASIN/MSKU 映射、首单日期、每日销量/销售额的接口参数、分页和字段口径尚未实现；广告接口未接入。
+店铺列表仅在业务 `code` 为整数 `0`、`data` 为直接数组且信封和每条店铺记录类型有效时才视为成功。名称、SID、站点会动态显示在 GUI 的店铺列表和周报页下拉框中；下拉框选项在内存中关联接口返回的 SID，不硬编码店铺。`status` 和 `has_ads_setting` 只显示接口返回的原始整数，不推断其业务含义。用户已确认最新版通过 Windows 动态店铺列表真实验收；自动化测试仍只使用合成数据。SKU→ASIN/MSKU 映射、首单日期、每日销量/销售额的接口参数、分页和字段口径尚未实现；广告接口未接入。
 
-### 第一阶段 Windows 首测
+### Windows 验收记录
 
-1. 更新开发分支并启动：`git switch feature/weekly-report-v1`、`git pull --ff-only origin feature/weekly-report-v1`、`run_gui.bat`。如 pip 环境尚未更新，先运行 `python -m pip install -r requirements.txt`。
-2. 在“领星 OpenAPI 连接”页安全保存 AppID/AppSecret（只写入 Windows Credential Manager）。
-3. 点击“测试 API 身份验证”，确认结果只显示成功/错误和有效期，不显示 Token。请求需从已加入领星 IP 白名单的 Windows 公网出口发出。
-4. 点击“刷新店铺列表”。程序会获取 Token 并发送已签名 GET 请求。成功时需满足业务 `code=0` 和确认过的响应字段类型；GUI 会显示店铺名称、SID、站点以及 `status`、`has_ads_setting` 的原始值。
-5. 打开“新品推广周报”页，确认店铺下拉框已从接口动态填充。选择一项时会在内存中关联响应里的 SID；当前 OpenAPI 销量查询尚未实现，现有 Excel/CSV 周报仍从导入文件读取数据。
-6. 可再次点击“刷新店铺列表”验证新增或变更店铺会重新读取。不要将响应正文、Seller ID、SID、Token 或请求记录回传到聊天。
+用户确认最新版在 Windows 本地成功刷新真实店铺列表，并在 OpenAPI 页和周报页下拉框正确显示。云端未访问用户凭证或业务数据。不要将响应正文、Seller ID、SID、Token 或请求记录回传到聊天。
 
 云端自动化测试使用 HTTP 模拟夹具，仅验证请求构造、Token 生命周期和错误脱敏；不代表真实 API 或业务数据验收。不要将 AppID、AppSecret、Access Token、完整签名 URL 或真实报表发到聊天或 GitHub。
 
-### 下一阶段所需的领星官方资料
+### SKU 识别与每日销量查询所需官方资料
 
-- local SKU→ASIN/MSKU 的官方查询接口/报表定义。
-- 历史首单日期、每日销量和销售额接口的路径、参数、分页、日期时区、订单状态/退款口径及响应字段。
+请从领星官方文档导出或复制以下页面的完整接口说明，包括请求参数表、分页规则、响应字段表和 JSON 示例：
 
-资料可用官方文档链接、SDK 文件/链接，或来自 Windows 本机授权只读 MCP 的脱敏 Schema 与响应字段结构补充。未经核对不使用社区 SDK 或猜测参数作为生产请求依据。
+- 产品表现（新版 / ASIN 列表）：[AsinListNew](https://apidoc.lingxing.com/new/api-docs/Statistics/AsinListNew/)，用于确认店铺下 SKU、MSKU、ASIN 的识别与筛选字段。
+- 亚马逊 ASIN 每日销量统计：[AsinDailyLists](https://apidoc.lingxing.com/new/api-docs/Statistics/AsinDailyLists/)，用于确认每日销量和销售额的查询参数、日期边界、时间口径、分页及数据字段定义。
+- 若以上页面不定义“历史首单日期”或可查询历史范围，请再提供领星官方首单/销量明细接口文档。不能直接把当前查询范围内最早记录当作真实首单日。
+
+需要核验 HTTP method/path、参数名称和类型、分页方式及结束条件、业务成功码和 data 结构、SKU/MSKU/ASIN 归属字段、日销量与订单量的区别、销售额及退款/取消口径、日期时区和历史覆盖范围。请提供脱敏页面 PDF/HTML 或粘贴 Schema 与字段说明，删除真实 SID、Seller ID、商品/订单记录及凭证。
+
+当前云端网络策略没有放行 `apidoc.lingxing.com`，无法从这里读取官方页面；我没有绕过该策略或猜测接口参数。
 
 ## 配置 Excel/CSV 字段映射
 
