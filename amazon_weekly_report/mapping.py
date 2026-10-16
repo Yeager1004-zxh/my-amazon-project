@@ -74,6 +74,14 @@ def validate_mapping(mapping: dict[str, Any]) -> list[str]:
                     "actual_ad_spend.sku_scope 未确认为 SKU_LEVEL_CONFIRMED；"
                     "必须先核实原始实际花费记录可唯一对应一个 SKU，禁止按活动或广告组重复分摊"
                 )
+            if report.get("coverage_scope", "PARTIAL_OR_UNKNOWN") not in {
+                "PARTIAL_OR_UNKNOWN",
+                "ALL_AD_TYPES_TOTAL_CONFIRMED",
+            }:
+                issues.append(
+                    "actual_ad_spend.coverage_scope 必须为 PARTIAL_OR_UNKNOWN 或 "
+                    "ALL_AD_TYPES_TOTAL_CONFIRMED"
+                )
 
         patterns = report.get("file_patterns")
         if report_name == "sales" or configured:

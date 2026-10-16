@@ -21,6 +21,7 @@
       "header_row": null,
       "sheet_name": "",
       "sku_scope": "UNVERIFIED",
+      "coverage_scope": "PARTIAL_OR_UNKNOWN",
       "file_patterns": [],
       "date_format": "",
       "source_headers": {

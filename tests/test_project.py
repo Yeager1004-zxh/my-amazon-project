@@ -391,6 +391,7 @@ class TemplateAndReportTests(unittest.TestCase):
                     },
                     "actual_ad_spend": {
                         "header_row": 1, "sheet_name": "", "sku_scope": "SKU_LEVEL_CONFIRMED",
+                        "coverage_scope": "ALL_AD_TYPES_TOTAL_CONFIRMED",
                         "file_patterns": ["ads.csv"], "date_format": "%Y-%m-%d",
                         "source_headers": {"store": "店铺", "sku": "SKU", "date": "日期", "actual_spend": "实际花费", "campaign_id": "活动ID", "campaign_disabled_at": "关闭日期"},
                     },
@@ -410,6 +411,8 @@ class TemplateAndReportTests(unittest.TestCase):
                 d01_dates={"TEST_SKU": date(2026, 1, 1)},
                 d01_confirmed=True,
             )
+            self.assertEqual(result.sku_results[0].status, "partial")
+            self.assertIsNone(result.sku_results[0].actual_ad_spend_total)
             workbook = load_workbook(result.output_path, data_only=False)
             worksheet = workbook["TEST_SKU"]
             self.assertEqual(worksheet["U7"].value, 5)
@@ -446,6 +449,7 @@ class TemplateAndReportTests(unittest.TestCase):
                     },
                     "actual_ad_spend": {
                         "header_row": 1, "sheet_name": "", "sku_scope": "SKU_LEVEL_CONFIRMED",
+                        "coverage_scope": "ALL_AD_TYPES_TOTAL_CONFIRMED",
                         "file_patterns": ["ads.csv"],
                         "source_headers": {"store": "店铺", "sku": "SKU", "date": "日期", "actual_spend": "实际花费", "campaign_id": "活动ID"},
                     },
@@ -520,6 +524,7 @@ class ApiReportGenerationTests(unittest.TestCase):
             )
             self.assertEqual(result.sku_results[0].status, "partial")
             self.assertEqual(result.sku_results[0].days, 62)
+            self.assertTrue(any("未确认覆盖 SP、SB、SD" in warning for warning in result.sku_results[0].warnings))
             workbook = load_workbook(output, data_only=False)
             sheet = workbook["API-TEST"]
             self.assertEqual(sheet["E6"].value, 0)
@@ -540,6 +545,7 @@ class ApiReportGenerationTests(unittest.TestCase):
             run = next(item for item in audit if item.get("record_type") == "run")
             self.assertEqual(run["source_details"]["provider"], "lingxing_openapi")
             self.assertEqual(run["source_details"]["store_sid"], 987654)
+            self.assertTrue(any("广告" in note for note in run["report_notes"]))
             first_day = next(item for item in audit if item.get("record_type") == "daily_metrics" and item["day_number"] == 1)
             missing_day = next(item for item in audit if item.get("record_type") == "daily_metrics" and item["day_number"] == 2)
             self.assertEqual(first_day["total_order_count"], "0")
@@ -608,6 +614,74 @@ class ApiReportGenerationTests(unittest.TestCase):
                     api_store_sid=987654,
                     api_store_name="Synthetic Shop",
                 )
+
+    def test_partial_csv_ad_cost_is_kept_in_audit_but_never_written_as_total(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            template = root / "template.xlsx"
+            data = root / "exports"
+            data.mkdir()
+            create_template(template)
+            with (data / "sales.csv").open("w", encoding="utf-8-sig", newline="") as stream:
+                writer = csv.writer(stream)
+                writer.writerow(["店铺", "SKU", "日期", "销量", "销售额"])
+                writer.writerow(["TEST_STORE", "TEST_SKU", "2026-02-01", 1, "10.00"])
+                writer.writerow(["TEST_STORE", "TEST_SKU", "2026-02-02", 1, "11.00"])
+            with (data / "ads.csv").open("w", encoding="utf-8-sig", newline="") as stream:
+                writer = csv.writer(stream)
+                writer.writerow(["店铺", "SKU", "日期", "实际花费"])
+                writer.writerow(["TEST_STORE", "TEST_SKU", "2026-02-02", "2.50"])
+            mapping = {
+                "version": 1,
+                "status": "READY_FOR_REVIEW",
+                "reports": {
+                    "sales": {
+                        "header_row": 1, "sheet_name": "", "file_patterns": ["sales.csv"],
+                        "source_headers": {"store": "店铺", "sku": "SKU", "date": "日期", "units_sold": "销量", "sales_amount": "销售额"},
+                    },
+                    "actual_ad_spend": {
+                        "header_row": 1, "sheet_name": "", "sku_scope": "SKU_LEVEL_CONFIRMED",
+                        "coverage_scope": "PARTIAL_OR_UNKNOWN", "file_patterns": ["ads.csv"],
+                        "source_headers": {"store": "店铺", "sku": "SKU", "date": "日期", "actual_spend": "实际花费"},
+                    },
+                    "ad_performance": {"enabled": False, "source_headers": {}},
+                    "traffic": {"enabled": False, "source_headers": {}},
+                    "product_snapshot": {"enabled": False, "source_headers": {}},
+                },
+            }
+            mapping_path = root / "mapping.json"
+            mapping_path.write_text(json.dumps(mapping, ensure_ascii=False), encoding="utf-8")
+            first = generate_reports(
+                template_path=template, data_folder=data, mapping_path=mapping_path,
+                skus=["TEST_SKU"], output_path=root / "first.xlsx",
+                d01_dates={"TEST_SKU": date(2026, 2, 1)}, d01_confirmed=True,
+            )
+            self.assertEqual(first.sku_results[0].status, "partial")
+            workbook = load_workbook(first.output_path)
+            worksheet = workbook["TEST_SKU"]
+            self.assertIsNone(worksheet["U7"].value)
+            self.assertIsNone(worksheet["X7"].value)
+            worksheet["U7"] = 99  # A previously generated total must not survive incomplete coverage.
+            workbook.save(first.output_path)
+            workbook.close()
+
+            updated = generate_reports(
+                template_path=template, data_folder=data, mapping_path=mapping_path,
+                skus=["TEST_SKU"], output_path=root / "updated.xlsx",
+                d01_dates={"TEST_SKU": date(2026, 2, 1)}, d01_confirmed=True,
+                existing_report_path=first.output_path,
+            )
+            workbook = load_workbook(updated.output_path)
+            self.assertIsNone(workbook["TEST_SKU"]["U7"].value)
+            self.assertIsNone(workbook["TEST_SKU"]["X7"].value)
+            workbook.close()
+            daily = [json.loads(line) for line in updated.audit_path.read_text(encoding="utf-8").splitlines()]
+            d02 = next(item for item in daily if item.get("record_type") == "daily_metrics" and item["day_number"] == 2)
+            self.assertEqual(d02["ad_spend_source_value"], 2.5)
+            self.assertEqual(d02["ad_spend_coverage_scope"], "PARTIAL_OR_UNKNOWN")
+            self.assertIsNone(d02["actual_ad_spend"])
+            sku = next(item for item in daily if item.get("record_type") == "sku")
+            self.assertTrue(any("未确认覆盖 SP、SB、SD" in warning for warning in sku["warnings"]))
 
 
 class D01SettingsTests(unittest.TestCase):
@@ -910,11 +984,11 @@ class SpAdApiTests(unittest.TestCase):
         with LingxingOpenApiClient("1234567890123456", "fixture-app-secret", http_client=http) as client:
             windows = client.query_sd_ad_spend_history(
                 access_token="fixture-token", store_sid=987654,
-                mappings=[SkuProductMapping("LOCAL-A", ("MSKU-A",), ())],
+                mappings=[SkuProductMapping("LOCAL-A", ("MSKU-A",), ("ASINTEST0001",))],
                 start_date=report_day, end_date=report_day,
             )
         window = windows[0]
-        self.assertEqual([item[0] for item in requests], [SD_PRODUCT_ADS_PATH, SD_CAMPAIGN_REPORTS_PATH, SD_PRODUCT_AD_REPORTS_PATH])
+        self.assertEqual([item[0] for item in requests], [SD_CAMPAIGN_REPORTS_PATH, SD_PRODUCT_AD_REPORTS_PATH, SD_PRODUCT_ADS_PATH])
         self.assertTrue(all(header == "2" for _path, _body, header in requests))
         self.assertTrue(all(body["show_detail"] == 0 and body["offset"] == 0 for path, body, _header in requests if path != SD_PRODUCT_ADS_PATH))
         self.assertTrue(window.report_complete)
@@ -923,6 +997,58 @@ class SpAdApiTests(unittest.TestCase):
         self.assertEqual(window.detail_cost_total, Decimal("3.00"))
         self.assertEqual(window.sku_daily_spends[0].actual_spend, Decimal("2.25"))
         self.assertEqual(window.unattributed_cost, Decimal("0.75"))
+        http.close()
+
+    def test_sd_historical_product_rows_attribute_without_catalog_and_block_identity_conflicts(self) -> None:
+        first_day = date(2026, 10, 10)
+        second_day = date(2026, 10, 11)
+        campaign_by_date = {
+            first_day: [{"campaign_id": 300, "profile_id": 900, "cost": 3, "report_date": first_day.isoformat()}],
+            second_day: [{"campaign_id": 301, "profile_id": 900, "cost": 4, "report_date": second_day.isoformat()}],
+        }
+        products_by_date = {
+            first_day: [
+                {"ad_id": 401, "asin": "ASIN-A", "sku": "MSKU-A", "ad_group_id": 402, "profile_id": 900, "campaign_id": 300, "cost": 2, "report_date": first_day.isoformat()},
+                {"ad_id": 403, "asin": "ASIN-B", "sku": "MSKU-A", "ad_group_id": 404, "profile_id": 900, "campaign_id": 300, "cost": 1, "report_date": first_day.isoformat()},
+            ],
+            second_day: [
+                {"ad_id": 405, "asin": "ASIN-A", "sku": "MSKU-A", "ad_group_id": 406, "profile_id": 900, "campaign_id": 301, "cost": 4, "report_date": second_day.isoformat()},
+            ],
+        }
+        request_paths: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            request_paths.append(request.url.path)
+            body = json.loads(request.content)
+            if request.url.path == SD_PRODUCT_ADS_PATH:
+                return httpx.Response(503, json={"message": "catalog unavailable"})
+            day = date.fromisoformat(body["report_date"])
+            rows = campaign_by_date[day] if request.url.path == SD_CAMPAIGN_REPORTS_PATH else products_by_date[day]
+            return httpx.Response(200, json=self._envelope(rows))
+
+        http = httpx.Client(transport=httpx.MockTransport(handler))
+        mappings = [
+            SkuProductMapping("LOCAL-A", ("MSKU-A",), ("ASIN-A",)),
+            SkuProductMapping("LOCAL-B", ("MSKU-B",), ("ASIN-B",)),
+        ]
+        with LingxingOpenApiClient("1234567890123456", "fixture-app-secret", http_client=http) as client:
+            windows = client.query_sd_ad_spend_history(
+                access_token="fixture-token", store_sid=987654, mappings=mappings,
+                start_date=first_day, end_date=second_day,
+            )
+        self.assertEqual(len(windows), 2)
+        self.assertEqual(request_paths, [
+            SD_CAMPAIGN_REPORTS_PATH, SD_PRODUCT_AD_REPORTS_PATH,
+            SD_CAMPAIGN_REPORTS_PATH, SD_PRODUCT_AD_REPORTS_PATH,
+            SD_PRODUCT_ADS_PATH,
+        ])
+        self.assertTrue(all(window.report_complete for window in windows))
+        self.assertEqual(windows[0].sku_daily_spends[0].local_sku, "LOCAL-A")
+        self.assertEqual(windows[0].sku_daily_spends[0].actual_spend, Decimal("2"))
+        self.assertEqual(windows[0].unattributed_cost, Decimal("1"))
+        self.assertEqual(windows[1].sku_daily_spends[0].report_date, second_day)
+        self.assertEqual(windows[1].sku_daily_spends[0].actual_spend, Decimal("4"))
+        self.assertEqual(windows[0].product_catalog_rows, [])
         http.close()
 
     def test_sp_campaign_matching_uses_profile_and_campaign_ids_together(self) -> None:

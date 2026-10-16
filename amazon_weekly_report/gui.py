@@ -1373,8 +1373,13 @@ class WeeklyReportApp(tk.Tk):
                 existing_report_path=existing,
             )
             ok = sum(item.status == "success" for item in result.sku_results)
+            partial = sum(item.status == "partial" for item in result.sku_results)
             failed = sum(item.status == "failed" for item in result.sku_results)
-            message = f"完成：{ok} 个 SKU 成功，{failed} 个失败。\n周报：{result.output_path}\n校验日志：{result.audit_path}"
+            message = (
+                f"完成：完整 {ok} 个 SKU，销售已生成但广告总花费未完整核验 {partial} 个，失败 {failed} 个。\n"
+                f"未完整核验的总广告花费与 ACOS 留空；详情见校验日志。\n"
+                f"周报：{result.output_path}\n校验日志：{result.audit_path}"
+            )
             return {"message": message, "output": str(result.output_path)}
 
         self._start_task(generate, self.report_status, "周报生成完成。")

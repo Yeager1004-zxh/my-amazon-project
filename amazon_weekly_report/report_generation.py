@@ -66,6 +66,7 @@ class ReportData:
     warnings: list[str] | None = None
     anomalies: list[str] | None = None
     orders_by_sku_date: dict[str, dict[date, Decimal | None]] | None = None
+    coverage_scope: str = "PARTIAL_OR_UNKNOWN"
 
 
 _NUMERIC_FIELDS = {
@@ -343,6 +344,10 @@ def _load_report(
         all_skus=all_skus,
         warnings=warnings,
         anomalies=anomalies,
+        coverage_scope=(
+            str(config.get("coverage_scope", "PARTIAL_OR_UNKNOWN"))
+            if report_name == "actual_ad_spend" else "NOT_APPLICABLE"
+        ),
     )
 
 
@@ -706,7 +711,7 @@ def generate_reports(
         reports["actual_ad_spend"] = ReportData(
             "actual_ad_spend", {}, {}, [],
             warnings=["本次 OpenAPI 流程尚未接入已核验的广告活动实际花费；相关单元格保持空白。"],
-            anomalies=[],
+            anomalies=[], coverage_scope="PARTIAL_OR_UNKNOWN",
         )
     else:
         reports_config = mapping["reports"]
@@ -718,12 +723,19 @@ def generate_reports(
             )
         else:
             reports["actual_ad_spend"] = ReportData(
-                "actual_ad_spend", {}, {}, [], warnings=["未配置广告实际花费来源；广告花费单元格保持空白。"], anomalies=[]
+                "actual_ad_spend", {}, {}, [],
+                warnings=["未配置广告实际花费来源；广告花费单元格保持空白。"],
+                anomalies=[], coverage_scope="PARTIAL_OR_UNKNOWN",
             )
         for optional_name in ("ad_performance", "traffic"):
             config = reports_config.get(optional_name, {})
             if config.get("enabled") and _report_is_configured(optional_name, config):
                 reports[optional_name] = _load_report(data_folder, optional_name, config, required=False)
+
+    ad_total_scope_confirmed = bool(
+        reports.get("actual_ad_spend")
+        and reports["actual_ad_spend"].coverage_scope == "ALL_AD_TYPES_TOTAL_CONFIRMED"
+    )
 
     sku_info: dict[str, dict[str, Any]] = {}
     failures: list[SkuGenerationResult] = []
@@ -863,6 +875,7 @@ def generate_reports(
             has_sales_amount = False
             ad_spend_total = Decimal("0")
             has_spend = False
+            ad_spend_incomplete_dates: list[str] = []
             for item in output_timeline:
                 row_number = by_day_row.get(item.day_number)
                 if row_number is None:
@@ -872,6 +885,18 @@ def generate_reports(
                 sales_source_present = item.date in reports["sales"].rows_by_sku_date.get(key, {})
                 spend_report = reports.get("actual_ad_spend")
                 spend_source_present = bool(spend_report and item.date in spend_report.rows_by_sku_date.get(key, {}))
+                source_spend = (
+                    spend_report.rows_by_sku_date.get(key, {}).get(item.date, {}).get("actual_spend")
+                    if spend_report else None
+                )
+                ad_total_complete = bool(ad_total_scope_confirmed and source_spend is not None)
+                if not ad_total_complete:
+                    # A reconciled SP or SD subtotal is useful evidence, but it
+                    # is not the complete cross-type total required by the
+                    # template. Clear stale generated totals on an update too.
+                    values["spend"] = None
+                    values["acos"] = None
+                    ad_spend_incomplete_dates.append(item.date.isoformat())
                 metrics = {
                     "price": values["price"], "sales": values["sales"], "organic_orders": values["organic_orders"],
                     "ad_orders": values["ad_orders"], "ad_order_share": values["ad_order_share"],
@@ -882,6 +907,13 @@ def generate_reports(
                     "overall_cvr": values["overall_cvr"], "acos": values["acos"],
                 }
                 for field, value in metrics.items():
+                    if field in {"spend", "acos"} and not ad_total_complete:
+                        metric_column = columns.get(field)
+                        if metric_column is not None:
+                            cell = worksheet.cell(row_number, metric_column)
+                            if cell.data_type != "f":
+                                cell.value = None
+                        continue
                     _write_metric(
                         worksheet, row_number, columns.get(field), value,
                         preserve=False,
@@ -919,17 +951,35 @@ def generate_reports(
                         ),
                         "sales_source": "lingxing_openapi" if api_mode else "mapped_file",
                         "ad_spend_source_row_present": spend_source_present,
+                        "ad_spend_source_value": _excel_number(source_spend),
+                        "ad_spend_coverage_scope": (
+                            spend_report.coverage_scope if spend_report else "PARTIAL_OR_UNKNOWN"
+                        ),
                         "actual_ad_spend": _excel_number(values["spend"]),
                     }
                 )
 
             sku_warnings = list(info["warnings"])
-            if not reports.get("actual_ad_spend") or not reports["actual_ad_spend"].rows_by_sku_date.get(key):
-                sku_warnings.append("没有该 SKU 可确认的广告实际花费记录；花费单元格保持空白，不视为 0。")
+            if not ad_total_scope_confirmed:
+                sku_warnings.append(
+                    "广告来源未确认覆盖 SP、SB、SD 全部广告类型；总广告花费和 ACOS 保持空白，不能视为 0。"
+                )
+            elif ad_spend_incomplete_dates:
+                sku_warnings.append(
+                    "以下日期没有完整广告总花费记录，花费和 ACOS 保持空白，不视为 0："
+                    + ", ".join(ad_spend_incomplete_dates)
+                )
+            if ad_spend_incomplete_dates:
+                has_spend = False
+                ad_spend_total = Decimal("0")
             successful.append(
                 SkuGenerationResult(
                     sku=sku,
-                    status="partial" if api_mode else "success",
+                    status=(
+                        "partial"
+                        if not ad_total_scope_confirmed or ad_spend_incomplete_dates
+                        else "success"
+                    ),
                     d01=d01.isoformat(),
                     d01_source=info["d01_source"],
                     latest_covered_date=latest.isoformat(),

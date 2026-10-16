@@ -1381,8 +1381,7 @@ class LingxingOpenApiClient:
         start_date: date,
         end_date: date,
     ) -> list[SpAdSpendWindow]:
-        """Read SD product costs and reconcile by campaign before SKU attribution."""
-        catalog_rows = self.query_sd_product_ads(access_token=access_token, store_sid=store_sid)
+        """Read historical SD product costs first; current catalog is diagnostic only."""
         windows = self._query_product_ad_spend_history(
             ad_type="SD",
             campaign_path=SD_CAMPAIGN_REPORTS_PATH,
@@ -1395,6 +1394,17 @@ class LingxingOpenApiClient:
             start_date=start_date,
             end_date=end_date,
         )
+        # The historical product report itself supplies report_date, MSKU, ASIN,
+        # campaign/ad identifiers and cost. A present-day catalog is not required
+        # to attribute that date-scoped row. Keep the catalog as best-effort
+        # preview context only, after the historical query has succeeded.
+        try:
+            catalog_rows = self.query_sd_product_ads(
+                access_token=access_token,
+                store_sid=store_sid,
+            )
+        except LingxingApiError:
+            catalog_rows = []
         return [replace(window, product_catalog_rows=catalog_rows) for window in windows]
 
     def _query_product_ad_spend_history(
@@ -1418,23 +1428,20 @@ class LingxingOpenApiClient:
         self._validate_query_range(start_date, end_date)
         if not mappings or any(not isinstance(item, SkuProductMapping) for item in mappings):
             raise LingxingApiError(f"{ad_type} 广告查询需要已验证的 local SKU→MSKU 映射。")
-        local_by_msku: dict[str, tuple[str, str]] = {}
-        ambiguous_mskus: set[str] = set()
+        local_by_msku: dict[str, set[str]] = defaultdict(set)
+        local_by_asin: dict[str, set[str]] = defaultdict(set)
         seen_local: set[str] = set()
+        local_names: dict[str, str] = {}
         for mapping in mappings:
             local_key = mapping.local_sku.casefold()
             if local_key in seen_local or not (mapping.seller_skus or mapping.asins):
                 raise LingxingApiError(f"{ad_type} 广告查询的 SKU 映射重复或没有可识别的 MSKU/ASIN。")
             seen_local.add(local_key)
+            local_names[local_key] = mapping.local_sku
             for seller_sku in mapping.seller_skus:
-                key = seller_sku.casefold()
-                if key in ambiguous_mskus:
-                    continue
-                if key in local_by_msku and local_by_msku[key][0] != mapping.local_sku:
-                    local_by_msku.pop(key)
-                    ambiguous_mskus.add(key)
-                    continue
-                local_by_msku[key] = (mapping.local_sku, seller_sku)
+                local_by_msku[seller_sku.casefold()].add(local_key)
+            for asin in mapping.asins:
+                local_by_asin[asin.casefold()].add(local_key)
 
         windows: list[SpAdSpendWindow] = []
         day_count = (end_date - start_date).days + 1
@@ -1480,27 +1487,38 @@ class LingxingOpenApiClient:
             if report_complete:
                 blocked_campaigns = {(item.profile_id, item.campaign_id) for item in discrepancies}
                 grouped: dict[tuple[str, str], list[SpProductAdSpend]] = defaultdict(list)
-                for row in products:
+                attributed_product_indexes: set[int] = set()
+                for index, row in enumerate(products):
                     if (row.profile_id, row.campaign_id) in blocked_campaigns:
                         continue
-                    mapped = local_by_msku.get(row.sku.casefold())
-                    if mapped is not None:
-                        local_sku, seller_sku = mapped
-                        grouped[(local_sku.casefold(), seller_sku.casefold())].append(row)
-                local_names = {item.local_sku.casefold(): item.local_sku for item in mappings}
-                for (local_key, msku_key), rows in grouped.items():
+                    # Historical report identifiers are authoritative for their
+                    # own report_date. Resolve exact MSKU and ASIN independently;
+                    # if both are known they must identify the same local SKU.
+                    owners = set(local_by_msku.get(row.sku.casefold(), set()))
+                    if row.asin:
+                        owners.update(local_by_asin.get(row.asin.casefold(), set()))
+                    if len(owners) == 1:
+                        local_key = next(iter(owners))
+                        grouped[(local_key, row.sku.casefold())].append(row)
+                        attributed_product_indexes.add(index)
+                for (local_key, _msku_key), rows in grouped.items():
                     sku_spends.append(
                         SkuDailyAdSpend(
                             store_sid=store_sid,
                             local_sku=local_names[local_key],
-                            seller_sku=local_by_msku[msku_key][1],
+                            seller_sku=rows[0].sku,
                             report_date=report_day,
                             actual_spend=sum((row.cost for row in rows), Decimal("0")),
                             campaign_count=len({(row.profile_id, row.campaign_id) for row in rows}),
                         )
                     )
+            else:
+                attributed_product_indexes = set()
             unmapped_cost = (
-                sum((row.cost for row in products if row.sku.casefold() not in local_by_msku), Decimal("0"))
+                sum(
+                    (row.cost for index, row in enumerate(products) if index not in attributed_product_indexes),
+                    Decimal("0"),
+                )
                 if report_complete else None
             )
             windows.append(SpAdSpendWindow(
