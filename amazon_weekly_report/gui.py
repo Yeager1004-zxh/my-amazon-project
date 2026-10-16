@@ -703,13 +703,18 @@ class WeeklyReportApp(tk.Tk):
             kind: sum(len(window.discrepancies) for window in windows_by_type[kind])
             for kind in ("SP", "SB", "SD")
         }
+        catalog_counts = {
+            kind: (len(windows_by_type[kind][0].product_catalog_rows) if windows_by_type[kind] else 0)
+            for kind in ("SB", "SD")
+        }
         self.report_ad_status.set(
             f"店铺 {result['_ad_store_name']}：{result['_ad_start'].isoformat()} 至 "
             f"{result['_ad_end'].isoformat()}（报表日期）。已核平日期数 SP/SB/SD="
             f"{complete_by_type['SP']}/{complete_by_type['SB']}/{complete_by_type['SD']}；"
             f"差异 campaign 数 SP/SB/SD={discrepancies['SP']}/{discrepancies['SB']}/{discrepancies['SD']}。"
-            "SP/SD 按 MSKU/ASIN 精确标识自动归属；SB 可依据完整商品目录归属独占广告组，或使用已核验的 ASIN 分摊金额。"
-            "Schema 未说明 cost 币种、report_date 时区、SB 视频覆盖范围及历史商品映射有效期；跨类型合计留空。"
+            f"SP/SD 按历史商品报表中的 MSKU/ASIN 精确标识预览；已读取 SB 创意目录 {catalog_counts['SB']} 条、SD 商品目录 {catalog_counts['SD']} 条。"
+            "新目录仅是当前快照，不能证明广告在历史报表日推广相同商品，因此 SB 广告组花费不自动归属。"
+            "SB 分摊接口字段语义仍待官方澄清；Schema 也未确认 cost 币种、report_date 时区及 SB 视频覆盖范围；跨类型合计留空。"
             "预览不写入周报；本次日期的 SP/SB/SD 数值都需在 Windows 逐日与领星后台核验。"
         )
 

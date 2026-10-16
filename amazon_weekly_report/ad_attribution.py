@@ -85,6 +85,10 @@ class PromotionTargetEvidence:
     ad_id: str = field(default="", repr=False)
     seller_sku: str = field(default="", repr=False)
     asin: str = field(default="", repr=False)
+    ad_creative_id: str = field(default="", repr=False)
+    # Current catalog identities are not historical proof. Set this only when
+    # the official source establishes that the identity was valid on report_date.
+    identity_valid_for_report: bool = field(default=False, repr=False)
 
 
 @dataclass(frozen=True)
@@ -280,25 +284,25 @@ def attribute_exclusive_ad_group_costs(
     targets_by_group: dict[tuple[str, int, date, str, str, str], list[PromotionTargetEvidence]] = defaultdict(list)
     duplicate_target_groups: set[tuple[str, int, date, str, str, str]] = set()
     seen_targets: set[tuple[object, ...]] = set()
-    target_bindings_by_ad_id: dict[
-        tuple[str, int, date, str, str],
-        set[tuple[tuple[str, int, date, str, str, str], str, str]],
-    ] = defaultdict(set)
+    target_bindings_by_ad_id: dict[tuple[object, ...], set[tuple[tuple[str, int, date, str, str, str], str, str]]] = defaultdict(set)
     for target in targets:
         if target.store_sid != store_sid:
             continue
         key = _campaign_key(target.ad_type, target.store_sid, target.report_date, target.profile_id, target.campaign_id)
         group_key = (*key, _norm(target.ad_group_id))
         target_identity = (
-            *group_key, _norm(target.ad_id), _norm(target.seller_sku), _norm(target.asin),
+            *group_key, _norm(target.ad_id), _norm(target.ad_creative_id), _norm(target.seller_sku), _norm(target.asin),
         )
         if target_identity in seen_targets:
             duplicate_target_groups.add(group_key)
         seen_targets.add(target_identity)
         targets_by_group[group_key].append(target)
         if target.ad_id.strip():
-            ad_identity = (target.ad_type.upper(), target.store_sid, target.report_date, _norm(target.profile_id), _norm(target.ad_id))
+            ad_identity = (target.ad_type.upper(), target.store_sid, target.report_date, _norm(target.profile_id), "ad", _norm(target.ad_id))
             target_bindings_by_ad_id[ad_identity].add((group_key, _norm(target.seller_sku), _norm(target.asin)))
+        if target.ad_creative_id.strip():
+            creative_identity = (target.ad_type.upper(), target.store_sid, target.report_date, _norm(target.profile_id), "creative", _norm(target.ad_creative_id))
+            target_bindings_by_ad_id[creative_identity].add((group_key, _norm(target.seller_sku), _norm(target.asin)))
     for bindings in target_bindings_by_ad_id.values():
         if len(bindings) > 1:
             duplicate_target_groups.update(binding[0] for binding in bindings)
@@ -325,6 +329,9 @@ def attribute_exclusive_ad_group_costs(
         group_targets = targets_by_group.get(group_key, ())
         if not group_targets:
             result.append(ExclusiveAdGroupAttribution(group, status="该广告组没有可核验的推广商品记录"))
+            continue
+        if any(not target.identity_valid_for_report for target in group_targets):
+            result.append(ExclusiveAdGroupAttribution(group, status="商品目录仅为当前快照，未证明在报表日有效；费用待确认"))
             continue
         resolved: set[str] = set()
         failure = ""

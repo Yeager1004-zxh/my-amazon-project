@@ -6,7 +6,7 @@ import re
 import threading
 import time
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -32,6 +32,9 @@ SB_CAMPAIGN_REPORTS_PATH = "/pb/openapi/newad/hsaCampaignReports"
 SB_AD_GROUP_REPORTS_PATH = "/pb/openapi/newad/hsaAdGroupReports"
 SD_CAMPAIGN_REPORTS_PATH = "/pb/openapi/newad/sdCampaignReports"
 SD_PRODUCT_AD_REPORTS_PATH = "/pb/openapi/newad/sdProductAdReports"
+SB_PRODUCT_ADS_PATH = "/pb/openapi/newad/hsaProductAds"
+SB_DIVIDE_ASIN_REPORTS_PATH = "/pb/openapi/newad/sbDivideAsinReports"
+SD_PRODUCT_ADS_PATH = "/pb/openapi/newad/sdProductAds"
 PRODUCT_PERFORMANCE_PAGE_LENGTH = 10_000
 ASIN_DAILY_PAGE_LENGTH = 1_000
 AD_REPORT_PAGE_LENGTH = 15
@@ -119,6 +122,25 @@ class SpProductAdSpend:
 
 
 @dataclass(frozen=True)
+class AdProductCatalogRecord:
+    """Current read-only ad/product identity record from the ads catalog APIs."""
+
+    ad_type: str = field(repr=False)
+    profile_id: str = field(repr=False)
+    campaign_id: str = field(repr=False)
+    ad_group_id: str = field(repr=False)
+    ad_id: str = field(default="", repr=False)
+    ad_creative_id: str = field(default="", repr=False)
+    seller_sku: str = field(default="", repr=False)
+    asins: tuple[str, ...] = field(default=(), repr=False)
+    state: str = field(default="", repr=False)
+    creative_type: str = field(default="", repr=False)
+    serving_status: str = field(default="", repr=False)
+    creation_date_value: Decimal | None = field(default=None, repr=False)
+    last_updated_date_value: Decimal | None = field(default=None, repr=False)
+
+
+@dataclass(frozen=True)
 class SkuDailyAdSpend:
     store_sid: int = field(repr=False)
     local_sku: str = field(repr=False)
@@ -168,6 +190,7 @@ class SpAdSpendWindow:
     report_complete: bool = field(default=False, repr=False)
     promotion_targets: tuple[PromotionTargetEvidence, ...] = field(default=(), repr=False)
     promotion_catalog_complete: bool = field(default=False, repr=False)
+    product_catalog_rows: tuple[AdProductCatalogRecord, ...] = field(default=(), repr=False)
 
 
 def split_date_windows(start_date: date, end_date: date, *, max_days: int = MAX_PRODUCT_QUERY_DAYS) -> list[tuple[date, date]]:
@@ -320,6 +343,71 @@ def parse_sd_product_ad_report_page(
     report_date: date,
 ) -> tuple[int, list[SpProductAdSpend]]:
     return _parse_product_ad_report_page(payload, report_date=report_date, endpoint="SD 广告商品报表")
+
+
+def _catalog_page_envelope(payload: Any, endpoint: str) -> tuple[int, list[dict[str, Any]], str]:
+    total, records = _report_page_records(payload, endpoint)
+    next_token = payload.get("next_token")
+    if not isinstance(next_token, str):
+        raise LingxingApiError(f"{endpoint}响应字段 next_token 类型无效。")
+    return total, records, next_token.strip()
+
+
+def _catalog_timestamp(value: Any, field_name: str, endpoint: str) -> Decimal:
+    # The docs call these numbers but give inconsistent epoch-like examples.
+    # Keep the raw numeric value; do not infer seconds, milliseconds or dates.
+    return _decimal_number(value, field_name, endpoint)
+
+
+def parse_sb_product_ads_page(payload: Any) -> tuple[int, list[AdProductCatalogRecord], str]:
+    """Parse the current SB creative catalog without treating it as history."""
+    endpoint = "SB 广告创意目录"
+    total, records, next_token = _catalog_page_envelope(payload, endpoint)
+    parsed: list[AdProductCatalogRecord] = []
+    for item in records:
+        profile_id = _report_identifier(item.get("profile_id"), "profile_id", endpoint)
+        campaign_id = _report_identifier(item.get("campaign_id"), "campaign_id", endpoint)
+        ad_group_id = _report_identifier(item.get("ad_group_id"), "ad_group_id", endpoint)
+        ad_creative_id = _report_identifier(item.get("ad_creative_id"), "ad_creative_id", endpoint)
+        raw_asins = item.get("asin")
+        if not isinstance(raw_asins, list) or any(not isinstance(asin, str) or not asin.strip() for asin in raw_asins):
+            raise LingxingApiError(f"{endpoint}响应字段 asin 必须是非空字符串组成的数组。")
+        parsed.append(AdProductCatalogRecord(
+            ad_type="SB",
+            profile_id=profile_id,
+            campaign_id=campaign_id,
+            ad_group_id=ad_group_id,
+            ad_creative_id=ad_creative_id,
+            asins=tuple(asin.strip() for asin in raw_asins),
+            state=_required_text(item.get("state"), "state", endpoint),
+            creative_type=_required_text(item.get("creative_type"), "creative_type", endpoint),
+            serving_status=_required_text(item.get("serving_status"), "serving_status", endpoint),
+            creation_date_value=_catalog_timestamp(item.get("creation_date"), "creation_date", endpoint),
+            last_updated_date_value=_catalog_timestamp(item.get("last_updated_date"), "last_updated_date", endpoint),
+        ))
+    return total, parsed, next_token
+
+
+def parse_sd_product_ads_page(payload: Any) -> tuple[int, list[AdProductCatalogRecord], str]:
+    """Parse the current SD product-ad catalog as a cross-check only."""
+    endpoint = "SD 广告商品目录"
+    total, records, next_token = _catalog_page_envelope(payload, endpoint)
+    parsed: list[AdProductCatalogRecord] = []
+    for item in records:
+        parsed.append(AdProductCatalogRecord(
+            ad_type="SD",
+            profile_id=_report_identifier(item.get("profile_id"), "profile_id", endpoint),
+            campaign_id=_report_identifier(item.get("campaign_id"), "campaign_id", endpoint),
+            ad_group_id=_report_identifier(item.get("ad_group_id"), "ad_group_id", endpoint),
+            ad_id=_report_identifier(item.get("ad_id"), "ad_id", endpoint),
+            seller_sku=_required_text(item.get("sku"), "sku", endpoint),
+            asins=(_required_text(item.get("asin"), "asin", endpoint),),
+            state=_required_text(item.get("state"), "state", endpoint),
+            serving_status=_required_text(item.get("serving_status"), "serving_status", endpoint),
+            creation_date_value=_catalog_timestamp(item.get("creation_date"), "creation_date", endpoint),
+            last_updated_date_value=_catalog_timestamp(item.get("last_updated_date"), "last_updated_date", endpoint),
+        ))
+    return total, parsed, next_token
 
 
 def _parse_product_ad_report_page(
@@ -661,7 +749,11 @@ def _redact_api_payload(value: Any, secrets: tuple[str, ...]) -> Any:
         safe: dict[str, Any] = {}
         for key, item in value.items():
             normalized_key = re.sub(r"[^a-z0-9]", "", str(key).casefold())
-            if any(marker in normalized_key for marker in ("token", "secret", "password", "sign", "authorization", "appkey", "appid")):
+            # A next_token is a pagination cursor, not an authentication token.
+            # The client must retain it to fetch the next read-only page.
+            if normalized_key == "nexttoken":
+                safe[key] = item
+            elif any(marker in normalized_key for marker in ("token", "secret", "password", "sign", "authorization", "appkey", "appid")):
                 safe[key] = "[已隐藏]"
             else:
                 safe[key] = _redact_api_payload(item, secrets)
@@ -679,7 +771,7 @@ def _redact_api_payload(value: Any, secrets: tuple[str, ...]) -> Any:
 
 
 class LingxingOpenApiClient:
-    """Official-host client for signed seller, product mapping, and daily sales reads."""
+    """Official-host client for signed read-only seller, sales, and ad queries."""
 
     def __init__(
         self,
@@ -1150,6 +1242,113 @@ class LingxingOpenApiClient:
             offset += len(page)
         return output
 
+    def _query_ad_product_catalog_pages(
+        self,
+        *,
+        path: str,
+        endpoint_label: str,
+        access_token: str,
+        store_sid: int,
+        parser: Any,
+        identity: Any,
+        api_version: str | None = None,
+    ) -> tuple[AdProductCatalogRecord, ...]:
+        """Read a complete current ad catalog using documented cursor/offset pagination."""
+        if not isinstance(access_token, str) or not access_token.strip():
+            raise LingxingApiError(f"Access Token 为空，未发送 {endpoint_label}查询。")
+        if isinstance(store_sid, bool) or not isinstance(store_sid, int) or store_sid <= 0:
+            raise LingxingApiError(f"{endpoint_label}查询必须使用动态店铺 SID。")
+        offset = 0
+        cursor = ""
+        expected_total: int | None = None
+        seen_tokens: set[str] = set()
+        seen_records: set[Any] = set()
+        output: list[AdProductCatalogRecord] = []
+        while True:
+            body: dict[str, Any] = {"sid": store_sid, "offset": offset, "length": AD_REPORT_PAGE_LENGTH}
+            if cursor:
+                # The documented cursor takes precedence over offset. Omit offset
+                # on cursor requests to avoid ambiguity between API versions.
+                body.pop("offset")
+                body["next_token"] = cursor
+            headers = {"X-API-VERSION": api_version} if api_version else None
+            with _AD_REPORT_REQUEST_LOCK:
+                payload = self._request_signed_post(
+                    path,
+                    access_token=access_token.strip(),
+                    body=body,
+                    headers=headers,
+                )
+            total, page, next_token = parser(payload)
+            if expected_total is None:
+                expected_total = total
+            elif total != expected_total:
+                raise LingxingApiError(f"{endpoint_label}分页期间 total 发生变化，已停止查询。")
+            if len(page) > AD_REPORT_PAGE_LENGTH or len(output) + len(page) > total:
+                raise LingxingApiError(f"{endpoint_label}分页返回数量无效。")
+            if not page and len(output) < total:
+                raise LingxingApiError(f"{endpoint_label}分页提前返回空页，数据可能不完整。")
+            for record in page:
+                record_id = identity(record)
+                if record_id in seen_records:
+                    raise LingxingApiError(f"{endpoint_label}分页返回重复广告记录，已停止查询。")
+                seen_records.add(record_id)
+                output.append(record)
+            offset += len(page)
+            if len(output) >= total:
+                break
+            if next_token:
+                if next_token in seen_tokens:
+                    raise LingxingApiError(f"{endpoint_label}分页游标重复，已停止查询。")
+                seen_tokens.add(next_token)
+                cursor = next_token
+            else:
+                # Both catalog schemas document offset. Use it only when the
+                # service returned no cursor, and still validate total/duplicates.
+                cursor = ""
+                if offset >= total:
+                    break
+        return tuple(output)
+
+    def query_sb_product_ads(
+        self,
+        *,
+        access_token: str,
+        store_sid: int,
+    ) -> tuple[AdProductCatalogRecord, ...]:
+        """Read current SB creative ASINs; the endpoint does not provide history."""
+        return self._query_ad_product_catalog_pages(
+            path=SB_PRODUCT_ADS_PATH,
+            endpoint_label="SB 广告创意目录",
+            access_token=access_token,
+            store_sid=store_sid,
+            parser=parse_sb_product_ads_page,
+            identity=lambda row: (row.profile_id, row.campaign_id, row.ad_group_id, row.ad_creative_id),
+        )
+
+    def query_sd_product_ads(
+        self,
+        *,
+        access_token: str,
+        store_sid: int,
+    ) -> tuple[AdProductCatalogRecord, ...]:
+        """Read current SD ad/product identities for cross-checking historical rows."""
+        return self._query_ad_product_catalog_pages(
+            path=SD_PRODUCT_ADS_PATH,
+            endpoint_label="SD 广告商品目录",
+            access_token=access_token,
+            store_sid=store_sid,
+            parser=parse_sd_product_ads_page,
+            identity=lambda row: (row.profile_id, row.ad_id),
+            api_version="2",
+        )
+
+    def query_sb_divide_asin_reports(self, **_kwargs: Any) -> None:
+        """Block the SB allocation endpoint until its malformed contract is corrected."""
+        raise LingxingApiNotReady(
+            f"{SB_DIVIDE_ASIN_REPORTS_PATH} 的 Schema 与示例字段错位，spends/percent 的结构和金额含义无法核验；未发送请求。"
+        )
+
     def query_sp_ad_spend_history(
         self,
         *,
@@ -1183,7 +1382,8 @@ class LingxingOpenApiClient:
         end_date: date,
     ) -> list[SpAdSpendWindow]:
         """Read SD product costs and reconcile by campaign before SKU attribution."""
-        return self._query_product_ad_spend_history(
+        catalog_rows = self.query_sd_product_ads(access_token=access_token, store_sid=store_sid)
+        windows = self._query_product_ad_spend_history(
             ad_type="SD",
             campaign_path=SD_CAMPAIGN_REPORTS_PATH,
             product_path=SD_PRODUCT_AD_REPORTS_PATH,
@@ -1195,6 +1395,7 @@ class LingxingOpenApiClient:
             start_date=start_date,
             end_date=end_date,
         )
+        return [replace(window, product_catalog_rows=catalog_rows) for window in windows]
 
     def _query_product_ad_spend_history(
         self,
@@ -1331,6 +1532,8 @@ class LingxingOpenApiClient:
         if isinstance(store_sid, bool) or not isinstance(store_sid, int):
             raise LingxingApiError("SB 广告报表查询必须使用动态店铺 SID。")
         self._validate_query_range(start_date, end_date)
+        catalog_rows = self.query_sb_product_ads(access_token=access_token, store_sid=store_sid)
+        catalog_complete = True  # The pagination helper returns only after total is fully read.
         windows: list[SpAdSpendWindow] = []
         day_count = (end_date - start_date).days + 1
         for day_offset in range(day_count):
@@ -1389,6 +1592,25 @@ class LingxingOpenApiClient:
                 # contract is available.
                 unattributed_cost=campaign_total if report_complete else None,
                 report_complete=report_complete,
+                promotion_targets=tuple(
+                    PromotionTargetEvidence(
+                        ad_type="SB",
+                        store_sid=store_sid,
+                        report_date=report_day,
+                        profile_id=row.profile_id,
+                        campaign_id=row.campaign_id,
+                        ad_group_id=row.ad_group_id,
+                        asin=asin,
+                        ad_creative_id=row.ad_creative_id,
+                        # This catalog has no report-date history or effective
+                        # timezone, so it is candidate identity only.
+                        identity_valid_for_report=False,
+                    )
+                    for row in catalog_rows
+                    for asin in row.asins
+                ),
+                promotion_catalog_complete=catalog_complete,
+                product_catalog_rows=catalog_rows,
             ))
         return windows
 

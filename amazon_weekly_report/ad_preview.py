@@ -68,8 +68,8 @@ def _type_state(kind: str, window: SpAdSpendWindow | None, *, matched_rows: int 
     if kind == "SB" and not window.product_rows:
         if window.report_complete:
             if window.promotion_targets and window.promotion_catalog_complete:
-                return "SB 推广商品目录已核验，但没有该 SKU 的独占广告组费用记录"
-            return "SB 活动/广告组成本已核平；商品推广身份接口未接入，费用待自动归属"
+                return "SB 当前创意目录已读取；报表日推广身份未核验，费用暂不归属"
+            return "SB 活动/广告组成本已核平；创意目录未确认，费用待自动归属"
         if window.discrepancies:
             return "SB 活动与广告组成本未核平；归属与金额均未知"
         return "SB 活动或广告组无记录（未知，不视为零）"
@@ -85,7 +85,7 @@ def _window_state(kind: str, window: SpAdSpendWindow | None) -> str:
         return f"{kind} 查询结果缺失"
     if window.report_complete:
         if kind == "SB":
-            detail = "ASIN 分摊" if window.product_rows else "广告组"
+            detail = "商品/分摊明细" if window.product_rows else "广告组"
         else:
             detail = "商品"
         return f"{kind} 活动与{detail}成本已核平"
@@ -201,6 +201,19 @@ def build_ad_spend_preview(
                 unmatched_costs[(kind, window.start_date)] = None
         by_kind_date[kind] = day_map
 
+    def catalog_sku_candidate(seller_sku: str, asins: Sequence[str]) -> str:
+        owners: set[str] = set()
+        for mapping in mappings:
+            if seller_sku and any(seller_sku.casefold() == value.casefold() for value in mapping.seller_skus):
+                owners.add(mapping.local_sku)
+            if any(asin.casefold() == value.casefold() for asin in asins for value in mapping.asins):
+                owners.add(mapping.local_sku)
+        if len(owners) == 1:
+            return next(iter(owners))
+        if owners:
+            return "归属冲突候选：" + ", ".join(sorted(owners))
+        return ""
+
     summaries: list[AdSpendSummaryPreview] = []
     details: list[AdSpendDetailPreview] = []
     day_count = (end_date - start_date).days + 1
@@ -288,4 +301,24 @@ def build_ad_spend_preview(
                     row.campaign_id, row.ad_group_id, _money(row.cost),
                     outcome.status if outcome else "只用于和活动总额核对，不重复计费",
                 ))
+            # Catalog endpoints expose current identities, not report-date
+            # history. Show their exact IDs for diagnosis, but never attach cost.
+            if report_day == start_date:
+                for catalog in window.product_catalog_rows:
+                    catalog_asins = catalog.asins or ("",)
+                    for asin in catalog_asins:
+                        details.append(AdSpendDetailPreview(
+                            day_text,
+                            kind,
+                            "当前商品目录快照（非历史费用）",
+                            catalog_sku_candidate(catalog.seller_sku, (asin,)),
+                            catalog.seller_sku,
+                            asin,
+                            catalog.ad_id or catalog.ad_creative_id,
+                            catalog.profile_id,
+                            catalog.campaign_id,
+                            catalog.ad_group_id,
+                            "",
+                            "当前目录 ID 关系仅供定位；未证明在报表日有效，不参与费用归属或合计",
+                        ))
     return summaries, details

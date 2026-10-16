@@ -42,13 +42,17 @@ from amazon_weekly_report.d01_settings import D01SettingsError, get_d01_dates, l
 from amazon_weekly_report.providers.lingxing_api import (
     SB_AD_GROUP_REPORTS_PATH,
     SB_CAMPAIGN_REPORTS_PATH,
+    SB_PRODUCT_ADS_PATH,
+    SB_DIVIDE_ASIN_REPORTS_PATH,
     SD_CAMPAIGN_REPORTS_PATH,
     SD_PRODUCT_AD_REPORTS_PATH,
+    SD_PRODUCT_ADS_PATH,
     SP_CAMPAIGN_REPORTS_PATH,
     SP_PRODUCT_AD_REPORTS_PATH,
     LingxingApiError,
     LingxingApiNotReady,
     LingxingOpenApiClient,
+    AdProductCatalogRecord,
     SbAdGroupSpend,
     SpAdSpendWindow,
     SpCampaignSpend,
@@ -61,10 +65,12 @@ from amazon_weekly_report.providers.lingxing_api import (
     parse_product_performance_page,
     parse_sb_ad_group_report_page,
     parse_sb_campaign_report_page,
+    parse_sb_product_ads_page,
     parse_sp_campaign_report_page,
     parse_sp_product_ad_report_page,
     parse_sd_campaign_report_page,
     parse_sd_product_ad_report_page,
+    parse_sd_product_ads_page,
     parse_seller_list_response,
     split_date_windows,
 )
@@ -648,6 +654,14 @@ class SpAdApiTests(unittest.TestCase):
             "data": records,
         }
 
+    @staticmethod
+    def _catalog_envelope(
+        records: list[dict[str, Any]], total: int | None = None, next_token: str = ""
+    ) -> dict[str, Any]:
+        payload = SpAdApiTests._envelope(records, total)
+        payload["next_token"] = next_token
+        return payload
+
     def test_sp_report_parsers_validate_costs_ids_dates_and_business_code(self) -> None:
         report_day = date(2026, 8, 5)
         campaign = self._envelope([{
@@ -792,6 +806,8 @@ class SpAdApiTests(unittest.TestCase):
         def handler(request: httpx.Request) -> httpx.Response:
             body = json.loads(request.content)
             requests.append((request.url.path, body, request.headers.get("X-API-VERSION")))
+            if request.url.path == SB_PRODUCT_ADS_PATH:
+                return httpx.Response(200, json=self._catalog_envelope([]))
             if request.url.path == SB_CAMPAIGN_REPORTS_PATH:
                 return httpx.Response(200, json=self._envelope(campaign_rows))
             offset = body["offset"]
@@ -805,13 +821,14 @@ class SpAdApiTests(unittest.TestCase):
             )
         window = windows[0]
         self.assertEqual([item[0] for item in requests], [
-            SB_CAMPAIGN_REPORTS_PATH, SB_AD_GROUP_REPORTS_PATH, SB_AD_GROUP_REPORTS_PATH,
+            SB_PRODUCT_ADS_PATH, SB_CAMPAIGN_REPORTS_PATH, SB_AD_GROUP_REPORTS_PATH, SB_AD_GROUP_REPORTS_PATH,
         ])
-        self.assertTrue(all(header == "2" for _path, _body, header in requests))
+        self.assertTrue(all(header == "2" for path, _body, header in requests if path != SB_PRODUCT_ADS_PATH))
+        self.assertIsNone(requests[0][2])
         self.assertTrue(all(body["sid"] == 987654 and body["length"] == 15 for _path, body, _header in requests))
-        self.assertEqual([body["offset"] for _path, body, _header in requests], [0, 0, 15])
-        self.assertTrue(all("show_detail" not in body for _path, body, _header in requests))
-        self.assertEqual(requests[2][1]["offset"], 15)
+        self.assertEqual([body["offset"] for _path, body, _header in requests], [0, 0, 0, 15])
+        self.assertTrue(all("show_detail" not in body for path, body, _header in requests if path != SB_PRODUCT_ADS_PATH))
+        self.assertEqual(requests[3][1]["offset"], 15)
         self.assertEqual(window.ad_type, "SB")
         self.assertTrue(window.report_complete)
         self.assertEqual(window.campaign_cost_total, Decimal("4.75"))
@@ -819,6 +836,52 @@ class SpAdApiTests(unittest.TestCase):
         self.assertEqual(window.unattributed_cost, Decimal("4.75"))
         self.assertEqual(len(window.ad_group_rows), 16)
         self.assertEqual(window.sku_daily_spends, ())
+        http.close()
+
+    def test_current_sb_catalog_is_candidate_only_for_historical_report_date(self) -> None:
+        report_day = date(2026, 8, 29)
+        requests: list[str] = []
+        campaign = [{"campaign_id": 10, "profile_id": 20, "cost": 19.21, "report_date": report_day.isoformat()}]
+        groups = [{"campaign_id": 10, "ad_group_id": 11, "profile_id": 20, "cost": 19.21, "report_date": report_day.isoformat()}]
+        catalog = [{
+            "campaign_id": 10, "ad_group_id": 11, "ad_creative_id": 12,
+            "profile_id": 20, "state": "ENABLED", "serving_status": "AD_STATUS_LIVE",
+            "creation_date": 1704643200000, "last_updated_date": 1704643200000,
+            "asin": ["ASIN-A"], "creative_type": "PRODUCT_COLLECTION",
+        }]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request.url.path)
+            if request.url.path == SB_PRODUCT_ADS_PATH:
+                return httpx.Response(200, json=self._catalog_envelope(catalog))
+            if request.url.path == SB_CAMPAIGN_REPORTS_PATH:
+                return httpx.Response(200, json=self._envelope(campaign))
+            return httpx.Response(200, json=self._envelope(groups))
+
+        http = httpx.Client(transport=httpx.MockTransport(handler))
+        with LingxingOpenApiClient("1234567890123456", "fixture-app-secret", http_client=http) as client:
+            windows = client.query_sb_ad_spend_history(
+                access_token="fixture-token", store_sid=77,
+                start_date=report_day, end_date=report_day,
+            )
+        window = windows[0]
+        self.assertEqual(requests, [SB_PRODUCT_ADS_PATH, SB_CAMPAIGN_REPORTS_PATH, SB_AD_GROUP_REPORTS_PATH])
+        self.assertTrue(window.report_complete)
+        self.assertTrue(window.promotion_catalog_complete)
+        self.assertEqual(window.promotion_targets[0].asin, "ASIN-A")
+        self.assertFalse(window.promotion_targets[0].identity_valid_for_report)
+        summaries, details = build_ad_spend_preview(
+            windows_by_type={"SB": windows},
+            mappings=[SkuProductMapping("LOCAL-A", (), ("ASIN-A",))],
+            store_sid=77, requested_skus=["LOCAL-A"], start_date=report_day, end_date=report_day,
+        )
+        sku_row = next(row for row in summaries if row.local_sku == "LOCAL-A")
+        catalog_row = next(row for row in details if row.report_level.startswith("当前商品目录"))
+        self.assertEqual(sku_row.sb_cost, "")
+        self.assertIn("历史", sku_row.integrity)
+        self.assertEqual(catalog_row.local_sku, "LOCAL-A")
+        self.assertEqual(catalog_row.cost, "")
+        self.assertIn("不参与费用归属", catalog_row.integrity)
         http.close()
 
     def test_sd_product_cost_is_mapped_only_after_campaign_reconciliation(self) -> None:
@@ -833,6 +896,13 @@ class SpAdApiTests(unittest.TestCase):
         def handler(request: httpx.Request) -> httpx.Response:
             body = json.loads(request.content)
             requests.append((request.url.path, body, request.headers.get("X-API-VERSION")))
+            if request.url.path == SD_PRODUCT_ADS_PATH:
+                return httpx.Response(200, json=self._catalog_envelope([{
+                    "ad_id": 399, "ad_group_id": 398, "campaign_id": 397, "state": "enabled",
+                    "sku": "MSKU-A", "asin": "ASINTEST0001", "profile_id": 900,
+                    "creation_date": 1640591614, "last_updated_date": 1640591614,
+                    "serving_status": "AD_STATUS_LIVE",
+                }]))
             records = campaign_rows if request.url.path == SD_CAMPAIGN_REPORTS_PATH else product_rows
             return httpx.Response(200, json=self._envelope(records))
 
@@ -844,10 +914,11 @@ class SpAdApiTests(unittest.TestCase):
                 start_date=report_day, end_date=report_day,
             )
         window = windows[0]
-        self.assertEqual([item[0] for item in requests], [SD_CAMPAIGN_REPORTS_PATH, SD_PRODUCT_AD_REPORTS_PATH])
+        self.assertEqual([item[0] for item in requests], [SD_PRODUCT_ADS_PATH, SD_CAMPAIGN_REPORTS_PATH, SD_PRODUCT_AD_REPORTS_PATH])
         self.assertTrue(all(header == "2" for _path, _body, header in requests))
-        self.assertTrue(all(body["show_detail"] == 0 and body["offset"] == 0 for _path, body, _header in requests))
+        self.assertTrue(all(body["show_detail"] == 0 and body["offset"] == 0 for path, body, _header in requests if path != SD_PRODUCT_ADS_PATH))
         self.assertTrue(window.report_complete)
+        self.assertEqual(window.product_catalog_rows[0].ad_id, "399")
         self.assertEqual(window.campaign_cost_total, Decimal("3"))
         self.assertEqual(window.detail_cost_total, Decimal("3.00"))
         self.assertEqual(window.sku_daily_spends[0].actual_spend, Decimal("2.25"))
@@ -930,6 +1001,77 @@ class SpAdApiTests(unittest.TestCase):
         with self.assertRaises(LingxingApiError):
             parse_sb_ad_group_report_page(self._envelope([dict(group["data"][0], cost="1.125")]), report_date=report_day)
 
+    def test_sb_sd_product_catalog_parsers_validate_real_schema_fields(self) -> None:
+        sb = self._catalog_envelope([{
+            "campaign_id": 101, "ad_group_id": 102, "ad_creative_id": 103,
+            "creative_id": 9, "name": "synthetic", "state": "ENABLED",
+            "creation_date": 1704643200000, "last_updated_date": 1704643200000,
+            "profile_id": 104, "serving_status": "AD_STATUS_LIVE",
+            "asin": ["ASIN-A", "ASIN-B"], "creative_type": "PRODUCT_COLLECTION",
+            "creative": {"asins": ["IGNORED-DETAIL-ASIN"]},
+            "landing_page": {"asins": ["IGNORED-LANDING-ASIN"]},
+            "video_creatives": [{"videos": [{"versions": [{"url": "https://example.invalid/ignored.mp4"}]}]}],
+        }])
+        total, sb_rows, token = parse_sb_product_ads_page(sb)
+        self.assertEqual((total, token), (1, ""))
+        self.assertEqual(sb_rows[0].asins, ("ASIN-A", "ASIN-B"))
+        self.assertEqual(sb_rows[0].ad_creative_id, "103")
+        self.assertEqual(sb_rows[0].creation_date_value, Decimal("1704643200000"))
+
+        sd = self._catalog_envelope([{
+            "ad_id": 201, "ad_group_id": 202, "campaign_id": 203, "state": "enabled",
+            "sku": "MSKU-A", "asin": "ASIN-C", "profile_id": 204,
+            "creation_date": 1640591614, "last_updated_date": 1640591614,
+            "serving_status": "AD_STATUS_LIVE",
+        }])
+        total, sd_rows, token = parse_sd_product_ads_page(sd)
+        self.assertEqual((total, token, sd_rows[0].seller_sku, sd_rows[0].asins), (1, "", "MSKU-A", ("ASIN-C",)))
+
+        with self.assertRaises(LingxingApiError):
+            parse_sb_product_ads_page(self._catalog_envelope([dict(sb["data"][0], asin="ASIN-A")]))
+        with self.assertRaises(LingxingApiError):
+            parse_sd_product_ads_page(self._catalog_envelope([dict(sd["data"][0], ad_id="not-numeric")]))
+        with self.assertRaises(LingxingApiError):
+            parse_sd_product_ads_page(dict(sd, next_token=None))
+
+    def test_sb_product_catalog_cursor_pagination_is_read_only_and_complete(self) -> None:
+        records = [{
+            "campaign_id": 100 + index, "ad_group_id": 200 + index,
+            "ad_creative_id": 300 + index, "state": "ENABLED",
+            "creation_date": 1704643200000, "last_updated_date": 1704643200000,
+            "profile_id": 900, "serving_status": "AD_STATUS_LIVE",
+            "asin": [f"ASIN-{index}"], "creative_type": "PRODUCT_COLLECTION",
+        } for index in range(16)]
+        requests: list[tuple[dict[str, Any], str | None]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content)
+            requests.append((body, request.headers.get("X-API-VERSION")))
+            cursor_request = body.get("next_token") == "cursor-1"
+            rows = records[15:] if cursor_request else records[:15]
+            next_token = "" if cursor_request else "cursor-1"
+            return httpx.Response(200, json=self._catalog_envelope(rows, 16, next_token))
+
+        http = httpx.Client(transport=httpx.MockTransport(handler))
+        with LingxingOpenApiClient("1234567890123456", "fixture-app-secret", http_client=http) as client:
+            rows = client.query_sb_product_ads(access_token="fixture-token", store_sid=987654)
+        self.assertEqual(len(rows), 16)
+        self.assertEqual(requests[0][0], {"sid": 987654, "offset": 0, "length": 15})
+        self.assertEqual(requests[1][0], {"sid": 987654, "length": 15, "next_token": "cursor-1"})
+        self.assertEqual([header for _body, header in requests], [None, None])
+        http.close()
+
+    def test_malformed_sb_divide_contract_is_blocked_before_network(self) -> None:
+        requests: list[httpx.Request] = []
+        http = httpx.Client(transport=httpx.MockTransport(
+            lambda request: requests.append(request) or httpx.Response(200, json={})
+        ))
+        with LingxingOpenApiClient("1234567890123456", "fixture-app-secret", http_client=http) as client:
+            with self.assertRaises(LingxingApiNotReady):
+                client.query_sb_divide_asin_reports(access_token="fixture-token", profile_id=900, report_date="2026-08-29")
+        self.assertEqual(requests, [])
+        http.close()
+
 
 class AdPreviewTests(unittest.TestCase):
     def test_summary_shows_sku_candidates_and_type_separated_unallocated_costs(self) -> None:
@@ -974,7 +1116,7 @@ class AdPreviewTests(unittest.TestCase):
         self.assertEqual((sku_row.sp_cost, sku_row.sb_cost, sku_row.sd_cost), ("1.00", "", "2.00"))
         self.assertEqual(sku_row.confirmed_total, "")
         self.assertEqual(sku_row.unattributed_cost, "")
-        self.assertIn("SB 活动/广告组成本已核平；商品推广身份接口未接入", sku_row.integrity)
+        self.assertIn("SB 活动/广告组成本已核平；创意目录未确认", sku_row.integrity)
         self.assertIn("币种/日期口径/历史映射时效尚未全部验收", sku_row.integrity)
         self.assertEqual((unallocated_row.sp_cost, unallocated_row.sb_cost, unallocated_row.sd_cost), ("0.50", "4.00", "0.25"))
         self.assertEqual(unallocated_row.confirmed_total, "")
@@ -1019,7 +1161,7 @@ class AdPreviewTests(unittest.TestCase):
             campaign_cost_total=Decimal("19.21"), detail_cost_total=Decimal("19.21"),
             unattributed_cost=Decimal("19.21"), report_complete=True,
             promotion_targets=(
-                PromotionTargetEvidence("SB", 77, report_day, "profile-1", "campaign-1", "group-1", "ad-1", "", "ASIN-A"),
+                PromotionTargetEvidence("SB", 77, report_day, "profile-1", "campaign-1", "group-1", "ad-1", "", "ASIN-A", identity_valid_for_report=True),
             ),
             promotion_catalog_complete=True,
         )
@@ -1203,8 +1345,8 @@ class AdAttributionTests(unittest.TestCase):
             AdGroupCostEvidence("SB", 10, report_day, "profile-1", "campaign-1", "group-a", Decimal("19.21")),
         ]
         targets = [
-            PromotionTargetEvidence("SB", 10, report_day, "profile-1", "campaign-1", "group-a", "ad-a", "", "ASIN-A"),
-            PromotionTargetEvidence("SB", 10, report_day, "profile-1", "campaign-1", "group-a", "ad-b", "", "ASIN-A2"),
+            PromotionTargetEvidence("SB", 10, report_day, "profile-1", "campaign-1", "group-a", "ad-a", "", "ASIN-A", identity_valid_for_report=True),
+            PromotionTargetEvidence("SB", 10, report_day, "profile-1", "campaign-1", "group-a", "ad-b", "", "ASIN-A2", identity_valid_for_report=True),
         ]
         result = attribute_exclusive_ad_group_costs(
             store_sid=10,
@@ -1237,8 +1379,8 @@ class AdAttributionTests(unittest.TestCase):
                 AttributionMapping("LOCAL-B", (), ("ASIN-B",)),
             ],
             promoted_targets=[
-                PromotionTargetEvidence("SB", 10, report_day, "profile-1", "campaign-1", "group-a", asin="ASIN-A"),
-                PromotionTargetEvidence("SB", 10, report_day, "profile-1", "campaign-1", "group-a", asin="ASIN-B"),
+                PromotionTargetEvidence("SB", 10, report_day, "profile-1", "campaign-1", "group-a", asin="ASIN-A", identity_valid_for_report=True),
+                PromotionTargetEvidence("SB", 10, report_day, "profile-1", "campaign-1", "group-a", asin="ASIN-B", identity_valid_for_report=True),
             ],
             ad_group_costs=[AdGroupCostEvidence("SB", 10, report_day, "profile-1", "campaign-1", "group-a", Decimal("19.21"))],
             campaign_costs=[CampaignCostEvidence("SB", 10, report_day, "profile-1", "campaign-1", Decimal("19.21"))],
@@ -1249,7 +1391,7 @@ class AdAttributionTests(unittest.TestCase):
 
     def test_duplicate_promotion_catalog_rows_block_exclusive_group_assignment(self) -> None:
         report_day = date(2026, 8, 29)
-        target = PromotionTargetEvidence("SB", 10, report_day, "profile-1", "campaign-1", "group-a", "ad-a", "", "ASIN-A")
+        target = PromotionTargetEvidence("SB", 10, report_day, "profile-1", "campaign-1", "group-a", "ad-a", "", "ASIN-A", identity_valid_for_report=True)
         result = attribute_exclusive_ad_group_costs(
             store_sid=10,
             mappings=[AttributionMapping("LOCAL-A", (), ("ASIN-A",))],
