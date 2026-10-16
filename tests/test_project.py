@@ -22,6 +22,7 @@ from amazon_weekly_report.mcp_client import (
     is_directory_search_tool,
     is_read_only_query_candidate,
     redact_sensitive,
+    validate_json_schema,
 )
 from amazon_weekly_report.providers.lingxing_api import (
     LingxingApiError,
@@ -462,8 +463,12 @@ class McpClientTests(unittest.TestCase):
             "查询商品表现 ASIN 列表",
             {
                 "type": "object",
-                "properties": {"offset": {"type": "integer"}, "length": {"type": "integer"}},
-                "required": ["offset", "length"],
+                "properties": {
+                    "offset": {"type": "integer"},
+                    "length": {"type": "integer"},
+                    "search_value": {"type": "array"},
+                },
+                "required": ["offset", "length", "search_value"],
                 "additionalProperties": False,
             },
         )
@@ -514,15 +519,20 @@ class McpClientTests(unittest.TestCase):
         client.connect()
         client.call_directory_search(search_tool, {})
         grant = VerifiedReadOnlyGrant(business.tool_id, business.permission_fingerprint)
+        valid_arguments = {"offset": 0, "length": 5, "search_value": ["ex3106"]}
         with self.assertRaises(McpClientError):
-            client.call_verified_business_query(action_tool, business, {"offset": 0, "length": 5}, VerifiedReadOnlyGrant("other_id", business.permission_fingerprint))
+            client.call_verified_business_query(action_tool, business, valid_arguments, VerifiedReadOnlyGrant("other_id", business.permission_fingerprint))
         self.assertEqual(len(calls), 1, "unverified action must not be sent")
         with self.assertRaises(McpClientError):
-            client.call_verified_business_query(action_tool, business, {"offset": 0}, grant)
+            client.call_verified_business_query(action_tool, business, {"length": 5, "search_value": ["ex3106"]}, grant)
         with self.assertRaises(McpClientError):
-            client.call_verified_business_query(action_tool, business, {"offset": 0, "length": 5, "unexpected": "value"}, grant)
+            client.call_verified_business_query(action_tool, business, {"offset": 0, "search_value": ["ex3106"]}, grant)
         with self.assertRaises(McpClientError):
-            client.call_verified_business_query(action_tool, business, {"offset": "0", "length": 5}, grant)
+            client.call_verified_business_query(action_tool, business, {**valid_arguments, "unexpected": "value"}, grant)
+        with self.assertRaises(McpClientError):
+            client.call_verified_business_query(action_tool, business, {**valid_arguments, "offset": "0"}, grant)
+        with self.assertRaises(McpClientError):
+            client.call_verified_business_query(action_tool, business, {**valid_arguments, "search_value": [{"sku": "ex3106"}]}, grant)
         changed_schema = BusinessTool(
             business.tool_id,
             business.name,
@@ -546,11 +556,11 @@ class McpClientTests(unittest.TestCase):
             {},
         )
         with self.assertRaises(McpClientError):
-            client.call_verified_business_query(bad_outer_schema, business, {"offset": 0, "length": 5}, grant)
+            client.call_verified_business_query(bad_outer_schema, business, valid_arguments, grant)
         self.assertEqual(len(calls), 1, "invalid params and a changed ID/Schema must not send action")
-        result = client.call_verified_business_query(action_tool, business, {"offset": 0, "length": 5}, grant)
+        result = client.call_verified_business_query(action_tool, business, valid_arguments, grant)
         self.assertIn("content", result)
-        self.assertEqual(calls[-1], {"name": "action", "arguments": {"toolId": business.tool_id, "params": {"offset": 0, "length": 5}}})
+        self.assertEqual(calls[-1], {"name": "action", "arguments": {"toolId": business.tool_id, "params": valid_arguments}})
         unsafe = BusinessTool("update_listing", "修改Listing", "更新商品信息", business.input_schema)
         self.assertFalse(is_read_only_query_candidate(unsafe))
         camel_case_query = BusinessTool("getSkuDailySales", "SKU销量", "查询 SKU 每日销量", business.input_schema)
@@ -564,6 +574,33 @@ class McpClientTests(unittest.TestCase):
         self.assertFalse(is_read_only_query_candidate(operation_schema))
         client.close()
         http.close()
+
+    def test_array_without_items_uses_scalar_allowlist_and_keeps_array_constraints(self) -> None:
+        schema = {
+            "type": "object",
+            "properties": {
+                "search_value": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 3,
+                    "uniqueItems": True,
+                }
+            },
+            "required": ["search_value"],
+            "additionalProperties": False,
+        }
+        validate_json_schema(schema, {"search_value": ["ex3106"]})
+        validate_json_schema(schema, {"search_value": ["ex3106", 0, None]})
+        with self.assertRaises(McpClientError):
+            validate_json_schema(schema, {"search_value": []})
+        with self.assertRaises(McpClientError):
+            validate_json_schema(schema, {"search_value": ["ex3106", "ex3106"]})
+        with self.assertRaises(McpClientError):
+            validate_json_schema(schema, {"search_value": ["ex3106", "ex3114", "ex3115", "ex3116"]})
+        with self.assertRaises(McpClientError):
+            validate_json_schema(schema, {"search_value": [{"sku": "ex3106"}]})
+        with self.assertRaises(McpClientError):
+            validate_json_schema(schema, {"search_value": [["ex3106"]]})
 
 
 class LingxingOpenApiTests(unittest.TestCase):

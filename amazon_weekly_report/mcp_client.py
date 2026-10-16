@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -325,11 +326,25 @@ def _validate_schema_value(schema: Any, value: Any, path: str) -> None:
             raise McpClientError(f"{path}数组元素数量超过 Schema 限制。")
         if schema.get("uniqueItems") is True and len(value) != len({json.dumps(item, sort_keys=True, ensure_ascii=False) for item in value}):
             raise McpClientError(f"{path}数组含有重复项，违反 Schema 要求。")
-        item_schema = schema.get("items")
-        if not isinstance(item_schema, dict):
-            raise McpClientError(f"{path}数组缺少可验证的 items Schema，已阻止调用。")
-        for index, item in enumerate(value):
-            _validate_schema_value(item_schema, item, f"{path}[{index}]")
+        if "items" not in schema:
+            # JSON Schema leaves item values unconstrained when `items` is
+            # omitted. The vendor's search_value uses this form. Accept only
+            # JSON scalar values here so an incomplete schema cannot smuggle
+            # arbitrary nested objects or arrays into an action request.
+            for index, item in enumerate(value):
+                is_scalar = item is None or isinstance(item, (str, bool, int))
+                if isinstance(item, float):
+                    is_scalar = math.isfinite(item)
+                if not is_scalar:
+                    raise McpClientError(
+                        f"{path}[{index}]的数组元素缺少 items Schema；未声明元素类型时只允许简单 JSON 标量。"
+                    )
+        else:
+            item_schema = schema["items"]
+            if not isinstance(item_schema, dict):
+                raise McpClientError(f"{path}数组的 items Schema 格式无效，已阻止调用。")
+            for index, item in enumerate(value):
+                _validate_schema_value(item_schema, item, f"{path}[{index}]")
 
 
 def build_action_arguments(action_tool: McpTool, business_tool: BusinessTool, arguments: dict[str, Any]) -> dict[str, Any]:
