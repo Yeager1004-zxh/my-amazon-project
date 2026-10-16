@@ -1,34 +1,60 @@
 # 新品推广周报 V1.0 实施清单
 
-本计划基于仓库 `main` 的现有实现，限定为新品推广周报。广告活动管理、库存和利润等其他业务不属于 V1.0。
+V1.0 只实现新品推广周报。当前分支为 `feature/weekly-report-v1`，所有开发在此分支进行；`main` 保持稳定。
 
-## 基线审查
+## 数据接口路线
 
-当前 `main` 已包含：MCP Streamable HTTP 初始化/会话、工具目录与只读许可、Windows Credential Manager、OpenAPI Token 获取、Excel/CSV 映射导入、D01 计算、D61+ 扩行、JSONL 校验日志和模板样式复制。
+1. **领星 OpenAPI：长期主数据接口。** 负责授权后的店铺、SKU 映射、销售与广告数据读取。
+2. **领星官方 MCP：辅助查询与交叉核验。** 保留现有 Streamable HTTP、Schema 发现、只读授权、工具 ID 与 Schema 指纹绑定；不要求日常用户填写 Tool ID/JSON。
+3. **领星 Excel/CSV：应急备用。** 继续复用现有导入映射与验证流程。
 
-当前仍缺：MCP 查询到周报生成的连接、真实店铺/SKU/ASIN/MSKU 数据映射、统一的带来源与覆盖状态的日数据、实际广告花费的接口口径核验，以及面向普通用户的 GUI 流程。OpenAPI 的店铺和销售查询保持 fail-closed。现有自动化测试均为本地夹具，不代表真实领星或 Windows 验收。
+三类来源应接入同一标准日数据模型，再调用已有周报生成器。只有官方接口口径和实体归属均已验证的数据才能成为正式输入。共享广告活动费用不可分摊或重复计入 SKU。
 
-## 分阶段任务
+## 当前基线
 
-| 阶段 | 模块 | 输入 → 输出 | 依赖 | 测试 | 完成条件 |
-|---|---|---|---|---|---|
-| 1 | MCP 参数封装 | action 外层 Schema + search 返回的业务 Schema + 参数 → action 请求体 | 会话中真实 search 结果、已核验只读许可 | MCP 模拟测试覆盖有效 offset/length、缺字段、额外字段、类型错误、外层 ID/params 错误和无效许可 | params 只按业务 Schema 验证；拒绝项不发请求；Windows 上对已核验的只读工具真实执行成功 |
-| 2 | 店铺与 SKU 查询 | get_my_sids/业务查询结果 + 选择店铺及 SKU → SID、local SKU、MSKU、ASIN 与日指标原始记录 | Windows 授权 MCP；真实工具名、Schema、分页和响应样本 | 模拟分页、超时、限流/错误、Token 或 session 失效；Windows 对照领星原报表 | EX-shop-US 唯一映射 SID；ex3106 每日销量/销售额与原报表一致，首单日期可追溯 |
-| 3 | 统一日数据与校验 | 销售/广告/流量响应 → SKU 日记录、数据来源、统计口径、日期/时区、完整性、实体归属和异常 | 阶段 2 的字段定义和官方口径 | Decimal 精度、缺失与 0、时区、重复、跨 SKU 活动费、关闭后仍有花费测试 | 未知或无法唯一归属的值为空；共享活动费用不分摊/不重复累计；金额计算不先转 float |
-| 4 | Excel 周报适配 | 统一日记录 + 模板/已有周报 → 新工作簿 + 脱敏校验日志 | 阶段 2、3；现有 `report_generation.py` 和模板扩展 | 原模板结构回归、D61+、人工字段保护、增量更新；用 ex3106 真实历史周报核对 | D01 与自然日正确；仅写入覆盖完整且已核验指标；其余明确留空/部分完成；公式、样式、合并单元格和人工字段保持 |
-| 5 | Windows 日常 GUI | 店铺、SKU → 进度、输出位置、成功/部分完成/失败和诊断 | 阶段 4 稳定接口；凭证/模板/输出本地设置 | UI 模拟测试、Windows 10/11 本地 MCP 与 Excel 测试 | 普通页面无需 JSON、Schema 或 Tool ID；高级设置集中技术连接选项；查询失败不生成貌似完整的报告 |
-| 6 | 打包与交付 | Python 项目、依赖、目标机 → EXE、安装说明和验收报告 | 阶段 5；Windows Tk/Tcl、Credential Manager 和 PyInstaller | Windows 干净环境安装、启动、真实数据端到端与 EXE 启动 | ex3106 单 SKU 先验收，再验收 ex3106+ex3114；对照领星原始报表一致；仓库不含密钥、业务报表或未脱敏日志 |
+- 已有：OpenAPI multipart Token 请求、Windows Credential Manager 凭证保存、连接测试 UI、店铺/销售方法的 fail-closed 占位；MCP 客户端与安全 Schema 校验；Excel/CSV 导入、D01、D61+、数据校验日志和模板生成。
+- 本阶段新增：OpenAPI 客户端仅在 Token 响应给出明确有效期时进行内存缓存；缺少有效期时每次重新获取。
+- 尚未完成：官方签名输出编码核验、店铺列表真实查询、SKU/ASIN/MSKU 映射、首单日期/每日销量/销售额查询、实际广告花费查询、OpenAPI/MCP 统一数据层以及真实接口到 Excel 的集成。
+- 云端夹具测试只验证程序行为，不表示真实接口或真实数据验收。不得用模拟业务结果填正式周报。
 
-## 第一阶段参数校验约束
+## 阶段和验收标准
 
-`action` 的外层 Schema 负责验证工具 ID、必需 envelope 字段、params 对象类型及外层额外字段。`params` 内的业务字段只使用同一 MCP 会话中 `search` 返回的业务 inputSchema 校验。通用 action params 的空 `properties`、`additionalProperties: false` 或字段数占位限制不能覆盖业务 Schema。只读许可仍绑定当次业务工具 ID、说明和 Schema 指纹；未核验、发生变化或不可确认只读的调用必须在发请求前被拒绝。
+| 阶段 | 范围与输入 → 输出 | 依赖 | 验收方式与完成条件 |
+|---|---|---|---|
+| 1. OpenAPI 基础连接 | 官方认证/签名规范与凭证 → Token 生命周期、已签名只读请求、店铺列表 | 官方 Python SDK/签名示例；店铺列表完整 Schema | 单测逐字节核对官方签名结果；模拟请求覆盖超时、HTTP 错误、Token 失效和脱敏；Windows 从已加入白名单的公网出口取得真实店铺列表。 |
+| 2. 商品与销售 | 店铺、local SKU → ASIN/MSKU → 历史首单日期和每日销量/销售额 | 官方端点参数、分页、日期/时区、订单状态及响应字段 | mock 覆盖分页/重复/缺失/限流；Windows 使用 ex3106 对照领星真实报表，确认首单日期、每日销量和销售额一致。 |
+| 3. 广告实际花费 | 广告报表/活动记录 → 日期、活动、广告组、SKU/ASIN 唯一归属的实际花费 | 官方广告接口 Schema 与口径；ex3106 原始记录 | 核对 2026-08-04 至 2026-08-10；活动关闭后的记录仍按事实核验；共享活动无法唯一归属时留空，不分摊、不重复累计。 |
+| 4. 统一数据层 | OpenAPI、MCP、Excel 输入 → 同一 SKU 日记录及来源/口径/日期/完整性/归属元数据 | 阶段 1–3 字段定义 | Decimal 金额；零值与缺失区分；重复、跨店覆盖、时区、活动归属均有诊断；MCP 仅辅助核验，不混用不同统计口径。 |
+| 5. 周报集成 | 已校验的标准日记录 + 模板/已有周报 → 新工作簿与脱敏日志 | 阶段 4；现有 `report_generation.py`、模板扩展 | ex3106 后 ex3106+ex3114 本机对照；D01、连续日期、D61+、周次、格式、公式、合并单元格和人工字段保护通过回归。缺失值空白并标注部分完成。 |
+| 6. Windows 流程与打包 | 店铺、SKU → 进度、输出、诊断和 EXE | 阶段 5；Credential Manager、Tk/Tcl、PyInstaller | 普通界面无需 JSON/Schema/Tool ID；Windows 10/11 干净环境和真实数据端到端验收通过后才发布 V1.0。 |
 
-## 真实接口所需的安全诊断材料
+## 第一阶段执行任务
 
-真实接入前需从 Windows 本地已授权会话确认并以脱敏方式记录：
+目前已核实的 OpenAPI 能力是 `POST /api/auth-server/oauth/access-token`，使用 multipart/form-data 发送 `appId` 与 `appSecret`；用户曾在 Windows 确认 Token 获取成功。已知店铺列表路径为 `GET /erp/sc/data/seller/lists`，但官方签名 SDK 的密文编码和完整店铺响应结构尚未在当前云端核验，所以真实店铺请求继续 fail-closed。
 
-- `get_my_sids` 工具元数据、inputSchema 和店铺返回中店铺名/SID/站点字段。
-- 负责 local SKU 与 ASIN/MSKU 对应、历史首单/每日销量/销售额、广告活动实际花费及可用广告表现指标的只读业务工具名、完整 inputSchema、分页方式和字段定义。
-- 每项查询一小段去除账号/订单等敏感值的响应结构，以及同日期领星原始报表上的汇总核对结果。
+实现顺序：
 
-不要收集或提交 MCP 密钥、Token、AppSecret、买家信息、完整订单明细或未经脱敏的业务报表。当前云环境无领星 MCP 凭证/会话；云端 mock 测试不构成真实数据验收。若接口未提供唯一 SKU 粒度的广告活动实际花费，相关单元必须留空并报告原因。
+1. 取得官方 Python SDK 来源及签名生成代码，添加可与官方 SDK 输出比较的单元测试；核对 ASCII 参数排序、拼接边界、MD5 大写、AES 填充、密文编码与 URL 编码。
+2. 取得店铺列表官方参数/响应 Schema，按规范实现公共只读签名请求和分页；不在 GUI 或日志显示 AppSecret、Token 或完整签名 URL。
+3. 在 Windows 用 Credential Manager 凭证测试 Token 和店铺列表；云端不使用用户凭证。
+4. 只有以上真实连接通过后，继续 SKU 映射及每日销售接口。
+
+## 缺少的官方资料
+
+- 官方 Python SDK 链接或源文件，特别是签名结果编码及官方测试向量。
+- 店铺列表完整参数、必填条件、分页及响应字段（名称、SID、站点、授权状态）。
+- local SKU→ASIN/MSKU 映射接口/报表规范。
+- 首单日期、每日销量、销售额接口规范：路径、请求 Schema、分页、时区、日期口径、订单状态/退款处理和响应字段。
+- 后续广告实际花费接口规范：活动/广告组/SKU/ASIN 归属粒度、时区、分页与“实际花费”定义。
+
+可提供官方文档页面或 SDK 源码链接；Windows 本机授权 MCP 只读结果也可补充脱敏的工具名、Schema、分页方式及字段结构。不要提交 AppID、AppSecret、Access Token、买家信息、订单明细或未经脱敏的报表。
+
+## Windows 首测
+
+1. `git switch feature/weekly-report-v1`，然后 `git pull --ff-only origin feature/weekly-report-v1`。
+2. 在项目目录运行 `run_gui.bat`，在“领星 OpenAPI 连接”页保存 AppID/AppSecret 到 Windows Credential Manager。
+3. 点击“测试 API 身份验证”，仅确认成功状态和有效期。请求来自的 Windows 公网 IP 必须在领星白名单。
+4. 官方签名规则和接口 Schema 核验并发布后，再点击“获取店铺列表”；当前代码不会发送未核验的列表请求。
+5. 回传成功/失败及脱敏字段结构。不要回传任何密钥、Token、签名请求或订单明细。
+
+真实验收必须在用户 Windows 环境完成。云端模拟测试、Token 单测或 SDK 代码审阅均不能替代真实业务数据对照。

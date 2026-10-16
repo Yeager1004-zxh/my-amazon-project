@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import math
 import re
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -103,6 +105,7 @@ class LingxingOpenApiClient:
         app_secret: str,
         *,
         timeout_seconds: float = 30,
+        token_refresh_skew_seconds: float = 60,
         http_client: httpx.Client | None = None,
     ) -> None:
         if not app_id.strip() or not app_secret:
@@ -111,6 +114,16 @@ class LingxingOpenApiClient:
             raise LingxingApiError("AppID 或 AppSecret 格式无效。")
         self._app_id = app_id.strip()
         self._app_secret = app_secret
+        if (
+            isinstance(token_refresh_skew_seconds, bool)
+            or not isinstance(token_refresh_skew_seconds, (int, float))
+            or not math.isfinite(token_refresh_skew_seconds)
+            or token_refresh_skew_seconds < 0
+        ):
+            raise LingxingApiError("Token 提前刷新时间必须是有限的非负数字。")
+        self._token_refresh_skew = timedelta(seconds=token_refresh_skew_seconds)
+        self._token_lock = threading.Lock()
+        self._cached_token: AccessTokenResult | None = None
         self._http = http_client or httpx.Client(timeout=timeout_seconds, follow_redirects=False)
         self._owns_http = http_client is None
 
@@ -154,6 +167,37 @@ class LingxingOpenApiClient:
         expires_at, expires_in = _read_expiry(layers)
         return AccessTokenResult(token, expires_at, expires_in)
 
+    def get_access_token(self, *, force_refresh: bool = False) -> AccessTokenResult:
+        """Return a fresh token, reusing it only when the response supplied expiry.
+
+        Tokens without an explicit, parseable expiry are never cached because
+        their lifetime cannot safely be inferred from the local client.
+        """
+        with self._token_lock:
+            now = datetime.now(timezone.utc)
+            cached = self._cached_token
+            if (
+                not force_refresh
+                and cached is not None
+                and cached.expires_at is not None
+                and cached.expires_at - now > self._token_refresh_skew
+            ):
+                return cached
+
+            self._cached_token = None
+            refreshed = self.request_access_token()
+            self._cached_token = (
+                refreshed
+                if refreshed.expires_at is not None and refreshed.expires_at > now
+                else None
+            )
+            return refreshed
+
+    def clear_token_cache(self) -> None:
+        """Forget the in-memory token after authentication changes or failures."""
+        with self._token_lock:
+            self._cached_token = None
+
     def list_sellers(self, access_token: str) -> list[dict[str, Any]]:
         del access_token
         raise LingxingApiNotReady(
@@ -175,6 +219,7 @@ class LingxingOpenApiClient:
         )
 
     def close(self) -> None:
+        self.clear_token_cache()
         if self._owns_http:
             self._http.close()
 

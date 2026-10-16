@@ -630,6 +630,68 @@ class LingxingOpenApiTests(unittest.TestCase):
         self.assertNotIn("fixture-token-do-not-display", result.safe_status())
         http.close()
 
+    def test_access_token_cache_reuses_only_tokens_with_expiry(self) -> None:
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            token_number = len(requests)
+            return httpx.Response(
+                200,
+                json={"code": 0, "data": {"access_token": f"fixture-token-{token_number}", "expires_in": 3600}},
+            )
+
+        http = httpx.Client(transport=httpx.MockTransport(handler))
+        with LingxingOpenApiClient("fixture-app-id", "fixture-app-secret", http_client=http) as client:
+            first = client.get_access_token()
+            cached = client.get_access_token()
+            self.assertIs(first, cached)
+            self.assertEqual(len(requests), 1)
+
+            refreshed = client.get_access_token(force_refresh=True)
+            self.assertEqual(refreshed.token, "fixture-token-2")
+            self.assertEqual(len(requests), 2)
+
+            client.clear_token_cache()
+            after_clear = client.get_access_token()
+            self.assertEqual(after_clear.token, "fixture-token-3")
+            self.assertEqual(len(requests), 3)
+        http.close()
+
+    def test_access_token_without_expiry_is_not_cached(self) -> None:
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(200, json={"code": 0, "data": {"access_token": f"fixture-token-{len(requests)}"}})
+
+        http = httpx.Client(transport=httpx.MockTransport(handler))
+        with LingxingOpenApiClient("fixture-app-id", "fixture-app-secret", http_client=http) as client:
+            first = client.get_access_token()
+            second = client.get_access_token()
+        self.assertEqual((first.token, second.token), ("fixture-token-1", "fixture-token-2"))
+        self.assertEqual(len(requests), 2)
+        http.close()
+
+    def test_access_token_near_expiry_is_refreshed(self) -> None:
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            expires_in = 1 if len(requests) == 1 else 3600
+            return httpx.Response(
+                200,
+                json={"code": 0, "data": {"access_token": f"fixture-token-{len(requests)}", "expires_in": expires_in}},
+            )
+
+        http = httpx.Client(transport=httpx.MockTransport(handler))
+        with LingxingOpenApiClient("fixture-app-id", "fixture-app-secret", http_client=http) as client:
+            first = client.get_access_token()
+            second = client.get_access_token()
+        self.assertEqual((first.token, second.token), ("fixture-token-1", "fixture-token-2"))
+        self.assertEqual(len(requests), 2)
+        http.close()
+
     def test_signed_queries_fail_closed_without_sending_request(self) -> None:
         requests: list[httpx.Request] = []
         http = httpx.Client(transport=httpx.MockTransport(lambda request: requests.append(request) or httpx.Response(200)))

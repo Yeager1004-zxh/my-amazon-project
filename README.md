@@ -1,6 +1,6 @@
 # 亚马逊新品推广周报工具
 
-面向 Windows 10/11 的本地程序，读取用户导出的领星 CSV/XLSX，按原周报模板生成多 SKU 工作表和数据校验日志；另提供 Windows 本地领星 Streamable HTTP MCP 只读连接客户端。
+面向 Windows 10/11 的本地新品推广周报工具。V1.0 数据路线为：领星 OpenAPI 作为主数据接口、官方 MCP 作为辅助查询/交叉核验、领星 Excel/CSV 导入作为应急备用；三种来源最终进入统一标准数据层，再复用原周报模板生成器。当前离线 Excel/CSV 周报功能可用，OpenAPI 业务查询和自动写入尚未通过真实接口验收。
 
 V1.0 分阶段任务、模块输入/输出、依赖、测试和验收门槛见 [正式实施清单](docs/V1_IMPLEMENTATION_PLAN.md)。当前版本仅聚焦新品推广周报。
 
@@ -13,6 +13,7 @@ V1.0 分阶段任务、模块输入/输出、依赖、测试和验收门槛见 [
 - 销量、销售金额、广告实际花费、广告表现和流量可按真实字段映射。广告花费必须使用实际花费字段；只有在用户将 `sku_scope` 明确设为 `SKU_LEVEL_CONFIRMED` 后才接受该映射。重复、跨 SKU 共享的同一活动花费或店铺覆盖不完整的记录会从相关日汇总中排除并写入校验日志。
 - 校验日志为 JSONL，记录来源文件名、SKU 的 D01、最新数据覆盖日、销量/销售额/广告花费汇总和异常提示。关闭日期后的实际花费只有在来源提供并映射 `campaign_disabled_at` 时才提示。
 - Windows 本地 MCP 客户端支持 MCP 初始化连接、工具列表分页、工具目录发现，以及按业务 Schema 核验的只读 action 查询。请求带 `X-Mcp-Key`、MCP session 和协议版本；常规工具仍要求 `readOnlyHint=true`。
+- OpenAPI Token 请求使用 multipart/form-data；Access Token 仅在本机内存中按响应明确提供的有效期缓存，并在有效期临近时刷新。未返回可识别有效期的 Token 不缓存。
 
 模板来自用户上传的《新品推广周报.xlsx》：第 5 行表头，D01–D60 在第 6–65 行，24 列，无公式。样例 SKU 为 ex3107；生成新 SKU 时会清空其样例数据。模板没有“日销售额”列，销售金额会写入校验日志，模板中的“售价”只写来源售价或根据销售额/销量计算的单价，不会把销售金额误填进售价列。原模板没有历史类目、排名、评分、评论数的日期字段，这些值会保持空白，避免把当前快照伪装成历史数据。
 
@@ -49,7 +50,7 @@ py -3.12 -m venv .venv
 
 “执行已验证的只读查询”会重新调用 `search`，确认 ID 和 Schema 未改变，按业务 Schema 校验查询参数，再通过 `action` 的 inputSchema 构造调用。缺少 search 目录说明、Schema 不支持校验、工具描述含有写入操作、许可不匹配或返回 Schema 变化时，程序会拒绝执行。未经核验或无法确认安全性的 action 不会发送。普通 MCP 工具仍仅允许调用 `readOnlyHint=true` 的工具。所有查询结果仅在本机窗口显示，并对凭证字段做隐藏；不会写入日志或工作簿。
 
-更新并验证本机连接时：先在仓库目录运行 `git pull --ff-only origin main`，再启动 `run_gui.bat`。在“领星 MCP 连接”页获取工具列表并检查三项工具的完整元数据；先查看 `search` 的 Schema，按其参数格式搜索店铺列表、SKU 每日销量/销售额和广告活动实际花费。对返回的每项业务工具先查看完整 Schema，并仅在领星官方说明确认它是只读查询后点击“核验本次只读范围”。验证 EX 店铺的 `ex3106` 时，按该业务 Schema 查询 2026-08-04 至 2026-08-06。若结果没有按日期和 SKU 唯一归属的“活动实际花费”，或可能把共享活动费用重复计到 SKU，不要把该字段用于周报；需要与领星原始报表交叉核对。程序不会自动确认真实数据口径，也不会自动写入周报。
+更新并验证本机 MCP 时：先运行 `git switch feature/weekly-report-v1` 和 `git pull --ff-only origin feature/weekly-report-v1`，再启动 `run_gui.bat`。在“领星 MCP 连接”页获取工具列表并检查元数据；按官方 Schema 搜索业务工具，并仅在确认只读后核验。验证 EX 店铺的 `ex3106` 时，按该业务 Schema 查询 2026-08-04 至 2026-08-06。若结果没有按日期和 SKU 唯一归属的“活动实际花费”，或可能把共享活动费用重复计到 SKU，不要把该字段用于周报；需与领星原始报表交叉核对。
 
 命令行连接测试也只从 Windows Credential Manager 读取凭证：
 
@@ -65,7 +66,25 @@ Codex 云端没有 Windows 本机 MCP 会话、endpoint 或密钥，未连接你
 
 OpenAPI 使用固定官方域名 `https://openapi.lingxing.com`。目前已实现 Token 请求：`POST /api/auth-server/oauth/access-token`，以 multipart/form-data 发送 `appId` 和 `appSecret`。在“领星 OpenAPI 连接”页分别填写两项凭证并点击“安全保存凭证”；凭证保存在 Windows Credential Manager 的 `my-amazon-project.lingxing-openapi` 服务项中，不写入配置文件、命令行或日志。之后点击“测试 API 身份验证”，界面只显示成功状态和响应中可识别的有效期，不显示 Access Token。
 
-店铺列表接口 `GET /erp/sc/data/seller/lists` 需要官方定义的 `access_token`、`app_key`、`timestamp`、`sign` 参数。签名规则、店铺响应字段和销售查询接口尚未完成官方文档核验，因此“获取店铺列表”和“测试 SKU 数据”当前会提示未发送请求，不会猜签名、读取模拟数据或把结果写入正式周报。广告接口也未接入。完整身份验证和数据查询仍需在 Windows 本机用你的授权凭证测试；不要将 AppID、AppSecret 或 Token 发到聊天或 GitHub。
+当前店铺列表接口 `GET /erp/sc/data/seller/lists` 仍保持 fail-closed：虽已知接口路径和鉴权参数名，但签名输出编码尚未从官方 SDK 核实，店铺响应字段也待确认。SKU→ASIN/MSKU 映射、首单日期、每日销量/销售额的接口路径、参数、分页和字段口径尚未拿到官方定义。因此“获取店铺列表”和“测试 SKU 数据”不会发送未核验请求，也不会读模拟结果或写入正式周报。广告接口未接入。
+
+### 第一阶段 Windows 首测
+
+1. 更新开发分支并启动：`git switch feature/weekly-report-v1`、`git pull --ff-only origin feature/weekly-report-v1`、`run_gui.bat`。
+2. 在“领星 OpenAPI 连接”页安全保存 AppID/AppSecret（只写入 Windows Credential Manager）。
+3. 点击“测试 API 身份验证”，确认结果只显示成功/错误和有效期，不显示 Token。请求需从已加入领星 IP 白名单的 Windows 公网出口发出。
+4. 店铺列表按钮仍会拒绝发送，直到签名 SDK 的准确编码和店铺列表响应定义完成核验。此提示是安全阻断，不表示真实店铺查询失败。
+
+云端自动化测试使用 HTTP 模拟夹具，仅验证请求构造、Token 生命周期和错误脱敏；不代表真实 API 或业务数据验收。不要将 AppID、AppSecret、Access Token 或真实报表发到聊天或 GitHub。
+
+### 仍需的领星官方资料
+
+- 官方 Python SDK 下载/代码地址或签名函数原文，尤其是 AES 密文的输出编码、URL 编码及参与签名参数范围。
+- 店铺列表接口完整参数和响应字段定义（店铺名称、SID、站点、授权状态及分页规则）。
+- local SKU→ASIN/MSKU 的官方查询接口/报表定义。
+- 历史首单日期、每日销量和销售额接口的路径、参数、分页、日期时区、订单状态/退款口径及响应字段。
+
+资料可用官方文档链接、SDK 文件/链接，或来自 Windows 本机授权只读 MCP 的脱敏 Schema 与响应字段结构补充。未经核对不使用社区 SDK 或猜测参数作为生产请求依据。
 
 ## 配置 Excel/CSV 字段映射
 
