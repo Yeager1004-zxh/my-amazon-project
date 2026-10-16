@@ -64,23 +64,25 @@ Codex 云端没有 Windows 本机 MCP 会话、endpoint 或密钥，未连接你
 
 ## 领星 OpenAPI 本机测试
 
-OpenAPI 使用固定官方域名 `https://openapi.lingxing.com`。目前已实现 Token 请求：`POST /api/auth-server/oauth/access-token`，以 multipart/form-data 发送 `appId` 和 `appSecret`。在“领星 OpenAPI 连接”页分别填写两项凭证并点击“安全保存凭证”；凭证保存在 Windows Credential Manager 的 `my-amazon-project.lingxing-openapi` 服务项中，不写入配置文件、命令行或日志。之后点击“测试 API 身份验证”，界面只显示成功状态和响应中可识别的有效期，不显示 Access Token。
+OpenAPI 使用固定官方域名 `https://openapi.lingxing.com`。Token 请求为 `POST /api/auth-server/oauth/access-token`，以 multipart/form-data 发送 `appId` 和 `appSecret`。在“领星 OpenAPI 连接”页安全保存凭证后，界面只显示身份验证结果和响应中可识别的有效期，不显示 Access Token。
 
-当前店铺列表接口 `GET /erp/sc/data/seller/lists` 仍保持 fail-closed：虽已知接口路径和鉴权参数名，但签名输出编码尚未从官方 SDK 核实，店铺响应字段也待确认。SKU→ASIN/MSKU 映射、首单日期、每日销量/销售额的接口路径、参数、分页和字段口径尚未拿到官方定义。因此“获取店铺列表”和“测试 SKU 数据”不会发送未核验请求，也不会读模拟结果或写入正式周报。广告接口未接入。
+已根据本次上传的领星 **Java** SDK 源码实现签名和只读店铺列表请求：`GET /erp/sc/data/seller/lists`。签名按 ASCII 参数名排序、使用 SDK 的字符串转换/去空格规则拼接 `key=value`、计算大写 MD5，再用 AppID 执行 AES/ECB/PKCS5Padding，密文使用标准 Base64，并按 Java `URLEncoder` 的 UTF-8 规则编码查询参数。Python SDK 并未包含在压缩包内；本项目只移植与签名相关的 SDK 行为，没有复制其会输出签名输入的日志代码。签名向量已用独立 OpenSSL 结果核对，但当前环境没有 Java 编译器，未执行官方 Java SDK。本阶段的模拟测试不代表领星真实接口已打通。
+
+店铺列表响应会在 GUI 中显示经过脱敏的原始 JSON，避免在没有核实响应 Schema 时猜测字段映射。此请求获得 HTTP 2xx JSON 不等于业务查询成功；需检查业务响应码和店铺字段。领星官方文档页面未能在当前云端环境访问，SellerLists 响应字段/分页仍未核实。SKU→ASIN/MSKU 映射、首单日期、每日销量/销售额的接口参数、分页和字段口径也尚未实现；广告接口未接入。
 
 ### 第一阶段 Windows 首测
 
-1. 更新开发分支并启动：`git switch feature/weekly-report-v1`、`git pull --ff-only origin feature/weekly-report-v1`、`run_gui.bat`。
+1. 更新开发分支并启动：`git switch feature/weekly-report-v1`、`git pull --ff-only origin feature/weekly-report-v1`、`run_gui.bat`。如 pip 环境尚未更新，先运行 `python -m pip install -r requirements.txt`。
 2. 在“领星 OpenAPI 连接”页安全保存 AppID/AppSecret（只写入 Windows Credential Manager）。
 3. 点击“测试 API 身份验证”，确认结果只显示成功/错误和有效期，不显示 Token。请求需从已加入领星 IP 白名单的 Windows 公网出口发出。
-4. 店铺列表按钮仍会拒绝发送，直到签名 SDK 的准确编码和店铺列表响应定义完成核验。此提示是安全阻断，不表示真实店铺查询失败。
+4. 点击“获取店铺列表”。程序会获取 Token 并发送已签名 GET 请求；界面只显示脱敏 JSON。先确认 HTTP/业务响应码，再核对响应中店铺名称、SID、站点和广告授权字段。不要将响应正文、店铺 SID 或 Token 回传到聊天。
+5. 只反馈请求成功/失败、脱敏后的字段名称与类型，以及是否能看到授权店铺。真实响应字段需要根据官方 SellerLists 文档确认后，才会做结构化映射。
 
-云端自动化测试使用 HTTP 模拟夹具，仅验证请求构造、Token 生命周期和错误脱敏；不代表真实 API 或业务数据验收。不要将 AppID、AppSecret、Access Token 或真实报表发到聊天或 GitHub。
+云端自动化测试使用 HTTP 模拟夹具，仅验证请求构造、Token 生命周期和错误脱敏；不代表真实 API 或业务数据验收。不要将 AppID、AppSecret、Access Token、完整签名 URL 或真实报表发到聊天或 GitHub。
 
 ### 仍需的领星官方资料
 
-- 官方 Python SDK 下载/代码地址或签名函数原文，尤其是 AES 密文的输出编码、URL 编码及参与签名参数范围。
-- 店铺列表接口完整参数和响应字段定义（店铺名称、SID、站点、授权状态及分页规则）。
+- 店铺列表接口完整响应字段定义（店铺名称、SID、站点、授权状态及分页规则）。压缩包只含 Java SDK，未包含 SellerLists 接口 Schema；若官方页面在你的 Windows 环境可访问，请按上述方式回传脱敏字段名称/类型，或上传官方接口文档页面的 PDF/HTML。
 - local SKU→ASIN/MSKU 的官方查询接口/报表定义。
 - 历史首单日期、每日销量和销售额接口的路径、参数、分页、日期时区、订单状态/退款口径及响应字段。
 

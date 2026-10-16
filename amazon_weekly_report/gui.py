@@ -191,7 +191,7 @@ class WeeklyReportApp(tk.Tk):
         ttk.Button(actions, text="测试 API 身份验证", command=self._test_openapi_auth).pack(side="left")
         ttk.Button(actions, text="获取店铺列表", command=self._openapi_seller_list).pack(side="left", padx=8)
 
-        ttk.Label(parent, text="店铺名称 / SID / 站点 / 广告授权状态").grid(row=3, column=0, columnspan=4, sticky="w", pady=(6, 2))
+        ttk.Label(parent, text="店铺名称 / SID / 站点 / 广告授权状态（响应 Schema 核验后映射）").grid(row=3, column=0, columnspan=4, sticky="w", pady=(6, 2))
         self.openapi_seller_tree = ttk.Treeview(
             parent,
             columns=("seller_name", "sid", "site", "ad_auth"),
@@ -222,7 +222,7 @@ class WeeklyReportApp(tk.Tk):
         self.openapi_output.grid(row=9, column=0, columnspan=4, sticky="nsew", pady=4)
         ttk.Label(
             parent,
-            text="目前仅启用 Token 身份验证测试。店铺列表和 SKU 查询依赖 app_key/timestamp/sign 规则及官方字段定义；在文档核实前，按钮不会发送查询请求。广告接口未接入。",
+            text="已启用 Token 身份验证和只读店铺列表请求。列表响应先以脱敏原始 JSON 显示，业务码与字段需核对；SKU 查询及其他业务接口尚未接入。",
             wraplength=900,
         ).grid(row=10, column=0, columnspan=4, sticky="w", pady=6)
 
@@ -266,8 +266,22 @@ class WeeklyReportApp(tk.Tk):
         self._start_task(authenticate, self.openapi_status, "API 身份验证完成。")
 
     def _openapi_seller_list(self) -> None:
-        self.openapi_status.set("未发送查询：官方 app_key/timestamp/sign 签名规则尚待核验。")
-        self._show_openapi_result(self.openapi_status.get())
+        try:
+            app_id, app_secret = self._openapi_credentials()
+        except CredentialStoreError as exc:
+            messagebox.showerror("OpenAPI 配置错误", str(exc))
+            return
+
+        def query_sellers() -> dict[str, str]:
+            with LingxingOpenApiClient(app_id, app_secret) as client:
+                token_result = client.get_access_token()
+                response = client.list_sellers(token_result.token)
+            return {
+                "message": "店铺列表端点已返回 HTTP 2xx JSON；请核对响应业务码和字段，尚未判定业务查询成功。",
+                "output": json.dumps(response, ensure_ascii=False, indent=2, default=str)[:80_000],
+            }
+
+        self._start_task(query_sellers, self.openapi_status, "店铺列表请求完成。")
 
     def _openapi_sku_query(self) -> None:
         self.openapi_status.set("未发送查询：销售接口路径、参数和字段尚待依据官方文档核验。")
@@ -351,7 +365,7 @@ class WeeklyReportApp(tk.Tk):
                         self._show_mcp_result(result)
                     elif status_var is self.openapi_status and isinstance(result, dict):
                         status_var.set(result.get("message", title))
-                        self._show_openapi_result(status_var.get())
+                        self._show_openapi_result(result.get("output", status_var.get()))
                     elif isinstance(result, dict):
                         status_var.set(result.get("message", title))
                         if result.get("output"):

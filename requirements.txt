@@ -2,5 +2,7 @@ pandas==3.0.6
 openpyxl==3.1.5
 # Shared HTTPS transport for local MCP and OpenAPI requests.
 httpx==0.28.1
+# AES-ECB/PKCS5-compatible signature encryption ported from the Lingxing Java SDK.
+cryptography==50.0.2
 # Windows Credential Manager integration; the app pins the Windows Vault backend.
 keyring==25.6.0

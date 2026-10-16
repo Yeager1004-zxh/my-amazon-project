@@ -6,6 +6,8 @@ import tempfile
 import unittest
 from datetime import date, timedelta
 from pathlib import Path
+from unittest.mock import patch
+from urllib.parse import parse_qs
 
 import httpx
 from openpyxl import Workbook, load_workbook
@@ -28,6 +30,12 @@ from amazon_weekly_report.providers.lingxing_api import (
     LingxingApiError,
     LingxingApiNotReady,
     LingxingOpenApiClient,
+)
+from amazon_weekly_report.providers.lingxing_signing import (
+    LingxingSignatureError,
+    canonical_signing_string,
+    encode_query_parameters,
+    generate_signature,
 )
 from amazon_weekly_report.report_generation import generate_reports
 from amazon_weekly_report.template_expansion import ensure_day_rows
@@ -604,6 +612,110 @@ class McpClientTests(unittest.TestCase):
 
 
 class LingxingOpenApiTests(unittest.TestCase):
+    def test_signature_matches_reference_algorithm_vector(self) -> None:
+        app_id = "ak_0123456789abc"
+        parameters = {
+            "timestamp": 1639734344,
+            "access_token": "fixture-token",
+            "app_key": app_id,
+        }
+        self.assertEqual(
+            canonical_signing_string(parameters),
+            "access_token=fixture-token&app_key=ak_0123456789abc&timestamp=1639734344",
+        )
+        self.assertEqual(
+            generate_signature(parameters, app_id),
+            "DGIcRRQN/VQlrOtSjtCmntt5i7TsON7XPBbSVCNFij5IwVhSPzVcd0sPeLkAl3rO",
+        )
+
+    def test_signature_serialization_boundaries_fail_closed(self) -> None:
+        self.assertEqual(
+            canonical_signing_string({"z": "  value  ", "a": "", "enabled": True, "count": 5}),
+            "a=&count=5&enabled=true&z=value",
+        )
+        for value in (None, 1.5, ["x"], {"x": "y"}):
+            with self.subTest(value_type=type(value).__name__):
+                with self.assertRaises(LingxingSignatureError):
+                    canonical_signing_string({"value": value})
+        with self.assertRaises(LingxingSignatureError):
+            canonical_signing_string({"签名": "value"})
+        with self.assertRaises(LingxingSignatureError):
+            canonical_signing_string({"sign": "self-reference"})
+        with self.assertRaises(LingxingSignatureError):
+            generate_signature({"timestamp": 1}, "short")
+
+    def test_query_encoding_matches_java_urlencoder_for_utf8_and_base64(self) -> None:
+        encoded = encode_query_parameters({"value": "a b+/%~=中", "sign": "A+/="})
+        self.assertEqual(encoded, "value=a+b%2B%2F%25%7E%3D%E4%B8%AD&sign=A%2B%2F%3D")
+
+    def test_list_sellers_sends_sdk_signed_get_and_redacts_response(self) -> None:
+        app_id = "ak_0123456789abc"
+        token = "fixture-token"
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(
+                200,
+                json={
+                    "code": "0",
+                    "msg": "ok",
+                    "data": [
+                        {"seller_name": "Fixture Store", "sid": 123456, "access_token": token},
+                        {"appId": app_id, "ad_auth": True},
+                    ],
+                },
+            )
+
+        http = httpx.Client(transport=httpx.MockTransport(handler))
+        with LingxingOpenApiClient(app_id, "fixture-app-secret", http_client=http) as client:
+            with patch("amazon_weekly_report.providers.lingxing_api.time.time", return_value=1639734344):
+                response = client.list_sellers(token)
+
+        request = requests[0]
+        self.assertEqual(request.method, "GET")
+        self.assertEqual(request.url.path, "/erp/sc/data/seller/lists")
+        self.assertEqual(request.content, b"")
+        self.assertNotIn("fixture-app-secret", str(request.url))
+        wire_query = request.url.query.decode("ascii")
+        self.assertIn("%2F", wire_query, "Base64 slash must be URL encoded")
+        query = parse_qs(wire_query, keep_blank_values=True)
+        self.assertEqual(query["access_token"], [token])
+        self.assertEqual(query["app_key"], [app_id])
+        self.assertEqual(query["timestamp"], ["1639734344"])
+        self.assertEqual(
+            query["sign"],
+            [generate_signature({"access_token": token, "app_key": app_id, "timestamp": 1639734344}, app_id)],
+        )
+        self.assertEqual(response["code"], "0")
+        self.assertEqual(response["data"][0]["seller_name"], "Fixture Store")
+        self.assertEqual(response["data"][0]["access_token"], "[已隐藏]")
+        self.assertEqual(response["data"][1]["appId"], "[已隐藏]")
+        http.close()
+
+    def test_list_sellers_http_error_does_not_echo_token_or_signature(self) -> None:
+        token = "fixture-access-token"
+        http = httpx.Client(
+            transport=httpx.MockTransport(
+                lambda _request: httpx.Response(403, text=f"denied {token} fake-signature")
+            )
+        )
+        with LingxingOpenApiClient("ak_0123456789abc", "fixture-app-secret", http_client=http) as client:
+            with self.assertRaises(LingxingApiError) as raised:
+                client.list_sellers(token)
+        self.assertNotIn(token, str(raised.exception))
+        self.assertNotIn("fake-signature", str(raised.exception))
+        http.close()
+
+    def test_list_sellers_rejects_non_success_redirect_response(self) -> None:
+        http = httpx.Client(
+            transport=httpx.MockTransport(lambda _request: httpx.Response(302, json={"code": 0, "data": []}))
+        )
+        with LingxingOpenApiClient("ak_0123456789abc", "fixture-app-secret", http_client=http) as client:
+            with self.assertRaisesRegex(LingxingApiError, "HTTP 302"):
+                client.list_sellers("fixture-token")
+        http.close()
+
     def test_token_exchange_uses_multipart_and_hides_token(self) -> None:
         requests: list[httpx.Request] = []
 
@@ -692,12 +804,10 @@ class LingxingOpenApiTests(unittest.TestCase):
         self.assertEqual(len(requests), 2)
         http.close()
 
-    def test_signed_queries_fail_closed_without_sending_request(self) -> None:
+    def test_unverified_sku_sales_query_fails_closed_without_sending_request(self) -> None:
         requests: list[httpx.Request] = []
         http = httpx.Client(transport=httpx.MockTransport(lambda request: requests.append(request) or httpx.Response(200)))
         with LingxingOpenApiClient("fixture-app-id", "fixture-app-secret", http_client=http) as client:
-            with self.assertRaises(LingxingApiNotReady):
-                client.list_sellers("fixture-token")
             with self.assertRaises(LingxingApiNotReady):
                 client.query_sku_sales(
                     access_token="fixture-token",

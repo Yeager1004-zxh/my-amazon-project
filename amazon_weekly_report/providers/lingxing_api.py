@@ -3,11 +3,14 @@ from __future__ import annotations
 import math
 import re
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
+
+from .lingxing_signing import encode_query_parameters, signed_query_parameters
 
 
 OPENAPI_BASE_URL = "https://openapi.lingxing.com"
@@ -92,12 +95,30 @@ def _safe_error_message(payload: dict[str, Any], secrets: tuple[str, ...]) -> st
     return "领星未返回 Access Token；请检查 AppID、AppSecret、账号权限及 IP 白名单。"
 
 
-class LingxingOpenApiClient:
-    """Minimal official-host client for the documented multipart token exchange.
+def _redact_api_payload(value: Any, secrets: tuple[str, ...]) -> Any:
+    if isinstance(value, dict):
+        safe: dict[str, Any] = {}
+        for key, item in value.items():
+            normalized_key = re.sub(r"[^a-z0-9]", "", str(key).casefold())
+            if any(marker in normalized_key for marker in ("token", "secret", "password", "sign", "authorization", "appkey", "appid")):
+                safe[key] = "[已隐藏]"
+            else:
+                safe[key] = _redact_api_payload(item, secrets)
+        return safe
+    if isinstance(value, list):
+        return [_redact_api_payload(item, secrets) for item in value]
+    if isinstance(value, str):
+        safe_value = value
+        for secret in secrets:
+            if secret:
+                safe_value = safe_value.replace(secret, "[已隐藏]")
+        safe_value = re.sub(r"(?i)(access[_-]?token\s*[:=]\s*)[^,\s]+", r"\1[已隐藏]", safe_value)
+        return safe_value
+    return value
 
-    Calls that require request signing remain fail-closed until the precise
-    official signing contract is available and covered by tests.
-    """
+
+class LingxingOpenApiClient:
+    """Official-host client for token exchange and the signed seller-list query."""
 
     def __init__(
         self,
@@ -198,10 +219,58 @@ class LingxingOpenApiClient:
         with self._token_lock:
             self._cached_token = None
 
-    def list_sellers(self, access_token: str) -> list[dict[str, Any]]:
-        del access_token
-        raise LingxingApiNotReady(
-            "店铺列表接口需要 app_key、timestamp 和 sign；领星官方签名规则尚未核验，未发送请求。"
+    def _request_signed_get(
+        self,
+        path: str,
+        parameters: dict[str, str],
+        *,
+        sensitive_values: tuple[str, ...],
+    ) -> Any:
+        query = encode_query_parameters(parameters)
+        # The query was already serialized with java.net.URLEncoder-compatible
+        # escaping. httpx.URL preserves existing percent escapes when parsed.
+        try:
+            url = httpx.URL(f"{OPENAPI_BASE_URL}{path}?{query}")
+            response = self._http.get(url)
+        except httpx.InvalidURL as exc:
+            raise LingxingApiError("领星 OpenAPI 查询请求格式无效。") from exc
+        except httpx.TimeoutException as exc:
+            raise LingxingApiError("领星 OpenAPI 查询超时。") from exc
+        except httpx.HTTPError as exc:
+            raise LingxingApiError("无法连接领星 OpenAPI；请检查网络、域名及 IP 白名单。") from exc
+
+        if not 200 <= response.status_code < 300:
+            # Do not include the URL or response body; either can echo credentials/signature.
+            raise LingxingApiError(f"领星 OpenAPI 查询返回 HTTP {response.status_code}。")
+        try:
+            payload = response.json()
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise LingxingApiError("领星 OpenAPI 查询返回了无法解析的 JSON。") from exc
+        if not isinstance(payload, (dict, list)):
+            raise LingxingApiError("领星 OpenAPI 查询响应结构无效。")
+        return _redact_api_payload(
+            payload,
+            (self._app_id, self._app_secret, *sensitive_values),
+        )
+
+    def list_sellers(self, access_token: str) -> Any:
+        """Call the read-only seller-list endpoint and return its redacted raw JSON.
+
+        The endpoint response envelope is intentionally not mapped to GUI fields
+        until its official response Schema is available in the development inputs.
+        """
+        if not isinstance(access_token, str) or not access_token.strip():
+            raise LingxingApiError("Access Token 为空，未发送店铺列表请求。")
+        parameters = {
+            "access_token": access_token.strip(),
+            "app_key": self._app_id,
+            "timestamp": str(int(time.time())),
+        }
+        signed = signed_query_parameters(parameters, self._app_id)
+        return self._request_signed_get(
+            SELLER_LIST_PATH,
+            signed,
+            sensitive_values=(access_token, signed["sign"]),
         )
 
     def query_sku_sales(
