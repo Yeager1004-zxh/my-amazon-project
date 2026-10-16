@@ -7,6 +7,7 @@ import unittest
 from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 from urllib.parse import parse_qs
 
@@ -27,6 +28,7 @@ from amazon_weekly_report.mcp_client import (
     redact_sensitive,
     validate_json_schema,
 )
+from amazon_weekly_report.d01_settings import D01SettingsError, get_d01_dates, load_d01_settings, save_d01_dates
 from amazon_weekly_report.providers.lingxing_api import (
     LingxingApiError,
     LingxingApiNotReady,
@@ -36,6 +38,8 @@ from amazon_weekly_report.providers.lingxing_api import (
     SkuProductMapping,
     parse_asin_daily_page,
     parse_product_performance_page,
+    parse_sp_campaign_report_page,
+    parse_sp_product_ad_report_page,
     parse_seller_list_response,
     split_date_windows,
 )
@@ -92,6 +96,106 @@ def create_template(path: Path) -> None:
 
 
 class TemplateAndReportTests(unittest.TestCase):
+    def test_report_generation_requires_a_manually_confirmed_d01_for_every_sku(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            template = root / "template.xlsx"
+            create_template(template)
+            data = root / "exports"
+            data.mkdir()
+            mapping = root / "mapping.json"
+            mapping.write_text("{}", encoding="utf-8")
+            with self.assertRaisesRegex(ReportGenerationError, "尚未设置并确认 D01"):
+                generate_reports(
+                    template_path=template,
+                    data_folder=data,
+                    mapping_path=mapping,
+                    skus=["SKU_A", "SKU_B"],
+                    output_path=root / "blocked.xlsx",
+                    d01_confirmed=True,
+                )
+            self.assertFalse((root / "blocked.xlsx").exists())
+
+    def test_existing_report_d01_change_requires_confirmation_then_rebases_dates_and_keeps_manual_fields(self) -> None:
+        start = date(2026, 1, 1)
+        mapping = SkuProductMapping("API-TEST", ("MSKU-A",), ())
+        rows = tuple(
+            SkuDailySales(987654, "API-TEST", "MSKU-A", "", start + timedelta(days=index), "USD", index + 1, index + 1, Decimal(f"{index + 1}.00"))
+            for index in range(3)
+        )
+        window = SkuDailySalesWindow(start, start + timedelta(days=2), (mapping,), rows)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            template = root / "template.xlsx"
+            create_template(template)
+            original = root / "original.xlsx"
+            generate_reports(
+                template_path=template,
+                data_folder=None,
+                mapping_path=None,
+                skus=["API-TEST"],
+                output_path=original,
+                d01_dates={"API-TEST": start},
+                d01_confirmed=True,
+                api_sales_windows=[window],
+                api_store_sid=987654,
+                api_store_name="Synthetic Shop",
+            )
+            workbook = load_workbook(original)
+            sheet = workbook["API-TEST"]
+            sheet["A2"] = "保留推广阶段"
+            sheet["G2"] = "保留发货时间"
+            sheet["M6"] = 5
+            sheet["M7"] = 6
+            sheet["M8"] = 7
+            workbook.save(original)
+            workbook.close()
+
+            new_d01 = start + timedelta(days=1)
+            with self.assertRaisesRegex(ReportGenerationError, "日期错位风险"):
+                generate_reports(
+                    template_path=template,
+                    data_folder=None,
+                    mapping_path=None,
+                    skus=["API-TEST"],
+                    output_path=root / "unconfirmed.xlsx",
+                    d01_dates={"API-TEST": new_d01},
+                    d01_confirmed=True,
+                    existing_report_path=original,
+                    api_sales_windows=[window],
+                    api_store_sid=987654,
+                    api_store_name="Synthetic Shop",
+                )
+
+            updated = root / "confirmed.xlsx"
+            generate_reports(
+                template_path=template,
+                data_folder=None,
+                mapping_path=None,
+                skus=["API-TEST"],
+                output_path=updated,
+                d01_dates={"API-TEST": new_d01},
+                d01_confirmed=True,
+                confirmed_d01_changes=True,
+                existing_report_path=original,
+                api_sales_windows=[window],
+                api_store_sid=987654,
+                api_store_name="Synthetic Shop",
+            )
+            workbook = load_workbook(updated)
+            sheet = workbook["API-TEST"]
+            self.assertEqual(sheet["C6"].value.date(), new_d01)
+            self.assertEqual(sheet["B6"].value, "D01")
+            self.assertEqual(sheet["B7"].value, "D02")
+            self.assertEqual(sheet["B8"].value, "D03")
+            self.assertEqual(sheet["E6"].value, 2)
+            self.assertEqual(sheet["E7"].value, 3)
+            self.assertIsNone(sheet["E8"].value)
+            self.assertEqual(sheet["A2"].value, "保留推广阶段")
+            self.assertEqual(sheet["G2"].value, "保留发货时间")
+            self.assertEqual([sheet[f"M{row}"].value for row in (6, 7, 8)], [5, 6, 7])
+            workbook.close()
+
     def test_gap_free_timeline_and_extension_past_sixty(self) -> None:
         first = date(2026, 1, 1)
         timeline = build_timeline(first, first + timedelta(days=65))
@@ -164,6 +268,8 @@ class TemplateAndReportTests(unittest.TestCase):
                 mapping_path=mapping_path,
                 skus=["TEST_SKU"],
                 output_path=output,
+                d01_dates={"TEST_SKU": date(2026, 1, 1)},
+                d01_confirmed=True,
             )
             self.assertTrue(output.is_file())
             self.assertTrue(result.audit_path.is_file())
@@ -208,6 +314,8 @@ class TemplateAndReportTests(unittest.TestCase):
                 mapping_path=mapping_path,
                 skus=["TEST_SKU"],
                 output_path=updated,
+                d01_dates={"TEST_SKU": date(2026, 1, 1)},
+                d01_confirmed=True,
                 existing_report_path=output,
             )
             workbook = load_workbook(updated, data_only=False)
@@ -268,6 +376,8 @@ class TemplateAndReportTests(unittest.TestCase):
                 mapping_path=mapping_path,
                 skus=["TEST_SKU"],
                 output_path=root / "report.xlsx",
+                d01_dates={"TEST_SKU": date(2026, 1, 1)},
+                d01_confirmed=True,
             )
             workbook = load_workbook(result.output_path, data_only=False)
             worksheet = workbook["TEST_SKU"]
@@ -321,6 +431,8 @@ class TemplateAndReportTests(unittest.TestCase):
                 mapping_path=mapping_path,
                 skus=["SKU_A", "SKU_B"],
                 output_path=root / "report.xlsx",
+                d01_dates={"SKU_A": date(2026, 1, 1), "SKU_B": date(2026, 1, 1)},
+                d01_confirmed=True,
             )
             workbook = load_workbook(result.output_path, data_only=False)
             for sku in ("SKU_A", "SKU_B"):
@@ -369,8 +481,8 @@ class ApiReportGenerationTests(unittest.TestCase):
                 mapping_path=None,
                 skus=["API-TEST"],
                 output_path=output,
-                d01_mode="launch_date",
-                launch_dates={"API-TEST": start},
+                d01_dates={"API-TEST": start},
+                d01_confirmed=True,
                 api_sales_windows=[window],
                 api_store_sid=987654,
                 api_store_name="Synthetic Shop",
@@ -427,8 +539,8 @@ class ApiReportGenerationTests(unittest.TestCase):
                 mapping_path=None,
                 skus=["API-TEST"],
                 output_path=updated,
-                d01_mode="launch_date",
-                launch_dates={"API-TEST": start},
+                d01_dates={"API-TEST": start},
+                d01_confirmed=True,
                 existing_report_path=output,
                 api_sales_windows=[updated_window],
                 api_store_sid=987654,
@@ -444,7 +556,7 @@ class ApiReportGenerationTests(unittest.TestCase):
             self.assertEqual(sheet["E68"].value, 2)
             workbook.close()
 
-    def test_openapi_generation_rejects_unverified_automatic_first_sale_d01(self) -> None:
+    def test_d01_requires_explicit_user_confirmation(self) -> None:
         start = date(2026, 1, 1)
         mapping = SkuProductMapping("API-TEST", ("MSKU-A",), ())
         row = SkuDailySales(987654, "API-TEST", "MSKU-A", "", start, "USD", 1, 1, Decimal("9.99"))
@@ -453,18 +565,191 @@ class ApiReportGenerationTests(unittest.TestCase):
             root = Path(temp_dir)
             template = root / "template.xlsx"
             create_template(template)
-            with self.assertRaisesRegex(ReportGenerationError, "没有已核验的完整历史首单日期"):
+            with self.assertRaisesRegex(ReportGenerationError, "尚未由用户明确确认"):
                 generate_reports(
                     template_path=template,
                     data_folder=None,
                     mapping_path=None,
                     skus=["API-TEST"],
                     output_path=root / "blocked.xlsx",
-                    d01_mode="first_sale",
+                    d01_dates={"API-TEST": start},
                     api_sales_windows=[window],
                     api_store_sid=987654,
                     api_store_name="Synthetic Shop",
                 )
+
+
+class D01SettingsTests(unittest.TestCase):
+    def test_confirmed_d01_dates_persist_per_store_and_sku(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "d01_dates.json"
+            first = date(2026, 8, 1)
+            second = date(2026, 9, 3)
+            save_d01_dates(510226, {"EX3106": first}, path=path)
+            save_d01_dates(510226, {"ex3114": second}, path=path)
+            save_d01_dates(510227, {"EX3106": second}, path=path)
+            self.assertEqual(get_d01_dates(510226, ["ex3106", "EX3114"], path=path), {
+                "ex3106": first, "ex3114": second,
+            })
+            self.assertEqual(get_d01_dates(510227, ["ex3106"], path=path), {"ex3106": second})
+            self.assertEqual(set(load_d01_settings(path)), {"510226", "510227"})
+            self.assertNotIn("secret", path.read_text(encoding="utf-8").casefold())
+
+    def test_corrupt_d01_settings_fail_closed_without_overwrite(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "d01_dates.json"
+            path.write_text("{broken", encoding="utf-8")
+            with self.assertRaises(D01SettingsError):
+                save_d01_dates(510226, {"SKU_A": date(2026, 1, 1)}, path=path)
+            self.assertEqual(path.read_text(encoding="utf-8"), "{broken")
+
+    def test_d01_settings_reject_invalid_dates_and_sid(self) -> None:
+        with self.assertRaises(D01SettingsError):
+            save_d01_dates(True, {"SKU_A": date(2026, 1, 1)}, path=Path("unused.json"))
+        with self.assertRaises(D01SettingsError):
+            save_d01_dates(510226, {"SKU_A": "2026-01-01"}, path=Path("unused.json"))  # type: ignore[arg-type]
+
+
+class SpAdApiTests(unittest.TestCase):
+    @staticmethod
+    def _envelope(records: list[dict[str, Any]], total: int | None = None) -> dict[str, Any]:
+        return {
+            "code": 0,
+            "message": "success",
+            "error_details": [],
+            "request_id": "synthetic-request",
+            "response_time": "2026-08-05 10:00:00",
+            "total": len(records) if total is None else total,
+            "data": records,
+        }
+
+    def test_sp_report_parsers_validate_costs_ids_dates_and_business_code(self) -> None:
+        report_day = date(2026, 8, 5)
+        campaign = self._envelope([{
+            "campaign_id": 123,
+            "profile_id": 987,
+            "cost": 3.25,
+            "report_date": report_day.isoformat(),
+        }])
+        product = self._envelope([{
+            "ad_id": 456,
+            "asin": "ASINTEST0001",
+            "sku": "MSKU-A",
+            "ad_group_id": 789,
+            "profile_id": 987,
+            "campaign_id": 123,
+            "cost": 3.25,
+            "report_date": report_day.isoformat(),
+        }])
+        total, campaign_rows = parse_sp_campaign_report_page(campaign, report_date=report_day)
+        self.assertEqual(total, 1)
+        self.assertEqual(campaign_rows[0].cost, Decimal("3.25"))
+        total, product_rows = parse_sp_product_ad_report_page(product, report_date=report_day)
+        self.assertEqual(total, 1)
+        self.assertEqual(product_rows[0].sku, "MSKU-A")
+        self.assertEqual(product_rows[0].campaign_id, "123")
+
+        wrong_code = dict(campaign, code=1)
+        with self.assertRaisesRegex(LingxingApiError, "业务 code"):
+            parse_sp_campaign_report_page(wrong_code, report_date=report_day)
+        wrong_date = self._envelope([dict(campaign["data"][0], report_date="2026-08-06")])
+        with self.assertRaisesRegex(LingxingApiError, "请求日期不一致"):
+            parse_sp_campaign_report_page(wrong_date, report_date=report_day)
+        wrong_cost = self._envelope([dict(product["data"][0], cost="3.25")])
+        with self.assertRaisesRegex(LingxingApiError, "字段 cost 类型无效"):
+            parse_sp_product_ad_report_page(wrong_cost, report_date=report_day)
+
+    def test_sp_product_cost_is_unique_per_sku_and_cross_checked_to_campaign_total(self) -> None:
+        report_day = date(2026, 8, 5)
+        campaigns = [{"campaign_id": 100, "profile_id": 900, "cost": 3, "report_date": report_day.isoformat()}]
+        products = [
+            {"ad_id": 1, "asin": "ASINTEST0001", "sku": "MSKU-A", "ad_group_id": 10, "profile_id": 900, "campaign_id": 100, "cost": 1.25, "report_date": report_day.isoformat()},
+            {"ad_id": 2, "asin": "ASINTEST0002", "sku": "MSKU-B", "ad_group_id": 10, "profile_id": 900, "campaign_id": 100, "cost": 1.75, "report_date": report_day.isoformat()},
+        ]
+        requests: list[dict[str, Any]] = []
+        headers_seen: list[str | None] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content)
+            requests.append({"path": request.url.path, **body})
+            headers_seen.append(request.headers.get("X-API-VERSION"))
+            records = campaigns if request.url.path.endswith("spCampaignReports") else products
+            return httpx.Response(200, json=self._envelope(records))
+
+        http = httpx.Client(transport=httpx.MockTransport(handler))
+        with LingxingOpenApiClient("1234567890123456", "fixture-app-secret", http_client=http) as client:
+            result = client.query_sp_ad_spend_history(
+                access_token="fixture-token",
+                store_sid=987654,
+                mappings=[
+                    SkuProductMapping("LOCAL-A", ("MSKU-A",), ()),
+                    SkuProductMapping("LOCAL-B", ("MSKU-B",), ()),
+                ],
+                start_date=report_day,
+                end_date=report_day,
+            )
+        self.assertEqual(len(requests), 2)
+        self.assertTrue(all(item["sid"] == 987654 and item["show_detail"] == 0 and item["length"] == 15 for item in requests))
+        self.assertEqual(headers_seen, ["2", "2"])
+        self.assertEqual(len(result[0].discrepancies), 0)
+        self.assertEqual({item.local_sku: item.actual_spend for item in result[0].sku_daily_spends}, {
+            "LOCAL-A": Decimal("1.25"), "LOCAL-B": Decimal("1.75"),
+        })
+        self.assertEqual(sum(item.actual_spend for item in result[0].sku_daily_spends), Decimal("3.00"))
+        http.close()
+
+    def test_sp_cost_mismatch_blocks_sku_attribution_and_pagination_is_complete(self) -> None:
+        report_day = date(2026, 8, 5)
+        campaign_records = [{"campaign_id": 100, "profile_id": 900, "cost": 4, "report_date": report_day.isoformat()}]
+        product_records = [
+            {"ad_id": index + 1, "asin": "ASINTEST0001", "sku": "MSKU-A", "ad_group_id": 10, "profile_id": 900, "campaign_id": 100, "cost": 0.25, "report_date": report_day.isoformat()}
+            for index in range(16)
+        ]
+        request_offsets: list[tuple[str, int]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content)
+            request_offsets.append((request.url.path, body["offset"]))
+            if request.url.path.endswith("spCampaignReports"):
+                return httpx.Response(200, json=self._envelope(campaign_records))
+            offset = body["offset"]
+            return httpx.Response(200, json=self._envelope(product_records[offset:offset + 15], len(product_records)))
+
+        http = httpx.Client(transport=httpx.MockTransport(handler))
+        with LingxingOpenApiClient("1234567890123456", "fixture-app-secret", http_client=http) as client:
+            result = client.query_sp_ad_spend_history(
+                access_token="fixture-token",
+                store_sid=987654,
+                mappings=[SkuProductMapping("LOCAL-A", ("MSKU-A",), ())],
+                start_date=report_day,
+                end_date=report_day,
+            )
+        self.assertEqual(request_offsets, [
+            ("/pb/openapi/newad/spCampaignReports", 0),
+            ("/pb/openapi/newad/spProductAdReports", 0),
+            ("/pb/openapi/newad/spProductAdReports", 15),
+        ])
+        self.assertEqual(len(result[0].product_rows), 16)
+        self.assertEqual(len(result[0].discrepancies), 0)
+        self.assertEqual(result[0].sku_daily_spends[0].actual_spend, Decimal("4.00"))
+        http.close()
+
+        def mismatch_handler(request: httpx.Request) -> httpx.Response:
+            rows = campaign_records if request.url.path.endswith("spCampaignReports") else product_records[:1]
+            return httpx.Response(200, json=self._envelope(rows))
+
+        http = httpx.Client(transport=httpx.MockTransport(mismatch_handler))
+        with LingxingOpenApiClient("1234567890123456", "fixture-app-secret", http_client=http) as client:
+            mismatch = client.query_sp_ad_spend_history(
+                access_token="fixture-token",
+                store_sid=987654,
+                mappings=[SkuProductMapping("LOCAL-A", ("MSKU-A",), ())],
+                start_date=report_day,
+                end_date=report_day,
+            )
+        self.assertEqual(len(mismatch[0].discrepancies), 1)
+        self.assertEqual(mismatch[0].sku_daily_spends, ())
+        http.close()
 
 
 class McpClientTests(unittest.TestCase):

@@ -480,6 +480,34 @@ def _days_in_sheet(worksheet, summary: TemplateInspection) -> tuple[list[int], d
     return rows, d01
 
 
+def read_existing_d01_dates(
+    existing_report_path: Path,
+    template_path: Path,
+    skus: list[str],
+) -> dict[str, date]:
+    """Read existing workbook D01 dates for a pre-update confirmation prompt."""
+    existing_path = existing_report_path.expanduser().resolve()
+    if not existing_path.is_file():
+        raise ReportGenerationError("找不到要增量更新的现有周报。")
+    try:
+        summary = inspect_template(template_path.expanduser().resolve())
+        workbook = load_workbook(existing_path, data_only=False, read_only=False)
+    except (OSError, TemplateInspectionError, ValueError) as exc:
+        raise ReportGenerationError("无法读取现有周报的 D01 日期。") from exc
+    dates: dict[str, date] = {}
+    try:
+        for sku in skus:
+            worksheet = next((sheet for sheet in workbook.worksheets if sheet.title.casefold() == sku.casefold()), None)
+            if worksheet is None:
+                continue
+            _rows, d01 = _days_in_sheet(worksheet, summary)
+            if d01 is not None:
+                dates[sku.casefold()] = d01
+    finally:
+        workbook.close()
+    return dates
+
+
 def _date_from_cell(value: Any) -> date | None:
     if isinstance(value, datetime):
         return value.date()
@@ -603,8 +631,9 @@ def generate_reports(
     mapping_path: Path | None,
     skus: list[str],
     output_path: Path,
-    d01_mode: str = "first_sale",
-    launch_dates: dict[str, date] | None = None,
+    d01_dates: dict[str, date] | None = None,
+    d01_confirmed: bool = False,
+    confirmed_d01_changes: bool = False,
     existing_report_path: Path | None = None,
     api_sales_windows: list[SkuDailySalesWindow] | None = None,
     api_store_sid: int | None = None,
@@ -615,7 +644,15 @@ def generate_reports(
     data_folder = data_folder.expanduser().resolve() if data_folder is not None else None
     mapping_path = mapping_path.expanduser().resolve() if mapping_path is not None else None
     output_path = output_path.expanduser().resolve()
-    launch_dates = {key.casefold(): value for key, value in (launch_dates or {}).items()}
+    normalized_d01_dates: dict[str, date] = {}
+    for raw_sku, day in (d01_dates or {}).items():
+        if not isinstance(raw_sku, str) or not raw_sku.strip() or type(day) is not date:
+            raise ReportGenerationError("D01 必须是逐 SKU 明确输入的有效 YYYY-MM-DD 日期。")
+        key = raw_sku.strip().casefold()
+        if key in normalized_d01_dates:
+            raise ReportGenerationError("D01 设置中存在重复 SKU。")
+        normalized_d01_dates[key] = day
+    d01_dates = normalized_d01_dates
     try:
         skus = _validate_skus(skus)
     except TemplatePreparationError as exc:
@@ -629,12 +666,17 @@ def generate_reports(
         raise ReportGenerationError("对应的数据校验日志已存在，为保护已有记录不覆盖。")
     if template_path == output_path or (existing_report_path and existing_report_path.resolve() == output_path):
         raise ReportGenerationError("输出路径不能覆盖模板或现有周报。")
-    if d01_mode not in {"first_sale", "launch_date"}:
-        raise ReportGenerationError("D01 方式必须是 first_sale 或 launch_date。")
+    if not d01_confirmed:
+        raise ReportGenerationError("D01 尚未由用户明确确认；未生成周报。")
+    requested_skus = {sku.casefold() for sku in skus}
+    missing_d01 = [sku for sku in skus if sku.casefold() not in d01_dates]
+    extra_d01 = [sku for sku in d01_dates if sku not in requested_skus]
+    if missing_d01:
+        raise ReportGenerationError("以下 SKU 尚未设置并确认 D01，不能生成周报：" + ", ".join(missing_d01))
+    if extra_d01:
+        raise ReportGenerationError("D01 设置包含本次未请求的 SKU，停止生成以避免错配。")
     api_mode = api_sales_windows is not None
     if api_mode:
-        if d01_mode != "launch_date":
-            raise ReportGenerationError("OpenAPI 当前没有已核验的完整历史首单日期；请为每个 SKU 手动指定 D01。")
         if isinstance(api_store_sid, bool) or not isinstance(api_store_sid, int):
             raise ReportGenerationError("OpenAPI 周报必须绑定动态店铺 SID。")
         if not isinstance(api_store_name, str) or not api_store_name.strip():
@@ -688,27 +730,12 @@ def generate_reports(
     for sku in skus:
         key = sku.casefold()
         warnings = []
-        sales_days = reports["sales"].rows_by_sku_date.get(key, {})
-        if d01_mode == "first_sale":
-            first_sale_days = [
-                day for day, row in sales_days.items()
-                if isinstance(row.get("units_sold"), Decimal) and row["units_sold"] > 0
-            ]
-            d01 = min(first_sale_days) if first_sale_days else None
-            d01_source = "首个有正销量的销售报表日期" if d01 else None
-        else:
-            d01 = launch_dates.get(key)
-            if d01:
-                d01_source = "用户手动核验的 D01 日期" if api_mode else "用户填写的正式开售日期"
-            else:
-                d01_source = None
+        d01 = d01_dates.get(key)
+        d01_source = "用户手动确认的店铺站点 D01 日期"
         coverage_dates = set()
         for report in reports.values():
             coverage_dates.update(report.coverage.get(key, set()))
         latest = max(coverage_dates) if coverage_dates else None
-        if d01 is None:
-            failures.append(SkuGenerationResult(sku, "failed", None, None, latest.isoformat() if latest else None, 0, None, None, None, ["无法从真实销售记录确定首单日期；请检查数据，或改用正式开售日期。"]))
-            continue
         if latest is None or latest < d01:
             failures.append(SkuGenerationResult(sku, "failed", d01.isoformat(), d01_source, latest.isoformat() if latest else None, 0, None, None, None, ["没有覆盖 D01 及之后日期的有效来源记录，未生成 SKU 页签。"]))
             continue
@@ -718,6 +745,20 @@ def generate_reports(
     if not sku_info:
         details = "; ".join(f"{item.sku}: {'; '.join(item.warnings)}" for item in failures)
         raise ReportGenerationError("没有可生成的 SKU。" + details)
+
+    existing_d01_by_sku: dict[str, date] = {}
+    if existing_report_path is not None:
+        existing_d01_by_sku = read_existing_d01_dates(existing_report_path, template_path, skus)
+    changed_d01 = {
+        sku: (existing_d01_by_sku[sku.casefold()], info["d01"])
+        for sku, info in sku_info.items()
+        if sku.casefold() in existing_d01_by_sku and existing_d01_by_sku[sku.casefold()] != info["d01"]
+    }
+    if changed_d01 and not confirmed_d01_changes:
+        names = ", ".join(changed_d01)
+        raise ReportGenerationError(
+            f"现有周报的 D01 与本次确认日期不同（{names}）；请先确认日期错位风险后重新生成。"
+        )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     stage_fd, stage_name = tempfile.mkstemp(prefix="weekly-report-", suffix=".xlsx", dir=output_path.parent)
@@ -767,18 +808,37 @@ def generate_reports(
                 raise ReportGenerationError(f"未能创建 SKU 工作表：{sku}")
             existing_rows, existing_d01 = _days_in_sheet(worksheet, summary)
             is_existing = sku.casefold() in original_sku_names
-            if is_existing and existing_d01 and existing_d01 != d01:
-                failures.append(
-                    SkuGenerationResult(sku, "failed", d01.isoformat(), info["d01_source"], latest.isoformat(), 0, None, None, None,
-                                        [f"来源确定的 D01 {d01.isoformat()} 与现有周报 D01 {existing_d01.isoformat()} 不一致；未改动该 SKU。"])
-                )
-                continue
+            d01_changed = is_existing and existing_d01 is not None and existing_d01 != d01
             row_count = max(len(existing_rows), len(timeline)) if is_existing else len(timeline)
+            output_timeline = timeline
+            if d01_changed:
+                observed_labels = [
+                    str(worksheet.cell(row, column_index_from_string(summary.day_column)).value).strip().upper()
+                    for row in existing_rows
+                ]
+                expected_labels = [f"D{index:02d}" for index in range(1, len(existing_rows) + 1)]
+                if observed_labels != expected_labels:
+                    raise ReportGenerationError(f"现有周报 {sku} 的日期编号不连续，不能安全修改 D01。")
+                output_timeline = build_timeline(d01, d01 + timedelta(days=max(row_count, 1) - 1))
             try:
                 row_numbers = ensure_day_rows(worksheet, summary, row_count)
             except TemplateExpansionError as exc:
                 raise ReportGenerationError(f"SKU {sku} 扩展日期行失败：{exc}") from exc
-            if is_existing and len(existing_rows) >= len(timeline):
+            if d01_changed:
+                write_timeline_rows(worksheet, summary, output_timeline, row_numbers, clear_after=False)
+                generated_fields = (
+                    "price", "sales", "organic_orders", "ad_orders", "ad_order_share", "target_attainment",
+                    "sessions", "organic_clicks", "impressions", "ad_clicks", "ctr", "ad_cvr", "spend",
+                    "ad_sales", "overall_cvr", "acos",
+                )
+                for row_number in row_numbers:
+                    for field in generated_fields:
+                        column = columns.get(field)
+                        if column is not None:
+                            cell = worksheet.cell(row_number, column)
+                            if cell.data_type != "f":
+                                cell.value = None
+            elif is_existing and len(existing_rows) >= len(timeline):
                 # Keep the existing date axis and previously saved manual input.
                 row_numbers = existing_rows
                 for index, row in enumerate(row_numbers[:len(timeline)]):
@@ -803,7 +863,7 @@ def generate_reports(
             has_sales_amount = False
             ad_spend_total = Decimal("0")
             has_spend = False
-            for item in timeline:
+            for item in output_timeline:
                 row_number = by_day_row.get(item.day_number)
                 if row_number is None:
                     continue
@@ -873,7 +933,7 @@ def generate_reports(
                     d01=d01.isoformat(),
                     d01_source=info["d01_source"],
                     latest_covered_date=latest.isoformat(),
-                    days=len(timeline),
+                    days=len(output_timeline),
                     sales_units_total=float(sales_units_total) if has_sales_units else None,
                     sales_amount_total=(
                         format(sales_amount_total, "f") if api_mode and has_sales_amount
@@ -913,7 +973,7 @@ def generate_reports(
             "template_file": template_path.name,
             "mapping_file": mapping_path.name if mapping_path is not None else None,
             "source_files": sorted({name for report in reports.values() for name in report.source_files}),
-            "d01_mode": d01_mode,
+            "d01_mode": "manual_confirmed",
             "source_details": (
                 {
                     "provider": "lingxing_openapi",
@@ -922,7 +982,7 @@ def generate_reports(
                     "queried_start": api_sales_windows[0].start_date.isoformat(),
                     "queried_end": api_sales_windows[-1].end_date.isoformat(),
                     "data_status": "sales_only_partial; ad_actual_spend_not_verified",
-                    "d01_status": "manually_confirmed_per_sku; complete_first_sale_api_not_available",
+                    "d01_status": "manually_confirmed_by_user_for_store_sku_site_date",
                 }
                 if api_mode and api_sales_windows else None
             ),

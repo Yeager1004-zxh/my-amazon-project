@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from datetime import date
 from pathlib import Path
@@ -98,16 +99,18 @@ def _sku_list(value: str) -> list[str]:
     return [sku.strip() for sku in value.replace("，", ",").split(",") if sku.strip()]
 
 
-def _parse_launch_dates(values: list[str]) -> dict[str, date]:
+def _parse_d01_dates(values: list[str]) -> dict[str, date]:
     result: dict[str, date] = {}
     for value in values:
         if "=" not in value:
-            raise ValueError("正式开售日期格式应为 SKU=YYYY-MM-DD")
+            raise ValueError("D01 日期格式应为 SKU=YYYY-MM-DD")
         sku, day = (part.strip() for part in value.split("=", 1))
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
+            raise ValueError(f"D01 日期格式应为 YYYY-MM-DD：{sku}")
         try:
             result[sku] = date.fromisoformat(day)
         except ValueError as exc:
-            raise ValueError(f"正式开售日期格式应为 SKU=YYYY-MM-DD：{sku}") from exc
+            raise ValueError(f"D01 日期不是有效的 YYYY-MM-DD 日期：{sku}") from exc
     return result
 
 
@@ -160,15 +163,16 @@ def _mcp_command(command: str, tool_name: str | None = None, arguments: str = "{
 
 def _generate(args: argparse.Namespace) -> int:
     try:
-        launch_dates = _parse_launch_dates(args.launch_date)
+        d01_dates = _parse_d01_dates(args.d01)
         result = generate_reports(
             template_path=args.template,
             data_folder=args.data,
             mapping_path=args.mapping,
             skus=_sku_list(args.skus),
             output_path=args.output,
-            d01_mode=args.d01_mode,
-            launch_dates=launch_dates,
+            d01_dates=d01_dates,
+            d01_confirmed=args.confirm_d01,
+            confirmed_d01_changes=args.confirm_d01_change,
             existing_report_path=args.existing,
         )
     except (ReportGenerationError, OSError, ValueError) as exc:
@@ -211,8 +215,9 @@ def main() -> int:
     generate_parser.add_argument("--mapping", type=Path, required=True, help="已按真实源表头配置的 JSON")
     generate_parser.add_argument("--skus", required=True, help="SKU 列表，使用逗号分隔")
     generate_parser.add_argument("--output", type=Path, required=True, help="新建输出 XLSX，不覆盖已有文件")
-    generate_parser.add_argument("--d01-mode", choices=("first_sale", "launch_date"), default="first_sale")
-    generate_parser.add_argument("--launch-date", action="append", default=[], help="正式开售日期，格式 SKU=YYYY-MM-DD；可重复")
+    generate_parser.add_argument("--d01", action="append", default=[], help="手动确认的 D01，格式 SKU=YYYY-MM-DD；可重复")
+    generate_parser.add_argument("--confirm-d01", action="store_true", required=True, help="确认所填 D01 按所选店铺站点日期解释")
+    generate_parser.add_argument("--confirm-d01-change", action="store_true", help="确认已有周报的 D01 变化会使全部 D 编号日期错位")
     generate_parser.add_argument("--existing", type=Path, help="可选的已有周报；更新时手动字段会保留")
 
     subparsers.add_parser("gui", help="启动 Windows 中文图形界面")

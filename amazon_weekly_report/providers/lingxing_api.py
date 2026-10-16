@@ -5,6 +5,7 @@ import json
 import re
 import threading
 import time
+from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -24,12 +25,16 @@ ACCESS_TOKEN_PATH = "/api/auth-server/oauth/access-token"
 SELLER_LIST_PATH = "/erp/sc/data/seller/lists"
 PRODUCT_PERFORMANCE_PATH = "/bd/productPerformance/openApi/asinList"
 ASIN_DAILY_LISTS_PATH = "/erp/sc/data/sales_report/asinDailyLists"
+SP_CAMPAIGN_REPORTS_PATH = "/pb/openapi/newad/spCampaignReports"
+SP_PRODUCT_AD_REPORTS_PATH = "/pb/openapi/newad/spProductAdReports"
 PRODUCT_PERFORMANCE_PAGE_LENGTH = 10_000
 ASIN_DAILY_PAGE_LENGTH = 1_000
+SP_REPORT_PAGE_LENGTH = 15
 MAX_PRODUCT_QUERY_DAYS = 92
 _PRODUCT_PERFORMANCE_REQUEST_LOCK = threading.Lock()
 _PRODUCT_PERFORMANCE_LAST_RESPONSE_AT: float | None = None
 _ASIN_DAILY_REQUEST_LOCK = threading.Lock()
+_SP_REPORT_REQUEST_LOCK = threading.Lock()
 
 
 class LingxingApiError(RuntimeError):
@@ -83,6 +88,52 @@ class SkuDailySalesWindow:
     end_date: date = field(repr=False)
     mappings: tuple[SkuProductMapping, ...] = field(repr=False)
     rows: tuple[SkuDailySales, ...] = field(repr=False)
+
+
+@dataclass(frozen=True)
+class SpCampaignSpend:
+    report_date: date = field(repr=False)
+    campaign_id: str = field(repr=False)
+    cost: Decimal = field(repr=False)
+
+
+@dataclass(frozen=True)
+class SpProductAdSpend:
+    report_date: date = field(repr=False)
+    sku: str = field(repr=False)
+    asin: str = field(repr=False)
+    ad_id: str = field(repr=False)
+    ad_group_id: str = field(repr=False)
+    campaign_id: str = field(repr=False)
+    cost: Decimal = field(repr=False)
+
+
+@dataclass(frozen=True)
+class SkuDailyAdSpend:
+    store_sid: int = field(repr=False)
+    local_sku: str = field(repr=False)
+    seller_sku: str = field(repr=False)
+    report_date: date = field(repr=False)
+    actual_spend: Decimal = field(repr=False)
+    campaign_count: int = field(repr=False)
+
+
+@dataclass(frozen=True)
+class SpAdSpendDiscrepancy:
+    report_date: date = field(repr=False)
+    campaign_id: str = field(repr=False)
+    campaign_cost: Decimal | None = field(repr=False)
+    product_cost: Decimal | None = field(repr=False)
+
+
+@dataclass(frozen=True)
+class SpAdSpendWindow:
+    start_date: date = field(repr=False)
+    end_date: date = field(repr=False)
+    campaign_rows: tuple[SpCampaignSpend, ...] = field(repr=False)
+    product_rows: tuple[SpProductAdSpend, ...] = field(repr=False)
+    sku_daily_spends: tuple[SkuDailyAdSpend, ...] = field(repr=False)
+    discrepancies: tuple[SpAdSpendDiscrepancy, ...] = field(repr=False)
 
 
 def split_date_windows(start_date: date, end_date: date, *, max_days: int = MAX_PRODUCT_QUERY_DAYS) -> list[tuple[date, date]]:
@@ -139,6 +190,83 @@ def _decimal_number(value: Any, field_name: str, endpoint_label: str) -> Decimal
     if not result.is_finite():
         raise LingxingApiError(f"{endpoint_label}响应字段 {field_name} 数值无效。")
     return result
+
+
+def _report_identifier(value: Any, field_name: str, endpoint_label: str) -> str:
+    if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
+        raise LingxingApiError(f"{endpoint_label}响应字段 {field_name} 类型无效；要求 number。")
+    try:
+        numeric = Decimal(str(value))
+    except InvalidOperation as exc:
+        raise LingxingApiError(f"{endpoint_label}响应字段 {field_name} 无效。") from exc
+    if not numeric.is_finite() or numeric <= 0 or numeric != numeric.to_integral_value():
+        raise LingxingApiError(f"{endpoint_label}响应字段 {field_name} 无效。")
+    return format(numeric.quantize(Decimal("1")), "f")
+
+
+def _report_page_records(payload: Any, endpoint_label: str) -> tuple[int, list[dict[str, Any]]]:
+    response = _business_code(payload, endpoint_label, message_field="message")
+    if not isinstance(response.get("error_details"), list):
+        raise LingxingApiError(f"{endpoint_label}响应字段 error_details 类型无效。")
+    if not isinstance(response.get("request_id"), str) or not isinstance(response.get("response_time"), str):
+        raise LingxingApiError(f"{endpoint_label}响应缺少 request_id/response_time。")
+    total = response.get("total")
+    if isinstance(total, bool) or not isinstance(total, int) or total < 0:
+        raise LingxingApiError(f"{endpoint_label}响应字段 total 类型无效。")
+    records = response.get("data")
+    if not isinstance(records, list) or any(not isinstance(row, dict) for row in records):
+        raise LingxingApiError(f"{endpoint_label}响应字段 data 必须是对象数组。")
+    return total, records
+
+
+def _report_date(value: Any, expected_date: date, field_name: str, endpoint_label: str) -> date:
+    if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        raise LingxingApiError(f"{endpoint_label}响应字段 {field_name} 必须是 YYYY-MM-DD。")
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError as exc:
+        raise LingxingApiError(f"{endpoint_label}响应字段 {field_name} 不是有效日期。") from exc
+    if parsed != expected_date:
+        raise LingxingApiError(f"{endpoint_label}返回日期与请求日期不一致。")
+    return parsed
+
+
+def parse_sp_campaign_report_page(
+    payload: Any,
+    *,
+    report_date: date,
+) -> tuple[int, list[SpCampaignSpend]]:
+    endpoint = "SP 广告活动报表"
+    total, records = _report_page_records(payload, endpoint)
+    parsed: list[SpCampaignSpend] = []
+    for item in records:
+        campaign_id = _report_identifier(item.get("campaign_id"), "campaign_id", endpoint)
+        _report_identifier(item.get("profile_id"), "profile_id", endpoint)
+        row_date = _report_date(item.get("report_date"), report_date, "report_date", endpoint)
+        cost = _decimal_number(item.get("cost"), "cost", endpoint)
+        parsed.append(SpCampaignSpend(row_date, campaign_id, cost))
+    return total, parsed
+
+
+def parse_sp_product_ad_report_page(
+    payload: Any,
+    *,
+    report_date: date,
+) -> tuple[int, list[SpProductAdSpend]]:
+    endpoint = "SP 广告商品报表"
+    total, records = _report_page_records(payload, endpoint)
+    parsed: list[SpProductAdSpend] = []
+    for item in records:
+        sku = _required_text(item.get("sku"), "sku", endpoint)
+        asin = _required_text(item.get("asin"), "asin", endpoint)
+        ad_id = _report_identifier(item.get("ad_id"), "ad_id", endpoint)
+        ad_group_id = _report_identifier(item.get("ad_group_id"), "ad_group_id", endpoint)
+        _report_identifier(item.get("profile_id"), "profile_id", endpoint)
+        campaign_id = _report_identifier(item.get("campaign_id"), "campaign_id", endpoint)
+        row_date = _report_date(item.get("report_date"), report_date, "report_date", endpoint)
+        cost = _decimal_number(item.get("cost"), "cost", endpoint)
+        parsed.append(SpProductAdSpend(row_date, sku, asin, ad_id, ad_group_id, campaign_id, cost))
+    return total, parsed
 
 
 def parse_product_performance_page(
@@ -600,6 +728,7 @@ class LingxingOpenApiClient:
         *,
         access_token: str,
         body: dict[str, Any],
+        headers: dict[str, str] | None = None,
     ) -> Any:
         """Send an SDK-style signed JSON POST; never expose URL/body on errors."""
         auth_parameters = {
@@ -611,7 +740,7 @@ class LingxingOpenApiClient:
         query = encode_query_parameters(signed_query)
         try:
             url = httpx.URL(f"{OPENAPI_BASE_URL}{path}?{query}")
-            response = self._http.post(url, json=body)
+            response = self._http.post(url, json=body, headers=headers)
         except httpx.InvalidURL as exc:
             raise LingxingApiError("领星 OpenAPI 查询请求格式无效。") from exc
         except httpx.TimeoutException as exc:
@@ -876,6 +1005,159 @@ class LingxingOpenApiClient:
                         )
                     )
         return result
+
+    def _query_sp_report_pages(
+        self,
+        *,
+        path: str,
+        endpoint_label: str,
+        access_token: str,
+        store_sid: int,
+        report_date: date,
+        parser: Any,
+        identity: Any,
+    ) -> list[Any]:
+        offset = 0
+        expected_total: int | None = None
+        seen: set[str] = set()
+        output: list[Any] = []
+        while True:
+            body = {
+                "sid": store_sid,
+                "report_date": report_date.isoformat(),
+                "show_detail": 0,
+                "offset": offset,
+                "length": SP_REPORT_PAGE_LENGTH,
+            }
+            with _SP_REPORT_REQUEST_LOCK:
+                payload = self._request_signed_post(
+                    path,
+                    access_token=access_token,
+                    body=body,
+                    headers={"X-API-VERSION": "2"},
+                )
+            total, page = parser(payload, report_date=report_date)
+            if expected_total is None:
+                expected_total = total
+            elif total != expected_total:
+                raise LingxingApiError(f"{endpoint_label}分页期间 total 发生变化，已停止查询。")
+            if len(page) > SP_REPORT_PAGE_LENGTH or offset + len(page) > total:
+                raise LingxingApiError(f"{endpoint_label}分页返回数量无效。")
+            if not page and offset < total:
+                raise LingxingApiError(f"{endpoint_label}分页提前返回空页，数据可能不完整。")
+            for record in page:
+                record_id = identity(record)
+                if record_id in seen:
+                    raise LingxingApiError(f"{endpoint_label}分页返回重复记录，已停止累计。")
+                seen.add(record_id)
+                output.append(record)
+            if offset + len(page) >= total:
+                break
+            offset += len(page)
+        return output
+
+    def query_sp_ad_spend_history(
+        self,
+        *,
+        access_token: str,
+        store_sid: int,
+        mappings: list[SkuProductMapping],
+        start_date: date,
+        end_date: date,
+    ) -> list[SpAdSpendWindow]:
+        """Read SP product spend and reconcile it to campaign spend per day.
+
+        Only a date whose every campaign total equals the sum of its product
+        report rows yields SKU totals. Unmatched costs remain diagnostic-only;
+        campaign-level costs are never copied onto every SKU in a campaign.
+        """
+        if not isinstance(access_token, str) or not access_token.strip():
+            raise LingxingApiError("Access Token 为空，未发送 SP 广告报表查询。")
+        if isinstance(store_sid, bool) or not isinstance(store_sid, int):
+            raise LingxingApiError("SP 广告报表查询必须使用动态店铺 SID。")
+        self._validate_query_range(start_date, end_date)
+        if not mappings or any(not isinstance(item, SkuProductMapping) for item in mappings):
+            raise LingxingApiError("SP 广告查询需要已验证的 local SKU→MSKU 映射。")
+        local_by_msku: dict[str, tuple[str, str]] = {}
+        seen_local: set[str] = set()
+        for mapping in mappings:
+            local_key = mapping.local_sku.casefold()
+            if local_key in seen_local or not mapping.seller_skus:
+                raise LingxingApiError("SP 广告查询的 SKU 映射重复或没有 MSKU。")
+            seen_local.add(local_key)
+            for seller_sku in mapping.seller_skus:
+                key = seller_sku.casefold()
+                if key in local_by_msku and local_by_msku[key][0] != mapping.local_sku:
+                    raise LingxingApiError("多个 local SKU 共用同一 MSKU，SP 成本无法唯一归属。")
+                local_by_msku[key] = (mapping.local_sku, seller_sku)
+
+        windows: list[SpAdSpendWindow] = []
+        day_count = (end_date - start_date).days + 1
+        for day_offset in range(day_count):
+            report_day = start_date + timedelta(days=day_offset)
+            campaigns = self._query_sp_report_pages(
+                path=SP_CAMPAIGN_REPORTS_PATH,
+                endpoint_label="SP 广告活动报表",
+                access_token=access_token.strip(),
+                store_sid=store_sid,
+                report_date=report_day,
+                parser=parse_sp_campaign_report_page,
+                identity=lambda row: row.campaign_id,
+            )
+            products = self._query_sp_report_pages(
+                path=SP_PRODUCT_AD_REPORTS_PATH,
+                endpoint_label="SP 广告商品报表",
+                access_token=access_token.strip(),
+                store_sid=store_sid,
+                report_date=report_day,
+                parser=parse_sp_product_ad_report_page,
+                identity=lambda row: row.ad_id,
+            )
+
+            campaign_costs = {row.campaign_id: row.cost for row in campaigns}
+            product_costs: dict[str, Decimal] = defaultdict(lambda: Decimal("0"))
+            for row in products:
+                product_costs[row.campaign_id] += row.cost
+            discrepancies: list[SpAdSpendDiscrepancy] = []
+            for campaign_id in sorted(set(campaign_costs) | set(product_costs)):
+                campaign_cost = campaign_costs.get(campaign_id)
+                product_cost = product_costs.get(campaign_id)
+                if campaign_cost is None or product_cost is None or campaign_cost != product_cost:
+                    discrepancies.append(
+                        SpAdSpendDiscrepancy(report_day, campaign_id, campaign_cost, product_cost)
+                    )
+
+            sku_spends: list[SkuDailyAdSpend] = []
+            if not discrepancies:
+                grouped: dict[tuple[str, str], list[SpProductAdSpend]] = defaultdict(list)
+                for row in products:
+                    mapped = local_by_msku.get(row.sku.casefold())
+                    if mapped is not None:
+                        local_sku, seller_sku = mapped
+                        grouped[(local_sku.casefold(), seller_sku.casefold())].append(row)
+                local_names = {item.local_sku.casefold(): item.local_sku for item in mappings}
+                for (local_key, msku_key), rows in grouped.items():
+                    sku_spends.append(
+                        SkuDailyAdSpend(
+                            store_sid=store_sid,
+                            local_sku=local_names[local_key],
+                            seller_sku=local_by_msku[msku_key][1],
+                            report_date=report_day,
+                            actual_spend=sum((row.cost for row in rows), Decimal("0")),
+                            campaign_count=len({row.campaign_id for row in rows}),
+                        )
+                    )
+            windows.append(
+                SpAdSpendWindow(
+                    report_day,
+                    report_day,
+                    tuple(campaigns),
+                    tuple(products),
+                    tuple(sku_spends),
+                    tuple(discrepancies),
+                )
+            )
+        return windows
 
     def query_daily_sales_history(
         self,
