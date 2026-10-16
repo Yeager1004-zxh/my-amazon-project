@@ -5,6 +5,7 @@ import json
 import tempfile
 import unittest
 from datetime import date, timedelta
+from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
 from urllib.parse import parse_qs
@@ -30,6 +31,10 @@ from amazon_weekly_report.providers.lingxing_api import (
     LingxingApiError,
     LingxingApiNotReady,
     LingxingOpenApiClient,
+    SkuDailySales,
+    SkuProductMapping,
+    parse_asin_daily_page,
+    parse_product_performance_page,
     parse_seller_list_response,
 )
 from amazon_weekly_report.providers.lingxing_signing import (
@@ -37,11 +42,13 @@ from amazon_weekly_report.providers.lingxing_signing import (
     canonical_signing_string,
     encode_query_parameters,
     generate_signature,
+    signed_post_query_parameters,
 )
 from amazon_weekly_report.report_generation import generate_reports
 from amazon_weekly_report.template_expansion import ensure_day_rows
 from amazon_weekly_report.template_inspection import inspect_template
 from amazon_weekly_report.timeline import build_timeline
+from amazon_weekly_report.gui import WeeklyReportApp
 
 
 HEADERS = [
@@ -528,20 +535,20 @@ class McpClientTests(unittest.TestCase):
         client.connect()
         client.call_directory_search(search_tool, {})
         grant = VerifiedReadOnlyGrant(business.tool_id, business.permission_fingerprint)
-        valid_arguments = {"offset": 0, "length": 5, "search_value": ["ex3106"]}
+        valid_arguments = {"offset": 0, "length": 5, "search_value": ["local-test-a"]}
         with self.assertRaises(McpClientError):
             client.call_verified_business_query(action_tool, business, valid_arguments, VerifiedReadOnlyGrant("other_id", business.permission_fingerprint))
         self.assertEqual(len(calls), 1, "unverified action must not be sent")
         with self.assertRaises(McpClientError):
-            client.call_verified_business_query(action_tool, business, {"length": 5, "search_value": ["ex3106"]}, grant)
+            client.call_verified_business_query(action_tool, business, {"length": 5, "search_value": ["local-test-a"]}, grant)
         with self.assertRaises(McpClientError):
-            client.call_verified_business_query(action_tool, business, {"offset": 0, "search_value": ["ex3106"]}, grant)
+            client.call_verified_business_query(action_tool, business, {"offset": 0, "search_value": ["local-test-a"]}, grant)
         with self.assertRaises(McpClientError):
             client.call_verified_business_query(action_tool, business, {**valid_arguments, "unexpected": "value"}, grant)
         with self.assertRaises(McpClientError):
             client.call_verified_business_query(action_tool, business, {**valid_arguments, "offset": "0"}, grant)
         with self.assertRaises(McpClientError):
-            client.call_verified_business_query(action_tool, business, {**valid_arguments, "search_value": [{"sku": "ex3106"}]}, grant)
+            client.call_verified_business_query(action_tool, business, {**valid_arguments, "search_value": [{"sku": "local-test-a"}]}, grant)
         changed_schema = BusinessTool(
             business.tool_id,
             business.name,
@@ -598,18 +605,18 @@ class McpClientTests(unittest.TestCase):
             "required": ["search_value"],
             "additionalProperties": False,
         }
-        validate_json_schema(schema, {"search_value": ["ex3106"]})
-        validate_json_schema(schema, {"search_value": ["ex3106", 0, None]})
+        validate_json_schema(schema, {"search_value": ["local-test-a"]})
+        validate_json_schema(schema, {"search_value": ["local-test-a", 0, None]})
         with self.assertRaises(McpClientError):
             validate_json_schema(schema, {"search_value": []})
         with self.assertRaises(McpClientError):
-            validate_json_schema(schema, {"search_value": ["ex3106", "ex3106"]})
+            validate_json_schema(schema, {"search_value": ["local-test-a", "local-test-a"]})
         with self.assertRaises(McpClientError):
-            validate_json_schema(schema, {"search_value": ["ex3106", "ex3114", "ex3115", "ex3116"]})
+            validate_json_schema(schema, {"search_value": ["local-test-a", "local-test-b", "local-test-c", "local-test-d"]})
         with self.assertRaises(McpClientError):
-            validate_json_schema(schema, {"search_value": [{"sku": "ex3106"}]})
+            validate_json_schema(schema, {"search_value": [{"sku": "local-test-a"}]})
         with self.assertRaises(McpClientError):
-            validate_json_schema(schema, {"search_value": [["ex3106"]]})
+            validate_json_schema(schema, {"search_value": [["local-test-a"]]})
 
 
 class LingxingOpenApiTests(unittest.TestCase):
@@ -702,6 +709,328 @@ class LingxingOpenApiTests(unittest.TestCase):
         with self.assertRaisesRegex(LingxingApiError, "字段 sid 的类型无效"):
             parse_seller_list_response(self._seller_response([record]))
 
+    @staticmethod
+    def _product_record(local_sku: str = "local-test-a", *, offset: int = 0) -> dict[str, object]:
+        return {
+            "sku": local_sku,
+            "price_list": [
+                {"local_sku": local_sku, "seller_sku": f"market-test-{offset + 1}", "sid": "987654"}
+            ],
+            "asins": [{"asin": f"ASINTEST{offset + 1:04d}", "sid": "987654"}],
+        }
+
+    @staticmethod
+    def _product_response(records: list[dict[str, object]], *, total: int | None = None) -> dict[str, object]:
+        return {
+            "code": 0,
+            "msg": "success",
+            "trace_id": "synthetic-trace-id",
+            "data": {"total": len(records) if total is None else total, "list": records},
+        }
+
+    @staticmethod
+    def _daily_record(
+        day: str,
+        metric_value: int | float,
+        *,
+        seller_sku: str = "market-test-1",
+        asin: str = "ASINTEST0001",
+    ) -> dict[str, object]:
+        return {
+            "sid": 987654,
+            "r_date": day,
+            "currency_code": "USD",
+            "seller_sku": seller_sku,
+            "asin": asin,
+            "product_name": "Synthetic Product",
+            "map_value": metric_value,
+        }
+
+    @staticmethod
+    def _daily_response(records: list[dict[str, object]]) -> dict[str, object]:
+        return {
+            "code": 0,
+            "message": "success",
+            "error_details": [],
+            "request_id": "synthetic-request-id",
+            "response_time": "2026-01-02T03:04:05Z",
+            "data": records,
+        }
+
+    def test_product_performance_parser_resolves_local_sku_to_store_msku_and_asin_candidates(self) -> None:
+        payload = self._product_response([self._product_record()])
+        total, mappings = parse_product_performance_page(
+            payload,
+            store_sid=987654,
+            requested_skus={"local-test-a"},
+        )
+        self.assertEqual(total, 1)
+        self.assertEqual(
+            mappings,
+            [SkuProductMapping("local-test-a", ("market-test-1",), ("ASINTEST0001",))],
+        )
+
+    def test_product_performance_parser_rejects_bad_envelope_and_untyped_mapping(self) -> None:
+        good = self._product_response([self._product_record()])
+        with self.assertRaisesRegex(LingxingApiError, "业务 code 7"):
+            parse_product_performance_page(
+                {**good, "code": 7}, store_sid=987654, requested_skus={"local-test-a"}
+            )
+        bad_row = self._product_record()
+        bad_row["price_list"] = "not-an-array"
+        with self.assertRaisesRegex(LingxingApiError, "price_list/asins 必须是数组"):
+            parse_product_performance_page(
+                self._product_response([bad_row]),
+                store_sid=987654,
+                requested_skus={"local-test-a"},
+            )
+        with self.assertRaisesRegex(LingxingApiError, "price_list.sid 的类型无效"):
+            parse_product_performance_page(
+                self._product_response([{
+                    **self._product_record(),
+                    "price_list": [{"local_sku": "local-test-a", "seller_sku": "market-test-1", "sid": True}],
+                }]),
+                store_sid=987654,
+                requested_skus={"local-test-a"},
+            )
+
+    def test_daily_parser_preserves_explicit_zero_and_rejects_bad_site_date_or_types(self) -> None:
+        day = date(2026, 1, 2)
+        parsed = parse_asin_daily_page(
+            self._daily_response([self._daily_record(day.isoformat(), 0)]),
+            store_sid=987654,
+            event_date=day,
+            metric_type=2,
+        )
+        self.assertEqual(parsed[0].metric_value, Decimal("0"))
+        self.assertEqual(parsed[0].event_date, day)
+        with self.assertRaisesRegex(LingxingApiError, "站点日期不一致"):
+            parse_asin_daily_page(
+                self._daily_response([self._daily_record("2026-01-03", 1)]),
+                store_sid=987654,
+                event_date=day,
+                metric_type=2,
+            )
+        with self.assertRaisesRegex(LingxingApiError, "不是整数"):
+            parse_asin_daily_page(
+                self._daily_response([self._daily_record(day.isoformat(), 1.5)]),
+                store_sid=987654,
+                event_date=day,
+                metric_type=3,
+            )
+        with self.assertRaisesRegex(LingxingApiError, "SID 不匹配"):
+            parse_asin_daily_page(
+                self._daily_response([{**self._daily_record(day.isoformat(), 1), "sid": 1}]),
+                store_sid=987654,
+                event_date=day,
+                metric_type=2,
+            )
+
+    def test_product_and_daily_queries_send_documented_parameters_and_keep_missing_distinct_from_zero(self) -> None:
+        app_id = "ak_0123456789abc"
+        token = "fixture-token"
+        first_day = date(2026, 1, 2)
+        second_day = date(2026, 1, 3)
+        requests: list[tuple[httpx.Request, dict[str, object]]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content.decode("utf-8"))
+            requests.append((request, body))
+            if request.url.path == "/bd/productPerformance/openApi/asinList":
+                return httpx.Response(200, json=self._product_response([self._product_record()]))
+            self.assertEqual(request.url.path, "/erp/sc/data/sales_report/asinDailyLists")
+            event_date = body["event_date"]
+            metric_type = body["type"]
+            if event_date == first_day.isoformat():
+                values = {1: 12.34, 2: 2, 3: 1}
+                records = [self._daily_record(event_date, values[metric_type])]
+            elif metric_type == 2:
+                # A returned zero is present data; omitted type 1/type 3 records
+                # stay None in the normalized result.
+                records = [self._daily_record(event_date, 0)]
+            else:
+                records = []
+            return httpx.Response(200, json=self._daily_response(records))
+
+        http = httpx.Client(transport=httpx.MockTransport(handler))
+        with patch("amazon_weekly_report.providers.lingxing_api._PRODUCT_PERFORMANCE_LAST_RESPONSE_AT", None), \
+                patch("amazon_weekly_report.providers.lingxing_api.time.time", return_value=1639734344), \
+                patch("amazon_weekly_report.providers.lingxing_api.time.monotonic", return_value=100.0), \
+                patch("amazon_weekly_report.providers.lingxing_api.time.sleep"):
+            with LingxingOpenApiClient(app_id, "fixture-app-secret", http_client=http) as client:
+                mappings = client.query_product_mappings(
+                    access_token=token,
+                    store_sid=987654,
+                    local_skus=["local-test-a"],
+                    start_date=first_day,
+                    end_date=second_day,
+                )
+                rows = client.query_daily_sales(
+                    access_token=token,
+                    store_sid=987654,
+                    mappings=mappings,
+                    start_date=first_day,
+                    end_date=second_day,
+                )
+        http.close()
+
+        self.assertEqual(len(requests), 7)
+        product_request, product_body = requests[0]
+        self.assertEqual(product_request.method, "POST")
+        self.assertEqual(product_request.url.path, "/bd/productPerformance/openApi/asinList")
+        self.assertEqual(product_body["search_field"], "local_sku")
+        self.assertEqual(product_body["search_value"], ["local-test-a"])
+        self.assertEqual(product_body["length"], 10_000)
+        self.assertEqual(product_body["sid"], "987654")
+        self.assertEqual(product_body["summary_field"], "sku")
+        self.assertIs(product_body["is_recently_enum"], False)
+        self.assertEqual(product_body["start_date"], first_day.isoformat())
+        self.assertEqual(product_body["end_date"], second_day.isoformat())
+        self.assertEqual([request.url.path for request, _ in requests[1:]], [
+            "/erp/sc/data/sales_report/asinDailyLists"
+        ] * 6)
+        for request, body in requests[1:]:
+            self.assertEqual(body["sid"], 987654)
+            self.assertEqual(body["asin_type"], 2)
+            self.assertIn(body["event_date"], (first_day.isoformat(), second_day.isoformat()))
+            self.assertIn(body["type"], (1, 2, 3))
+            self.assertEqual(body["length"], 1000)
+            query = parse_qs(request.url.query.decode("ascii"))
+            self.assertEqual(query["access_token"], [token])
+            self.assertEqual(query["timestamp"], ["1639734344"])
+            self.assertEqual(query["sign"], [signed_post_query_parameters({
+                "access_token": token,
+                "app_key": app_id,
+                "timestamp": 1639734344,
+            }, body, app_id)["sign"]])
+
+        self.assertEqual(len(rows), 2)
+        first, second = rows
+        self.assertEqual((first.units_sold, first.order_count, first.sales_amount), (2, 1, Decimal("12.34")))
+        self.assertEqual(first.event_date, first_day)
+        self.assertEqual(first.asin, "ASINTEST0001")
+        self.assertEqual((second.units_sold, second.order_count, second.sales_amount), (0, None, None))
+        self.assertEqual(second.event_date, second_day)
+        self.assertEqual(second.asin, "ASINTEST0001")
+
+    def test_product_mapping_paginates_using_offset_and_rejects_uncovered_pages(self) -> None:
+        requested = ["local-test-a", "local-test-b"]
+        offsets: list[int] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content.decode("utf-8"))
+            offsets.append(body["offset"])
+            record_index = body["offset"]
+            records = [
+                self._product_record(requested[record_index], offset=record_index)
+            ] if record_index < len(requested) else []
+            return httpx.Response(200, json=self._product_response(records, total=len(requested)))
+
+        http = httpx.Client(transport=httpx.MockTransport(handler))
+        with patch("amazon_weekly_report.providers.lingxing_api.PRODUCT_PERFORMANCE_PAGE_LENGTH", 1), \
+                patch("amazon_weekly_report.providers.lingxing_api._PRODUCT_PERFORMANCE_LAST_RESPONSE_AT", None), \
+                patch("amazon_weekly_report.providers.lingxing_api.time.monotonic", return_value=100.0), \
+                patch("amazon_weekly_report.providers.lingxing_api.time.sleep"):
+            with LingxingOpenApiClient("ak_0123456789abc", "fixture-app-secret", http_client=http) as client:
+                mappings = client.query_product_mappings(
+                    access_token="fixture-token",
+                    store_sid=987654,
+                    local_skus=requested,
+                    start_date=date(2026, 1, 1),
+                    end_date=date(2026, 1, 2),
+                )
+        http.close()
+        self.assertEqual(offsets, [0, 1])
+        self.assertEqual([mapping.local_sku for mapping in mappings], requested)
+
+    def test_product_mapping_rejects_duplicate_local_sku_across_pages(self) -> None:
+        record = self._product_record()
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content.decode("utf-8"))
+            return httpx.Response(200, json=self._product_response([record], total=2))
+
+        http = httpx.Client(transport=httpx.MockTransport(handler))
+        with patch("amazon_weekly_report.providers.lingxing_api.PRODUCT_PERFORMANCE_PAGE_LENGTH", 1), \
+                patch("amazon_weekly_report.providers.lingxing_api._PRODUCT_PERFORMANCE_LAST_RESPONSE_AT", None), \
+                patch("amazon_weekly_report.providers.lingxing_api.time.monotonic", return_value=100.0), \
+                patch("amazon_weekly_report.providers.lingxing_api.time.sleep"):
+            with LingxingOpenApiClient("ak_0123456789abc", "fixture-app-secret", http_client=http) as client:
+                with self.assertRaisesRegex(LingxingApiError, "重复 local SKU"):
+                    client.query_product_mappings(
+                        access_token="fixture-token",
+                        store_sid=987654,
+                        local_skus=["local-test-a", "local-test-b"],
+                        start_date=date(2026, 1, 1),
+                        end_date=date(2026, 1, 2),
+                    )
+        http.close()
+
+    def test_daily_statistics_paginates_serially_and_stops_on_rate_limit(self) -> None:
+        day = date(2026, 1, 2)
+        offsets: list[tuple[int, int]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content.decode("utf-8"))
+            metric_type = body["type"]
+            offset = body["offset"]
+            offsets.append((metric_type, offset))
+            page_rows = [
+                self._daily_record(day.isoformat(), 3, seller_sku="market-other"),
+                self._daily_record(day.isoformat(), {1: 12.34, 2: 2, 3: 1}[metric_type]),
+            ]
+            records = page_rows[offset:offset + 1]
+            return httpx.Response(200, json=self._daily_response(records))
+
+        http = httpx.Client(transport=httpx.MockTransport(handler))
+        with patch("amazon_weekly_report.providers.lingxing_api.ASIN_DAILY_PAGE_LENGTH", 1):
+            with LingxingOpenApiClient("ak_0123456789abc", "fixture-app-secret", http_client=http) as client:
+                rows = client.query_daily_sales(
+                    access_token="fixture-token",
+                    store_sid=987654,
+                    mappings=[SkuProductMapping("local-test-a", ("market-test-1",), ("ASINTEST0001",))],
+                    start_date=day,
+                    end_date=day,
+                )
+        http.close()
+        self.assertEqual(offsets, [(metric, offset) for metric in (1, 2, 3) for offset in (0, 1, 2)])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((rows[0].units_sold, rows[0].order_count, rows[0].sales_amount), (2, 1, Decimal("12.34")))
+
+        limited_http = httpx.Client(
+            transport=httpx.MockTransport(lambda _request: httpx.Response(429, headers={"Retry-After": "9"}))
+        )
+        with LingxingOpenApiClient("ak_0123456789abc", "fixture-app-secret", http_client=limited_http) as client:
+            with self.assertRaisesRegex(LingxingApiError, "等待 9 秒"):
+                client.query_daily_sales(
+                    access_token="fixture-token",
+                    store_sid=987654,
+                    mappings=[SkuProductMapping("local-test-a", ("market-test-1",), ())],
+                    start_date=day,
+                    end_date=day,
+                )
+        limited_http.close()
+
+    def test_daily_statistics_rejects_duplicate_msku_across_pages(self) -> None:
+        day = date(2026, 1, 2)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content.decode("utf-8"))
+            return httpx.Response(200, json=self._daily_response([self._daily_record(day.isoformat(), 1)]))
+
+        http = httpx.Client(transport=httpx.MockTransport(handler))
+        with patch("amazon_weekly_report.providers.lingxing_api.ASIN_DAILY_PAGE_LENGTH", 1):
+            with LingxingOpenApiClient("ak_0123456789abc", "fixture-app-secret", http_client=http) as client:
+                with self.assertRaisesRegex(LingxingApiError, "重复 MSKU"):
+                    client.query_daily_sales(
+                        access_token="fixture-token",
+                        store_sid=987654,
+                        mappings=[SkuProductMapping("local-test-a", ("market-test-1",), ())],
+                        start_date=day,
+                        end_date=day,
+                    )
+        http.close()
+
     def test_signature_matches_reference_algorithm_vector(self) -> None:
         app_id = "ak_0123456789abc"
         parameters = {
@@ -733,6 +1062,26 @@ class LingxingOpenApiTests(unittest.TestCase):
             canonical_signing_string({"sign": "self-reference"})
         with self.assertRaises(LingxingSignatureError):
             generate_signature({"timestamp": 1}, "short")
+
+    def test_signed_post_serializes_arrays_as_compact_json_for_sdk_signature(self) -> None:
+        app_id = "ak_0123456789abc"
+        auth = {"access_token": "fixture-token", "app_key": app_id, "timestamp": 1639734344}
+        body = {
+            "search_value": ["local sku", "本地SKU"],
+            "sid": "987654",
+            "offset": 0,
+        }
+        signed = signed_post_query_parameters(auth, body, app_id)
+        canonical_parameters = {
+            **auth,
+            "search_value": '["local sku","本地SKU"]',
+            "sid": "987654",
+            "offset": 0,
+        }
+        self.assertEqual(signed["sign"], generate_signature(canonical_parameters, app_id))
+        self.assertEqual(set(signed), {"access_token", "app_key", "timestamp", "sign"})
+        with self.assertRaises(LingxingSignatureError):
+            signed_post_query_parameters(auth, {"timestamp": 1}, app_id)
 
     def test_query_encoding_matches_java_urlencoder_for_utf8_and_base64(self) -> None:
         encoded = encode_query_parameters({"value": "a b+/%~=中", "sign": "A+/="})
@@ -915,7 +1264,7 @@ class LingxingOpenApiTests(unittest.TestCase):
                 client.query_sku_sales(
                     access_token="fixture-token",
                     seller_id="fixture-seller",
-                    sku="ex3106",
+                    sku="local-test-a",
                     start_date="2026-08-01",
                     end_date="2026-08-10",
                 )
@@ -929,6 +1278,55 @@ class LingxingOpenApiTests(unittest.TestCase):
                 client.request_access_token()
         self.assertNotIn("fixture-app-secret", str(raised.exception))
         http.close()
+
+
+class OpenApiPreviewTests(unittest.TestCase):
+    class _Value:
+        def __init__(self) -> None:
+            self.value = ""
+
+        def set(self, value: str) -> None:
+            self.value = value
+
+    class _Tree:
+        def __init__(self) -> None:
+            self.rows: list[tuple[object, ...]] = []
+
+        def insert(self, _parent: str, _index: str, *, values: tuple[object, ...]) -> None:
+            self.rows.append(values)
+
+    def test_gui_preview_formats_missing_and_explicit_zero_without_claiming_historical_first_sale(self) -> None:
+        app = object.__new__(WeeklyReportApp)
+        app.report_mapping_status = self._Value()
+        app.report_query_status = self._Value()
+        app.report_sales_tree = self._Tree()
+        day = date(2026, 1, 2)
+        result = {
+            "_mappings": [SkuProductMapping("local-test-a", ("market-test-1",), ("ASINTEST0001",))],
+            "_daily_rows": [
+                SkuDailySales(
+                    sid=987654,
+                    local_sku="local-test-a",
+                    seller_sku="market-test-1",
+                    asin="ASINTEST0001",
+                    event_date=day,
+                    currency_code="USD",
+                    units_sold=0,
+                    order_count=None,
+                    sales_amount=None,
+                )
+            ],
+            "_requested_skus": ["local-test-a"],
+            "_unresolved_skus": [],
+            "_start_date": day,
+            "_end_date": day,
+            "_store_name": "Synthetic Store",
+        }
+        app._apply_daily_sales_preview(result)
+        self.assertEqual(app.report_sales_tree.rows[0][4:8], ("0", "", "", "USD"))
+        self.assertIn("ASIN 候选未假定与某个 MSKU 一一对应", app.report_mapping_status.value)
+        self.assertIn("所选范围未发现明确正销量记录", app.report_query_status.value)
+        self.assertIn("不是已核验的历史首单日期", app.report_query_status.value)
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 from collections.abc import Mapping
 from urllib.parse import quote_plus
 from typing import Any
@@ -84,6 +85,41 @@ def signed_query_parameters(parameters: Mapping[str, Any], app_id: str) -> dict[
     signed = dict(normalized)
     signed["sign"] = generate_signature(normalized, app_id)
     return signed
+
+
+def signed_post_query_parameters(
+    query_parameters: Mapping[str, Any],
+    body_parameters: Mapping[str, Any],
+    app_id: str,
+) -> dict[str, str]:
+    """Sign auth query parameters together with JSON POST body fields.
+
+    The supplied Java SDK POST examples merge query/body maps before signing.
+    For collection-valued body fields, its examples first JSON-serialize the
+    collection for signing, then send the collection itself in the JSON body.
+    """
+    normalized_query = normalize_signing_parameters(query_parameters)
+    if not isinstance(body_parameters, Mapping):
+        raise LingxingSignatureError("POST JSON body 必须是键值映射。")
+    signed_values: dict[str, Any] = dict(normalized_query)
+    for name, value in body_parameters.items():
+        if not isinstance(name, str) or not name or not name.isascii():
+            raise LingxingSignatureError("POST body 参数名必须是非空 ASCII 字符串。")
+        if name in signed_values:
+            raise LingxingSignatureError(f"POST body 与签名查询参数重名：{name}。")
+        if isinstance(value, (list, dict)):
+            try:
+                signed_values[name] = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+            except (TypeError, ValueError) as exc:
+                raise LingxingSignatureError(f"POST body 参数 {name} 不能按 SDK 规则序列化。") from exc
+        else:
+            # Validate scalar serialization using the same behavior as ApiSign.
+            signed_values[name] = _serialize_sdk_value(value, name=name)
+
+    return {
+        **normalized_query,
+        "sign": generate_signature(signed_values, app_id),
+    }
 
 
 def _java_urlencode(value: str) -> str:

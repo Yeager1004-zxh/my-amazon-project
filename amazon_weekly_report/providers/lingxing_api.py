@@ -1,21 +1,35 @@
 from __future__ import annotations
 
 import math
+import json
 import re
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import httpx
 
-from .lingxing_signing import encode_query_parameters, signed_query_parameters
+from .lingxing_signing import (
+    encode_query_parameters,
+    signed_post_query_parameters,
+    signed_query_parameters,
+)
 
 
 OPENAPI_BASE_URL = "https://openapi.lingxing.com"
 ACCESS_TOKEN_PATH = "/api/auth-server/oauth/access-token"
 SELLER_LIST_PATH = "/erp/sc/data/seller/lists"
+PRODUCT_PERFORMANCE_PATH = "/bd/productPerformance/openApi/asinList"
+ASIN_DAILY_LISTS_PATH = "/erp/sc/data/sales_report/asinDailyLists"
+PRODUCT_PERFORMANCE_PAGE_LENGTH = 10_000
+ASIN_DAILY_PAGE_LENGTH = 1_000
+MAX_PRODUCT_QUERY_DAYS = 92
+_PRODUCT_PERFORMANCE_REQUEST_LOCK = threading.Lock()
+_PRODUCT_PERFORMANCE_LAST_RESPONSE_AT: float | None = None
+_ASIN_DAILY_REQUEST_LOCK = threading.Lock()
 
 
 class LingxingApiError(RuntimeError):
@@ -24,6 +38,203 @@ class LingxingApiError(RuntimeError):
 
 class LingxingApiNotReady(LingxingApiError):
     """A query is deliberately blocked until its official contract is verified."""
+
+
+@dataclass(frozen=True)
+class SkuProductMapping:
+    """A local SKU's MSKU/ASIN identities for one selected Lingxing store."""
+
+    local_sku: str = field(repr=False)
+    seller_skus: tuple[str, ...] = field(repr=False)
+    asins: tuple[str, ...] = field(repr=False)
+
+
+@dataclass(frozen=True)
+class _DailyMetricRecord:
+    sid: int = field(repr=False)
+    event_date: date = field(repr=False)
+    currency_code: str = field(repr=False)
+    seller_sku: str = field(repr=False)
+    asin: str = field(repr=False)
+    product_name: str = field(repr=False)
+    metric_value: Decimal = field(repr=False)
+
+
+@dataclass(frozen=True)
+class SkuDailySales:
+    """Daily API values; None means no API record, while zero is explicit zero."""
+
+    sid: int = field(repr=False)
+    local_sku: str = field(repr=False)
+    seller_sku: str = field(repr=False)
+    asin: str = field(repr=False)
+    event_date: date = field(repr=False)
+    currency_code: str = field(repr=False)
+    units_sold: int | None = field(repr=False)
+    order_count: int | None = field(repr=False)
+    sales_amount: Decimal | None = field(repr=False)
+
+
+def _business_code(payload: Any, endpoint_label: str, *, message_field: str) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise LingxingApiError(f"{endpoint_label}业务响应必须是 JSON 对象。")
+    code = payload.get("code")
+    if isinstance(code, bool) or not isinstance(code, int):
+        raise LingxingApiError(f"{endpoint_label}业务响应 code 类型无效。")
+    if code != 0:
+        raise LingxingApiError(f"{endpoint_label}业务查询失败（业务 code {code}）。")
+    if not isinstance(payload.get(message_field), str):
+        raise LingxingApiError(f"{endpoint_label}响应字段 {message_field} 类型无效。")
+    return payload
+
+
+def _documented_sid(value: Any, field_name: str) -> int:
+    # The Product Performance field table says integer, but its published JSON
+    # success example encodes nested SID values as decimal strings.
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.isdecimal():
+        return int(value)
+    raise LingxingApiError(f"商品映射响应字段 {field_name} 的类型无效。")
+
+
+def _required_text(value: Any, field_name: str, endpoint_label: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise LingxingApiError(f"{endpoint_label}响应字段 {field_name} 类型或内容无效。")
+    return value.strip()
+
+
+def _decimal_number(value: Any, field_name: str, endpoint_label: str) -> Decimal:
+    if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
+        raise LingxingApiError(f"{endpoint_label}响应字段 {field_name} 类型无效；要求 number。")
+    try:
+        result = Decimal(str(value))
+    except InvalidOperation as exc:
+        raise LingxingApiError(f"{endpoint_label}响应字段 {field_name} 数值无效。") from exc
+    if not result.is_finite():
+        raise LingxingApiError(f"{endpoint_label}响应字段 {field_name} 数值无效。")
+    return result
+
+
+def parse_product_performance_page(
+    payload: Any,
+    *,
+    store_sid: int,
+    requested_skus: set[str],
+) -> tuple[int, list[SkuProductMapping]]:
+    """Parse one documented ``asinList`` page without leaking raw records."""
+    response = _business_code(payload, "产品表现", message_field="msg")
+    if not isinstance(response.get("trace_id"), str):
+        raise LingxingApiError("产品表现响应字段 trace_id 类型无效。")
+    data = response.get("data")
+    if not isinstance(data, dict):
+        raise LingxingApiError("产品表现响应字段 data 必须是对象。")
+    total = data.get("total")
+    if isinstance(total, bool) or not isinstance(total, int) or total < 0:
+        raise LingxingApiError("产品表现响应字段 total 类型无效。")
+    records = data.get("list")
+    if not isinstance(records, list):
+        raise LingxingApiError("产品表现响应字段 data.list 必须是数组。")
+
+    mappings: list[SkuProductMapping] = []
+    for item in records:
+        if not isinstance(item, dict):
+            raise LingxingApiError("产品表现 data.list 中的记录必须是对象。")
+        local_sku = _required_text(item.get("sku"), "sku", "产品表现")
+        if local_sku not in requested_skus:
+            continue
+        price_list = item.get("price_list")
+        asin_records = item.get("asins")
+        if not isinstance(price_list, list) or not isinstance(asin_records, list):
+            raise LingxingApiError("产品表现记录的 price_list/asins 必须是数组。")
+
+        seller_skus: set[str] = set()
+        for price in price_list:
+            if not isinstance(price, dict):
+                raise LingxingApiError("产品表现 price_list 记录必须是对象。")
+            row_local_sku = _required_text(price.get("local_sku"), "price_list.local_sku", "产品表现")
+            seller_sku = _required_text(price.get("seller_sku"), "price_list.seller_sku", "产品表现")
+            row_sid = _documented_sid(price.get("sid"), "price_list.sid")
+            if row_sid == store_sid and row_local_sku == local_sku:
+                seller_skus.add(seller_sku)
+
+        asins: set[str] = set()
+        for asin_record in asin_records:
+            if not isinstance(asin_record, dict):
+                raise LingxingApiError("产品表现 asins 记录必须是对象。")
+            asin = _required_text(asin_record.get("asin"), "asins.asin", "产品表现")
+            row_sid = _documented_sid(asin_record.get("sid"), "asins.sid")
+            if row_sid == store_sid:
+                asins.add(asin)
+
+        mappings.append(
+            SkuProductMapping(
+                local_sku=local_sku,
+                seller_skus=tuple(sorted(seller_skus)),
+                asins=tuple(sorted(asins)),
+            )
+        )
+    return total, mappings
+
+
+def parse_asin_daily_page(
+    payload: Any,
+    *,
+    store_sid: int,
+    event_date: date,
+    metric_type: int,
+) -> list[_DailyMetricRecord]:
+    """Parse one daily statistics page for the documented metric selector."""
+    if isinstance(metric_type, bool) or not isinstance(metric_type, int) or metric_type not in (1, 2, 3):
+        raise LingxingApiError("每日销量统计 type 必须是文档规定的 1、2 或 3。")
+    response = _business_code(payload, "每日销量统计", message_field="message")
+    if not isinstance(response.get("error_details"), list):
+        raise LingxingApiError("每日销量统计响应字段 error_details 类型无效。")
+    if not isinstance(response.get("request_id"), str):
+        raise LingxingApiError("每日销量统计响应字段 request_id 类型无效。")
+    if not isinstance(response.get("response_time"), str):
+        raise LingxingApiError("每日销量统计响应字段 response_time 类型无效。")
+    records = response.get("data")
+    if not isinstance(records, list):
+        raise LingxingApiError("每日销量统计响应字段 data 必须是数组。")
+
+    result: list[_DailyMetricRecord] = []
+    for item in records:
+        if not isinstance(item, dict):
+            raise LingxingApiError("每日销量统计 data 中的记录必须是对象。")
+        sid = item.get("sid")
+        if isinstance(sid, bool) or not isinstance(sid, int):
+            raise LingxingApiError("每日销量统计响应字段 sid 类型无效。")
+        raw_date = _required_text(item.get("r_date"), "r_date", "每日销量统计")
+        try:
+            parsed_date = date.fromisoformat(raw_date)
+        except ValueError as exc:
+            raise LingxingApiError("每日销量统计响应字段 r_date 不是 YYYY-MM-DD。") from exc
+        if parsed_date != event_date:
+            raise LingxingApiError("每日销量统计响应日期与请求的站点日期不一致。")
+        currency_code = _required_text(item.get("currency_code"), "currency_code", "每日销量统计")
+        seller_sku = _required_text(item.get("seller_sku"), "seller_sku", "每日销量统计")
+        asin = _required_text(item.get("asin"), "asin", "每日销量统计")
+        product_name = item.get("product_name")
+        if not isinstance(product_name, str):
+            raise LingxingApiError("每日销量统计响应字段 product_name 类型无效。")
+        metric_value = _decimal_number(item.get("map_value"), "map_value", "每日销量统计")
+        if metric_type in (2, 3) and metric_value != metric_value.to_integral_value():
+            raise LingxingApiError("每日销量统计销量/订单量不是整数，已停止映射。")
+        if sid != store_sid:
+            raise LingxingApiError("每日销量统计返回了与所选店铺 SID 不匹配的记录。")
+        result.append(
+            _DailyMetricRecord(
+                sid=sid,
+                event_date=parsed_date,
+                currency_code=currency_code,
+                seller_sku=seller_sku,
+                asin=asin,
+                product_name=product_name,
+                metric_value=metric_value,
+            )
+        )
+    return result
 
 
 @dataclass(frozen=True)
@@ -223,7 +434,7 @@ def _redact_api_payload(value: Any, secrets: tuple[str, ...]) -> Any:
 
 
 class LingxingOpenApiClient:
-    """Official-host client for token exchange and the signed seller-list query."""
+    """Official-host client for signed seller, product mapping, and daily sales reads."""
 
     def __init__(
         self,
@@ -357,6 +568,289 @@ class LingxingOpenApiClient:
             payload,
             (self._app_id, self._app_secret, *sensitive_values),
         )
+
+    def _request_signed_post(
+        self,
+        path: str,
+        *,
+        access_token: str,
+        body: dict[str, Any],
+    ) -> Any:
+        """Send an SDK-style signed JSON POST; never expose URL/body on errors."""
+        auth_parameters = {
+            "access_token": access_token,
+            "app_key": self._app_id,
+            "timestamp": str(int(time.time())),
+        }
+        signed_query = signed_post_query_parameters(auth_parameters, body, self._app_id)
+        query = encode_query_parameters(signed_query)
+        try:
+            url = httpx.URL(f"{OPENAPI_BASE_URL}{path}?{query}")
+            response = self._http.post(url, json=body)
+        except httpx.InvalidURL as exc:
+            raise LingxingApiError("领星 OpenAPI 查询请求格式无效。") from exc
+        except httpx.TimeoutException as exc:
+            raise LingxingApiError("领星 OpenAPI 查询超时。") from exc
+        except httpx.HTTPError as exc:
+            raise LingxingApiError("无法连接领星 OpenAPI；请检查网络、域名及 IP 白名单。") from exc
+
+        if not 200 <= response.status_code < 300:
+            if response.status_code == 429:
+                retry_after = response.headers.get("Retry-After", "")
+                if retry_after.isdecimal():
+                    raise LingxingApiError(
+                        f"领星 OpenAPI 限流（HTTP 429）；服务端建议等待 {retry_after} 秒后再试。"
+                    )
+                raise LingxingApiError("领星 OpenAPI 限流（HTTP 429）；未自动重发，请稍后重试。")
+            raise LingxingApiError(f"领星 OpenAPI 查询返回 HTTP {response.status_code}。")
+        try:
+            payload = json.loads(response.content, parse_float=Decimal)
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise LingxingApiError("领星 OpenAPI 查询返回了无法解析的 JSON。") from exc
+        if not isinstance(payload, (dict, list)):
+            raise LingxingApiError("领星 OpenAPI 查询响应结构无效。")
+        return _redact_api_payload(
+            payload,
+            (self._app_id, self._app_secret, access_token, signed_query["sign"]),
+        )
+
+    def _request_product_performance_page(
+        self,
+        *,
+        access_token: str,
+        body: dict[str, Any],
+    ) -> Any:
+        """Honor Product Performance's documented single-store 1 s interval."""
+        global _PRODUCT_PERFORMANCE_LAST_RESPONSE_AT
+        with _PRODUCT_PERFORMANCE_REQUEST_LOCK:
+            if _PRODUCT_PERFORMANCE_LAST_RESPONSE_AT is not None:
+                remaining = 1.0 - (time.monotonic() - _PRODUCT_PERFORMANCE_LAST_RESPONSE_AT)
+                if remaining > 0:
+                    time.sleep(remaining)
+            try:
+                return self._request_signed_post(
+                    PRODUCT_PERFORMANCE_PATH,
+                    access_token=access_token,
+                    body=body,
+                )
+            finally:
+                # Count failed responses too so a subsequent retry cannot burst.
+                _PRODUCT_PERFORMANCE_LAST_RESPONSE_AT = time.monotonic()
+
+    @staticmethod
+    def _validate_query_range(start_date: date, end_date: date) -> None:
+        if type(start_date) is not date or type(end_date) is not date:
+            raise LingxingApiError("查询日期必须使用 YYYY-MM-DD 站点日期。")
+        if end_date < start_date:
+            raise LingxingApiError("结束日期不能早于开始日期。")
+        if (end_date - start_date).days + 1 > MAX_PRODUCT_QUERY_DAYS:
+            raise LingxingApiError("本次查询范围不能超过 92 个自然日（含首尾日期）。")
+
+    def query_product_mappings(
+        self,
+        *,
+        access_token: str,
+        store_sid: int,
+        local_skus: list[str],
+        start_date: date,
+        end_date: date,
+    ) -> list[SkuProductMapping]:
+        """Find local SKU -> MSKU/ASIN mappings using the documented API."""
+        if not isinstance(access_token, str) or not access_token.strip():
+            raise LingxingApiError("Access Token 为空，未发送产品表现查询。")
+        if isinstance(store_sid, bool) or not isinstance(store_sid, int):
+            raise LingxingApiError("产品表现查询必须使用动态店铺 SID。")
+        self._validate_query_range(start_date, end_date)
+        if not isinstance(local_skus, list) or not 1 <= len(local_skus) <= 50:
+            raise LingxingApiError("产品表现查询需要 1–50 个 local SKU。")
+        normalized_skus: list[str] = []
+        for sku in local_skus:
+            if not isinstance(sku, str) or not sku.strip():
+                raise LingxingApiError("产品表现查询包含空白或无效 SKU。")
+            value = sku.strip()
+            if value not in normalized_skus:
+                normalized_skus.append(value)
+        requested_skus = set(normalized_skus)
+
+        offset = 0
+        expected_total: int | None = None
+        seen_local_skus: set[str] = set()
+        mappings: dict[str, SkuProductMapping] = {}
+        while True:
+            body: dict[str, Any] = {
+                "offset": offset,
+                "length": PRODUCT_PERFORMANCE_PAGE_LENGTH,
+                "sort_field": "volume",
+                "sort_type": "desc",
+                "search_field": "local_sku",
+                "search_value": normalized_skus,
+                # SellerLists returns SID as integer; the Product Performance
+                # docs specify a string for a single store.
+                "sid": str(store_sid),
+                "start_date": start_date.isoformat(),
+                "end_date": end_date.isoformat(),
+                "summary_field": "sku",
+                "is_recently_enum": False,
+            }
+            payload = self._request_product_performance_page(
+                access_token=access_token.strip(),
+                body=body,
+            )
+            total, page_mappings = parse_product_performance_page(
+                payload,
+                store_sid=store_sid,
+                requested_skus=requested_skus,
+            )
+            raw_records = payload["data"]["list"]
+            if expected_total is None:
+                expected_total = total
+            elif total != expected_total:
+                raise LingxingApiError("产品表现分页期间 total 发生变化，已停止映射。")
+            if len(raw_records) > PRODUCT_PERFORMANCE_PAGE_LENGTH:
+                raise LingxingApiError("产品表现分页返回数量超过请求长度。")
+            if not raw_records and offset < total:
+                raise LingxingApiError("产品表现分页提前返回空页，数据可能不完整。")
+            for mapping in page_mappings:
+                if mapping.local_sku in seen_local_skus:
+                    raise LingxingApiError("产品表现分页包含重复 local SKU，已停止映射。")
+                seen_local_skus.add(mapping.local_sku)
+                mappings[mapping.local_sku] = mapping
+            if offset + len(raw_records) >= total or not raw_records:
+                break
+            offset += len(raw_records)
+        return [mappings[sku] for sku in normalized_skus if sku in mappings]
+
+    def _request_daily_page(
+        self,
+        *,
+        access_token: str,
+        body: dict[str, Any],
+    ) -> Any:
+        # The official page publishes a token-bucket capacity of 5 but no refill
+        # rate. Serialize calls, and fail on rate-limit responses without guessing
+        # a retry delay or automatically replaying requests.
+        with _ASIN_DAILY_REQUEST_LOCK:
+            return self._request_signed_post(
+                ASIN_DAILY_LISTS_PATH,
+                access_token=access_token,
+                body=body,
+            )
+
+    def query_daily_sales(
+        self,
+        *,
+        access_token: str,
+        store_sid: int,
+        mappings: list[SkuProductMapping],
+        start_date: date,
+        end_date: date,
+    ) -> list[SkuDailySales]:
+        """Query daily sales/units/orders by site date, then bind rows by MSKU."""
+        if not isinstance(access_token, str) or not access_token.strip():
+            raise LingxingApiError("Access Token 为空，未发送每日销量查询。")
+        if isinstance(store_sid, bool) or not isinstance(store_sid, int):
+            raise LingxingApiError("每日销量查询必须使用动态店铺 SID。")
+        self._validate_query_range(start_date, end_date)
+        if not mappings or any(not isinstance(item, SkuProductMapping) for item in mappings):
+            raise LingxingApiError("没有已验证的 SKU→MSKU 映射，未发送每日销量查询。")
+
+        msku_to_local: dict[str, str] = {}
+        seen_local_skus: set[str] = set()
+        for mapping in mappings:
+            if not isinstance(mapping.local_sku, str) or not mapping.local_sku.strip():
+                raise LingxingApiError("SKU→MSKU 映射包含无效 local SKU，已停止查询。")
+            if mapping.local_sku in seen_local_skus:
+                raise LingxingApiError("SKU→MSKU 映射包含重复 local SKU，已停止查询。")
+            seen_local_skus.add(mapping.local_sku)
+            if not mapping.seller_skus:
+                raise LingxingApiError(f"SKU {mapping.local_sku} 没有可用于查询的 MSKU。")
+            if any(not isinstance(value, str) or not value.strip() for value in mapping.seller_skus):
+                raise LingxingApiError("SKU→MSKU 映射包含无效 MSKU，已停止查询。")
+            if len(set(mapping.seller_skus)) != len(mapping.seller_skus):
+                raise LingxingApiError("SKU→MSKU 映射包含重复 MSKU，已停止查询。")
+            for seller_sku in mapping.seller_skus:
+                prior_sku = msku_to_local.get(seller_sku)
+                if prior_sku is not None and prior_sku != mapping.local_sku:
+                    raise LingxingApiError("同一店铺 MSKU 映射到多个 local SKU，已停止归属。")
+                msku_to_local[seller_sku] = mapping.local_sku
+
+        values: dict[tuple[date, str], dict[int, _DailyMetricRecord]] = {}
+        day_count = (end_date - start_date).days + 1
+        for day_offset in range(day_count):
+            day = start_date + timedelta(days=day_offset)
+            for metric_type in (1, 2, 3):
+                offset = 0
+                seen_seller_skus: set[str] = set()
+                while True:
+                    body = {
+                        "sid": store_sid,
+                        "event_date": day.isoformat(),
+                        "asin_type": 2,
+                        "type": metric_type,
+                        "offset": offset,
+                        "length": ASIN_DAILY_PAGE_LENGTH,
+                    }
+                    payload = self._request_daily_page(
+                        access_token=access_token.strip(),
+                        body=body,
+                    )
+                    page = parse_asin_daily_page(
+                        payload,
+                        store_sid=store_sid,
+                        event_date=day,
+                        metric_type=metric_type,
+                    )
+                    if len(page) > ASIN_DAILY_PAGE_LENGTH:
+                        raise LingxingApiError("每日销量统计分页返回数量超过请求长度。")
+                    for record in page:
+                        if record.seller_sku not in msku_to_local:
+                            continue
+                        if record.seller_sku in seen_seller_skus:
+                            raise LingxingApiError("每日销量统计分页包含重复 MSKU，已停止归属。")
+                        seen_seller_skus.add(record.seller_sku)
+                        key = (day, record.seller_sku)
+                        existing = values.setdefault(key, {})
+                        for other in existing.values():
+                            if (
+                                other.asin != record.asin
+                                or other.currency_code != record.currency_code
+                            ):
+                                raise LingxingApiError("同一 MSKU 的每日 ASIN/币种记录不一致，已停止归属。")
+                        existing[metric_type] = record
+                    if len(page) < ASIN_DAILY_PAGE_LENGTH:
+                        break
+                    offset += len(page)
+
+        result: list[SkuDailySales] = []
+        for day_offset in range(day_count):
+            day = start_date + timedelta(days=day_offset)
+            for mapping in mappings:
+                for seller_sku in mapping.seller_skus:
+                    metric_records = values.get((day, seller_sku), {})
+                    identity = next(iter(metric_records.values()), None)
+                    # Product Performance exposes ASIN and MSKU lists, but does
+                    # not define a one-to-one relationship between those lists.
+                    # Only an ASIN returned on this exact daily MSKU row is
+                    # safe to display here.
+                    asin = identity.asin if identity is not None else ""
+                    currency_code = identity.currency_code if identity is not None else ""
+                    units_value = metric_records.get(2)
+                    orders_value = metric_records.get(3)
+                    sales_value = metric_records.get(1)
+                    result.append(
+                        SkuDailySales(
+                            sid=store_sid,
+                            local_sku=mapping.local_sku,
+                            seller_sku=seller_sku,
+                            asin=asin,
+                            event_date=day,
+                            currency_code=currency_code,
+                            units_sold=(int(units_value.metric_value) if units_value is not None else None),
+                            order_count=(int(orders_value.metric_value) if orders_value is not None else None),
+                            sales_amount=(sales_value.metric_value if sales_value is not None else None),
+                        )
+                    )
+        return result
 
     def list_sellers(self, access_token: str) -> list[LingxingSeller]:
         """Call SellerLists and return records only after business/schema validation."""

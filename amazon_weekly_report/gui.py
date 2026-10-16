@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import queue
+import re
 import threading
 from datetime import date, datetime
 from pathlib import Path
@@ -27,7 +28,13 @@ from .mcp_client import (
     is_read_only_query_candidate,
     redact_sensitive,
 )
-from .providers.lingxing_api import LingxingApiError, LingxingOpenApiClient, LingxingSeller
+from .providers.lingxing_api import (
+    LingxingApiError,
+    LingxingOpenApiClient,
+    LingxingSeller,
+    SkuDailySales,
+    SkuProductMapping,
+)
 from .report_generation import ReportGenerationError, generate_reports
 
 
@@ -84,6 +91,8 @@ class WeeklyReportApp(tk.Tk):
         self.existing_var = tk.StringVar()
         self.skus_var = tk.StringVar()
         self.report_store_var = tk.StringVar()
+        self.query_start_date_var = tk.StringVar()
+        self.query_end_date_var = tk.StringVar()
         self.d01_mode = tk.StringVar(value="first_sale")
         self.launch_dates_var = tk.StringVar()
         self._path_row(parent, 0, "Excel 格式模板", self.template_var)
@@ -101,9 +110,48 @@ class WeeklyReportApp(tk.Tk):
         ttk.Label(parent, text="SKU（逗号分隔）", width=20).grid(row=7, column=0, sticky="w", pady=5)
         ttk.Entry(parent, textvariable=self.skus_var).grid(row=7, column=1, columnspan=2, sticky="ew", padx=6, pady=5)
 
+        query_box = ttk.LabelFrame(parent, text="领星 SKU 与每日销量预览（只读，不写入周报）", padding=8)
+        query_box.grid(row=8, column=0, columnspan=3, sticky="nsew", pady=6)
+        ttk.Label(query_box, text="查询开始日（站点时间）").grid(row=0, column=0, sticky="w", padx=4, pady=4)
+        ttk.Entry(query_box, textvariable=self.query_start_date_var, width=13).grid(row=0, column=1, sticky="w", padx=4, pady=4)
+        ttk.Label(query_box, text="查询结束日").grid(row=0, column=2, sticky="e", padx=4, pady=4)
+        ttk.Entry(query_box, textvariable=self.query_end_date_var, width=13).grid(row=0, column=3, sticky="w", padx=4, pady=4)
+        self.report_query_button = ttk.Button(query_box, text="查询并预览真实数据", command=self._query_report_sku_data)
+        self.report_query_button.grid(row=0, column=4, sticky="w", padx=6, pady=4)
+        self.report_mapping_status = tk.StringVar(value="商品映射尚未查询。")
+        ttk.Label(query_box, textvariable=self.report_mapping_status, wraplength=900).grid(
+            row=1, column=0, columnspan=5, sticky="w", padx=4, pady=(0, 5)
+        )
+        self.report_query_status = tk.StringVar(
+            value="日期按所选站点自然日查询，最多 92 天。空白表示接口未返回该指标，0 表示明确返回零。"
+        )
+        ttk.Label(query_box, textvariable=self.report_query_status, wraplength=900).grid(
+            row=2, column=0, columnspan=5, sticky="w", padx=4, pady=(0, 5)
+        )
+        preview_columns = ("event_date", "local_sku", "seller_sku", "asin", "units_sold", "order_count", "sales_amount", "currency_code")
+        self.report_sales_tree = ttk.Treeview(query_box, columns=preview_columns, show="headings", height=5)
+        for column, heading, width in (
+            ("event_date", "站点日期", 95),
+            ("local_sku", "本地 SKU", 120),
+            ("seller_sku", "MSKU", 130),
+            ("asin", "ASIN", 125),
+            ("units_sold", "销量", 65),
+            ("order_count", "订单量", 70),
+            ("sales_amount", "销售额", 100),
+            ("currency_code", "币种", 75),
+        ):
+            self.report_sales_tree.heading(column, text=heading)
+            self.report_sales_tree.column(column, width=width, anchor="w")
+        self.report_sales_tree.grid(row=3, column=0, columnspan=5, sticky="nsew", padx=4, pady=4)
+        sales_scrollbar = ttk.Scrollbar(query_box, orient="vertical", command=self.report_sales_tree.yview)
+        sales_scrollbar.grid(row=3, column=5, sticky="ns", pady=4)
+        self.report_sales_tree.configure(yscrollcommand=sales_scrollbar.set)
+        query_box.columnconfigure(4, weight=1)
+        query_box.rowconfigure(3, weight=1)
+
         mode_box = ttk.LabelFrame(parent, text="D01 规则", padding=8)
-        mode_box.grid(row=8, column=0, columnspan=3, sticky="ew", pady=8)
-        ttk.Radiobutton(mode_box, text="SKU 首个有销量日期", variable=self.d01_mode, value="first_sale").grid(row=0, column=0, sticky="w", padx=4)
+        mode_box.grid(row=9, column=0, columnspan=3, sticky="ew", pady=8)
+        ttk.Radiobutton(mode_box, text="SKU 首个有销量日期（需完整历史来源）", variable=self.d01_mode, value="first_sale").grid(row=0, column=0, sticky="w", padx=4)
         ttk.Radiobutton(mode_box, text="正式开售日期", variable=self.d01_mode, value="launch_date").grid(row=0, column=1, sticky="w", padx=4)
         ttk.Label(mode_box, text="选择正式开售日期时，每行填写 SKU=YYYY-MM-DD（不同 SKU 可用不同日期）").grid(row=1, column=0, columnspan=2, sticky="w", padx=4, pady=(5, 2))
         self.launch_dates_text = tk.Text(mode_box, height=3, wrap="none")
@@ -111,11 +159,11 @@ class WeeklyReportApp(tk.Tk):
         mode_box.columnconfigure(1, weight=1)
 
         self.progress = ttk.Progressbar(parent, mode="indeterminate")
-        self.progress.grid(row=9, column=0, columnspan=3, sticky="ew", pady=(10, 4))
+        self.progress.grid(row=10, column=0, columnspan=3, sticky="ew", pady=(10, 4))
         self.report_status = tk.StringVar(value="待处理。字段映射必须基于真实报表表头配置。")
-        ttk.Label(parent, textvariable=self.report_status, wraplength=880).grid(row=10, column=0, columnspan=3, sticky="w", pady=4)
+        ttk.Label(parent, textvariable=self.report_status, wraplength=880).grid(row=11, column=0, columnspan=3, sticky="w", pady=4)
         buttons = ttk.Frame(parent)
-        buttons.grid(row=11, column=0, columnspan=3, sticky="ew", pady=10)
+        buttons.grid(row=12, column=0, columnspan=3, sticky="ew", pady=10)
         self.generate_button = ttk.Button(buttons, text="开始生成周报", command=self._start_generation)
         self.generate_button.pack(side="left")
         ttk.Button(buttons, text="打开输出文件夹", command=self._open_output_folder).pack(side="left", padx=8)
@@ -124,7 +172,7 @@ class WeeklyReportApp(tk.Tk):
             text="程序不会自动推断导出字段；无法唯一匹配或缺少来源的数据留空，并写入校验日志。\n"
                  "新增周次按原模板七天一周延续。A2 推广阶段、G2 发货时间、M 列日目标销量由你手动维护。",
             justify="left",
-        ).grid(row=12, column=0, columnspan=3, sticky="w", pady=8)
+        ).grid(row=13, column=0, columnspan=3, sticky="w", pady=8)
 
     def _build_mcp_tab(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(1, weight=1)
@@ -183,12 +231,9 @@ class WeeklyReportApp(tk.Tk):
 
     def _build_openapi_tab(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(1, weight=1)
-        parent.rowconfigure(9, weight=1)
+        parent.rowconfigure(7, weight=1)
         self.openapi_app_id_var = tk.StringVar()
         self.openapi_app_secret_var = tk.StringVar()
-        self.openapi_sku_var = tk.StringVar()
-        self.openapi_start_var = tk.StringVar()
-        self.openapi_end_var = tk.StringVar()
 
         ttk.Label(parent, text="AppID", width=22).grid(row=0, column=0, sticky="w", pady=5)
         ttk.Entry(parent, textvariable=self.openapi_app_id_var).grid(row=0, column=1, columnspan=2, sticky="ew", padx=6, pady=5)
@@ -218,24 +263,16 @@ class WeeklyReportApp(tk.Tk):
             self.openapi_seller_tree.heading(column, text=heading)
             self.openapi_seller_tree.column(column, width=width, anchor="w")
         self.openapi_seller_tree.grid(row=4, column=0, columnspan=4, sticky="ew", pady=4)
-        ttk.Label(parent, text="SKU", width=22).grid(row=5, column=0, sticky="w", pady=5)
-        ttk.Entry(parent, textvariable=self.openapi_sku_var).grid(row=5, column=1, sticky="ew", padx=6, pady=5)
-        ttk.Label(parent, text="开始日期 (YYYY-MM-DD)").grid(row=5, column=2, sticky="e", padx=4)
-        ttk.Entry(parent, textvariable=self.openapi_start_var, width=14).grid(row=5, column=3, sticky="ew", padx=6, pady=5)
-        ttk.Label(parent, text="结束日期 (YYYY-MM-DD)").grid(row=6, column=2, sticky="e", padx=4)
-        ttk.Entry(parent, textvariable=self.openapi_end_var, width=14).grid(row=6, column=3, sticky="ew", padx=6, pady=5)
-        ttk.Button(parent, text="测试 SKU 数据", command=self._openapi_sku_query).grid(row=6, column=1, sticky="w", padx=6, pady=5)
-
         self.openapi_status = tk.StringVar(value="OpenAPI 地址固定为官方域名；密钥仅保存在 Windows Credential Manager。")
-        ttk.Label(parent, textvariable=self.openapi_status, wraplength=900).grid(row=7, column=0, columnspan=4, sticky="w", pady=6)
-        ttk.Label(parent, text="结果 / 说明（不显示 Token，不写入日志）").grid(row=8, column=0, columnspan=4, sticky="w", pady=(8, 2))
+        ttk.Label(parent, textvariable=self.openapi_status, wraplength=900).grid(row=5, column=0, columnspan=4, sticky="w", pady=6)
+        ttk.Label(parent, text="结果 / 说明（不显示 Token，不写入日志）").grid(row=6, column=0, columnspan=4, sticky="w", pady=(8, 2))
         self.openapi_output = tk.Text(parent, height=14, wrap="word", state="disabled")
-        self.openapi_output.grid(row=9, column=0, columnspan=4, sticky="nsew", pady=4)
+        self.openapi_output.grid(row=7, column=0, columnspan=4, sticky="nsew", pady=4)
         ttk.Label(
             parent,
-            text="已启用 Token 身份验证和只读店铺列表请求。列表需通过业务码及字段类型校验后才会更新；status、has_ads_setting 显示原值，SKU 查询尚未接入。",
+            text="已启用 Token 身份验证和只读店铺列表请求。SKU 与销量预览位于“生成周报”页；查询结果只显示，不写入工作簿。",
             wraplength=900,
-        ).grid(row=10, column=0, columnspan=4, sticky="w", pady=6)
+        ).grid(row=8, column=0, columnspan=4, sticky="w", pady=6)
 
     def _save_openapi_credentials(self) -> None:
         app_id = self.openapi_app_id_var.get().strip()
@@ -342,9 +379,155 @@ class WeeklyReportApp(tk.Tk):
 
         self._start_task(query_sellers, self.openapi_status, "店铺列表请求完成。")
 
-    def _openapi_sku_query(self) -> None:
-        self.openapi_status.set("未发送查询：销售接口路径、参数和字段尚待依据官方文档核验。")
-        self._show_openapi_result(self.openapi_status.get())
+    def _query_report_sku_data(self) -> None:
+        if self._busy:
+            return
+        seller = self._selected_report_seller()
+        if seller is None:
+            messagebox.showwarning("请选择店铺", "请先刷新并选择领星授权店铺。")
+            return
+
+        local_skus = [
+            value.strip()
+            for value in self.skus_var.get().replace("，", ",").split(",")
+            if value.strip()
+        ]
+        local_skus = list(dict.fromkeys(local_skus))
+        if not 1 <= len(local_skus) <= 50:
+            messagebox.showwarning("SKU 数量无效", "请输入 1–50 个不重复的本地 SKU，以逗号分隔。")
+            return
+
+        start_text = self.query_start_date_var.get().strip()
+        end_text = self.query_end_date_var.get().strip()
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", start_text) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", end_text):
+            messagebox.showwarning("日期格式错误", "请输入 YYYY-MM-DD 格式的站点日期。")
+            return
+        try:
+            start_date = date.fromisoformat(start_text)
+            end_date = date.fromisoformat(end_text)
+        except ValueError:
+            messagebox.showwarning("日期格式错误", "开始日和结束日必须是有效的 YYYY-MM-DD 日期。")
+            return
+        if end_date < start_date:
+            messagebox.showwarning("日期范围错误", "结束日期不能早于开始日期。")
+            return
+        if (end_date - start_date).days + 1 > 92:
+            messagebox.showwarning("日期范围过长", "产品表现接口的日期范围上限为 92 个自然日（含首尾）。")
+            return
+        try:
+            app_id, app_secret = self._openapi_credentials()
+        except CredentialStoreError as exc:
+            messagebox.showerror("OpenAPI 配置错误", str(exc))
+            return
+
+        for item_id in self.report_sales_tree.get_children():
+            self.report_sales_tree.delete(item_id)
+        self.report_mapping_status.set("正在查询所选店铺的 SKU 商品映射…")
+
+        def query() -> dict[str, Any]:
+            with LingxingOpenApiClient(app_id, app_secret) as client:
+                token_result = client.get_access_token()
+                mappings = client.query_product_mappings(
+                    access_token=token_result.token,
+                    store_sid=seller.sid,
+                    local_skus=local_skus,
+                    start_date=start_date,
+                    end_date=end_date,
+                )
+                mapping_by_sku = {mapping.local_sku: mapping for mapping in mappings}
+                daily_mappings = [mapping for mapping in mappings if mapping.seller_skus]
+                unresolved_skus = [
+                    sku for sku in local_skus
+                    if sku not in mapping_by_sku or not mapping_by_sku[sku].seller_skus
+                ]
+                rows = (
+                    client.query_daily_sales(
+                        access_token=token_result.token,
+                        store_sid=seller.sid,
+                        mappings=daily_mappings,
+                        start_date=start_date,
+                        end_date=end_date,
+                    )
+                    if daily_mappings
+                    else []
+                )
+            return {
+                "_daily_rows": rows,
+                "_mappings": mappings,
+                "_requested_skus": local_skus,
+                "_unresolved_skus": unresolved_skus,
+                "_start_date": start_date,
+                "_end_date": end_date,
+                "_store_name": seller.name,
+            }
+
+        self._start_task(query, self.report_query_status, "SKU 每日数据查询完成。")
+
+    def _apply_daily_sales_preview(self, result: dict[str, Any]) -> None:
+        mappings: list[SkuProductMapping] = result["_mappings"]
+        rows: list[SkuDailySales] = result["_daily_rows"]
+        requested_skus: list[str] = result["_requested_skus"]
+        unresolved_skus: list[str] = result["_unresolved_skus"]
+        start_date: date = result["_start_date"]
+        end_date: date = result["_end_date"]
+
+        summary_parts: list[str] = []
+        mapping_by_sku = {mapping.local_sku: mapping for mapping in mappings}
+        for sku in requested_skus:
+            mapping = mapping_by_sku.get(sku)
+            if mapping is None:
+                summary_parts.append(f"{sku}：未找到本店商品映射")
+                continue
+            msku_text = ", ".join(mapping.seller_skus) if mapping.seller_skus else "无已确认 MSKU"
+            asin_text = ", ".join(mapping.asins) if mapping.asins else "无 ASIN 候选"
+            summary_parts.append(f"{sku}：MSKU [{msku_text}]；本店 ASIN 候选 [{asin_text}]")
+        self.report_mapping_status.set(
+            "商品映射（ASIN 候选未假定与某个 MSKU 一一对应）：" + "；".join(summary_parts)
+            if summary_parts
+            else "产品表现接口没有返回所请求 SKU 的映射。"
+        )
+
+        for row in rows:
+            self.report_sales_tree.insert(
+                "",
+                "end",
+                values=(
+                    row.event_date.isoformat(),
+                    row.local_sku,
+                    row.seller_sku,
+                    row.asin,
+                    "" if row.units_sold is None else str(row.units_sold),
+                    "" if row.order_count is None else str(row.order_count),
+                    "" if row.sales_amount is None else format(row.sales_amount, "f"),
+                    row.currency_code,
+                ),
+            )
+
+        first_positive_day: dict[str, date] = {}
+        for row in rows:
+            if row.units_sold is not None and row.units_sold > 0:
+                prior = first_positive_day.get(row.local_sku)
+                if prior is None or row.event_date < prior:
+                    first_positive_day[row.local_sku] = row.event_date
+        first_positive_text = "；".join(
+            f"{sku}={first_positive_day[sku].isoformat()}"
+            for sku in requested_skus
+            if sku in first_positive_day
+        ) or "所选范围未发现明确正销量记录"
+        populated_metric_count = sum(
+            value is not None
+            for row in rows
+            for value in (row.sales_amount, row.units_sold, row.order_count)
+        )
+        status_parts = [
+            f"店铺 {result['_store_name']}：{start_date.isoformat()} 至 {end_date.isoformat()}（站点日期）",
+            f"预览列出 {len(rows)} 个 SKU×MSKU×日期位置，接口明确返回 {populated_metric_count} 项指标值",
+            f"范围内首个明确正销量日：{first_positive_text}。这不是已核验的历史首单日期。",
+            "本次结果仅供核对，不写入周报；无记录留空，明确零值显示为 0。",
+        ]
+        if unresolved_skus:
+            status_parts.append("未能唯一映射的 SKU：" + ", ".join(unresolved_skus))
+        self.report_query_status.set(" ".join(status_parts))
 
     def _show_openapi_result(self, content: str) -> None:
         self.openapi_output.configure(state="normal")
@@ -383,6 +566,7 @@ class WeeklyReportApp(tk.Tk):
             return
         self._busy = True
         self.generate_button.configure(state="disabled")
+        self.report_query_button.configure(state="disabled")
         self.progress.start(10)
         status_var.set("处理中…")
 
@@ -427,6 +611,8 @@ class WeeklyReportApp(tk.Tk):
                         if result.get("_sellers") is not None:
                             self._apply_sellers(result["_sellers"])
                         self._show_openapi_result(result.get("output", status_var.get()))
+                    elif status_var is self.report_query_status and isinstance(result, dict):
+                        self._apply_daily_sales_preview(result)
                     elif isinstance(result, dict):
                         status_var.set(result.get("message", title))
                         if result.get("output"):
@@ -442,6 +628,7 @@ class WeeklyReportApp(tk.Tk):
             self._busy = False
             self.progress.stop()
             self.generate_button.configure(state="normal")
+            self.report_query_button.configure(state="normal")
         self.after(150, self._poll_events)
 
     def _show_mcp_result(self, value: Any) -> None:

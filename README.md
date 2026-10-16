@@ -1,6 +1,6 @@
 # 亚马逊新品推广周报工具
 
-面向 Windows 10/11 的本地新品推广周报工具。V1.0 数据路线为：领星 OpenAPI 作为主数据接口、官方 MCP 作为辅助查询/交叉核验、领星 Excel/CSV 导入作为应急备用；三种来源最终进入统一标准数据层，再复用原周报模板生成器。当前离线 Excel/CSV 周报功能可用。用户已确认最新版在 Windows 真实验证并通过动态店铺列表验收；SKU 商品识别、每日销量查询和自动写入尚未接入。
+面向 Windows 10/11 的本地新品推广周报工具。V1.0 数据路线为：领星 OpenAPI 作为主数据接口、官方 MCP 作为辅助查询/交叉核验、领星 Excel/CSV 导入作为应急备用。离线 Excel/CSV 周报功能可用；Windows 动态店铺列表已由用户真实验收。当前版本新增 OpenAPI SKU→MSKU/ASIN 候选识别与每日销量预览，但尚未接入正式周报写入，也未完成 Windows 真实销量数据核验。
 
 V1.0 分阶段任务、模块输入/输出、依赖、测试和验收门槛见 [正式实施清单](docs/V1_IMPLEMENTATION_PLAN.md)。当前版本仅聚焦新品推广周报。
 
@@ -14,6 +14,10 @@ V1.0 分阶段任务、模块输入/输出、依赖、测试和验收门槛见 [
 - 校验日志为 JSONL，记录来源文件名、SKU 的 D01、最新数据覆盖日、销量/销售额/广告花费汇总和异常提示。关闭日期后的实际花费只有在来源提供并映射 `campaign_disabled_at` 时才提示。
 - Windows 本地 MCP 客户端支持 MCP 初始化连接、工具列表分页、工具目录发现，以及按业务 Schema 核验的只读 action 查询。请求带 `X-Mcp-Key`、MCP session 和协议版本；常规工具仍要求 `readOnlyHint=true`。
 - OpenAPI Token 请求使用 multipart/form-data；Access Token 仅在本机内存中按响应明确提供的有效期缓存，并在有效期临近时刷新。未返回可识别有效期的 Token 不缓存。
+- 周报页可使用当前动态选择的店铺 SID，按 local SKU 查询产品表现映射，再按站点自然日读取每日销售额、销量和订单量。查询结果只显示在预览表中，不写入 Excel 周报。
+- 每日 API 的无记录指标保持空白；仅显式返回的 `map_value: 0` 显示为零。销量和订单量是不同指标。商品表现返回的 ASIN 候选不会被假设为与 MSKU 一一对应；表格中的 ASIN 只取自相同每日 MSKU 记录。
+- 用户提供的每日销量统计字段说明没有定义取消订单、退款或销售额净额口径；Windows 对照领星后台时必须使用同一报表与日期条件核验这些口径，确认前预览数据不得接入正式周报。
+- 当前窗口内最早的明确正销量日仅是“范围内首个正销量日”，不等于完整历史首单日。产品创建时间也不是首单日期；领星尚需提供能确认完整历史覆盖的首单数据接口或说明。
 
 模板来自用户上传的《新品推广周报.xlsx》：第 5 行表头，D01–D60 在第 6–65 行，24 列，无公式。样例 SKU 为 ex3107；生成新 SKU 时会清空其样例数据。模板没有“日销售额”列，销售金额会写入校验日志，模板中的“售价”只写来源售价或根据销售额/销量计算的单价，不会把销售金额误填进售价列。原模板没有历史类目、排名、评分、评论数的日期字段，这些值会保持空白，避免把当前快照伪装成历史数据。
 
@@ -68,7 +72,7 @@ OpenAPI 使用固定官方域名 `https://openapi.lingxing.com`。Token 请求�
 
 已根据本次上传的领星 **Java** SDK 源码实现签名和只读店铺列表请求：`GET /erp/sc/data/seller/lists`。签名按 ASCII 参数名排序、使用 SDK 的字符串转换/去空格规则拼接 `key=value`、计算大写 MD5，再用 AppID 执行 AES/ECB/PKCS5Padding，密文使用标准 Base64，并按 Java `URLEncoder` 的 UTF-8 规则编码查询参数。Python SDK 并未包含在压缩包内；本项目只移植与签名相关的 SDK 行为，没有复制其会输出签名输入的日志代码。签名向量已用独立 OpenSSL 结果核对，但当前环境没有 Java 编译器，未执行官方 Java SDK。
 
-店铺列表仅在业务 `code` 为整数 `0`、`data` 为直接数组且信封和每条店铺记录类型有效时才视为成功。名称、SID、站点会动态显示在 GUI 的店铺列表和周报页下拉框中；下拉框选项在内存中关联接口返回的 SID，不硬编码店铺。`status` 和 `has_ads_setting` 只显示接口返回的原始整数，不推断其业务含义。用户已确认最新版通过 Windows 动态店铺列表真实验收；自动化测试仍只使用合成数据。SKU→ASIN/MSKU 映射、首单日期、每日销量/销售额的接口参数、分页和字段口径尚未实现；广告接口未接入。
+店铺列表仅在业务 `code` 为整数 `0`、`data` 为直接数组且信封和每条店铺记录类型有效时才视为成功。名称、SID、站点会动态显示在 GUI 的店铺列表和周报页下拉框中；下拉框选项在内存中关联接口返回的 SID，不硬编码店铺。`status` 和 `has_ads_setting` 只显示接口返回的原始整数，不推断其业务含义。用户已确认 Windows 动态店铺列表真实验收通过；自动化测试仍只使用合成数据。
 
 ### Windows 验收记录
 
@@ -76,17 +80,34 @@ OpenAPI 使用固定官方域名 `https://openapi.lingxing.com`。Token 请求�
 
 云端自动化测试使用 HTTP 模拟夹具，仅验证请求构造、Token 生命周期和错误脱敏；不代表真实 API 或业务数据验收。不要将 AppID、AppSecret、Access Token、完整签名 URL 或真实报表发到聊天或 GitHub。
 
-### SKU 识别与每日销量查询所需官方资料
+### SKU 识别与每日销量接口
 
-请从领星官方文档导出或复制以下页面的完整接口说明，包括请求参数表、分页规则、响应字段表和 JSON 示例：
+根据用户提供的领星官方 `AsinListNew` 与 `AsinDailyLists` 字段说明实现：
 
-- 产品表现（新版 / ASIN 列表）：[AsinListNew](https://apidoc.lingxing.com/new/api-docs/Statistics/AsinListNew/)，用于确认店铺下 SKU、MSKU、ASIN 的识别与筛选字段。
-- 亚马逊 ASIN 每日销量统计：[AsinDailyLists](https://apidoc.lingxing.com/new/api-docs/Statistics/AsinDailyLists/)，用于确认每日销量和销售额的查询参数、日期边界、时间口径、分页及数据字段定义。
-- 若以上页面不定义“历史首单日期”或可查询历史范围，请再提供领星官方首单/销量明细接口文档。不能直接把当前查询范围内最早记录当作真实首单日。
+- 产品表现：`POST /bd/productPerformance/openApi/asinList`。以 `search_field=local_sku` 搜索 1–50 个本地 SKU，`summary_field=sku`，单店铺 `sid` 按文档作为字符串发送，日期为 `YYYY-MM-DD` 双闭区间且最多 92 天。`offset`/`length` 分页，单页长度不超过 10000，按 `data.total` 完成分页。只有 `code=0`、`data.total` 与 `data.list` 结构有效才接受结果。
+- 映射字段：顶层 `sku` 匹配请求的 local SKU；`price_list.local_sku/seller_sku/sid` 提供此店铺的 MSKU；`asins.asin/sid` 提供此店铺的 ASIN 候选。文档示例中嵌套 SID 为数字字符串，解析时仅接受整数字符串或整数。ASIN 数组和 MSKU 数组没有定义一一关系，所以不自行配对。
+- 每日销量统计：`POST /erp/sc/data/sales_report/asinDailyLists`，以 `sid` 整数、`event_date` 站点日期、`asin_type=2`（MSKU）查询。`type=1/2/3` 分别读取销售额、销量、订单量；`offset` 从 0 开始，`length` 不超过 1000，逐页读到短页结束。只接受 `code=0` 和 `data` 直接数组，并核对返回 SID、站点日期和 MSKU。
+- 用户提供的两个页面没有完整历史首单日期字段/覆盖声明。`product_create_time` 表示商品创建时间，不是首单时间。因此界面只列出本次输入范围内最早的明确正销量日，不会据此填写 D01。
+- 用户提供的 `AsinDailyLists` 字段说明未定义取消/退款状态筛选或销售额净额算法；这些口径必须通过 Windows 与领星同店铺同日期的报表对照确认，完成前预览数字不能进入正式周报。
+- 两个接口均只读。查询金额使用 `Decimal`，请求和响应不写日志或工作簿；错误信息不包含 Token、签名或完整响应。Product Performance 的单店查询间隔按官方说明至少 1 秒。每日统计页面只给出令牌桶容量 5、未给出补充速率；客户端串行执行，收到 HTTP 429 时停止且不自动重发。若响应带整数 `Retry-After`，错误提示会显示建议等待秒数。
+- 合成 HTTP 测试覆盖 POST 签名、参数结构、SKU 映射、站点日期、显式零/缺失、分页及限流停止；这些测试不能证明领星真实业务请求成功。
 
-需要核验 HTTP method/path、参数名称和类型、分页方式及结束条件、业务成功码和 data 结构、SKU/MSKU/ASIN 归属字段、日销量与订单量的区别、销售额及退款/取消口径、日期时区和历史覆盖范围。请提供脱敏页面 PDF/HTML 或粘贴 Schema 与字段说明，删除真实 SID、Seller ID、商品/订单记录及凭证。
+云端网络策略没有放行 `apidoc.lingxing.com`；以上参数来自用户提供的官方页面内容，未尝试绕过网络限制，也未使用真实凭证或企业记录。
 
-当前云端网络策略没有放行 `apidoc.lingxing.com`，无法从这里读取官方页面；我没有绕过该策略或猜测接口参数。
+### Windows SKU/销量预览测试
+
+1. 在项目目录更新分支并启动：
+
+   ```powershell
+   git switch feature/weekly-report-v1
+   git pull --ff-only origin feature/weekly-report-v1
+   run_gui.bat
+   ```
+
+2. 确认原有 OpenAPI 凭证仍保存在 Windows Credential Manager；切到“生成周报”页，点击“刷新店铺列表”，选择要查询的店铺。
+3. 输入本地 SKU 和 `YYYY-MM-DD` 站点日期范围。首次实测建议先查 1 天，以便验证映射和三种每日统计；当前程序不会因 429 自动重放请求。
+4. 点击“查询并预览真实数据”，对照领星相同店铺/站点日期的原始报表，检查 local SKU、MSKU、ASIN、销量、订单量、销售额和币种。表格空白表示接口没有返回该指标；显式零值显示为 `0`。
+5. 只反馈“本地校验通过/失败、MCP/OpenAPI 调用是否成功、业务查询是否成功、是否返回数据及脱敏字段结构/是否与后台一致”。不要回传密钥、Token、完整响应、Seller ID 或订单/商品明细。查询结果只供预览，尚未写入正式周报。
 
 ## 配置 Excel/CSV 字段映射
 
@@ -154,4 +175,4 @@ CSV 支持 UTF-8、UTF-8 BOM 和 GB18030；XLSX/XLSM 支持明确指定工作表
 
 ## 验证范围与待实测项目
 
-`tests/` 使用明确标注的临时测试夹具验证 D61 扩行、手动字段保留、空白花费、关闭日期后花费告警和 MCP Streamable HTTP 协议；这些夹具只用于自动测试，不代表真实业务记录。ex3106 的真实销量、销售额和 8 月 5 日前后广告实际花费仍须由已授权 MCP 查询或领星原始导出确认。若官方 MCP 没有返回按日期、SKU 唯一归属的广告实际花费，不能用广告归因销售数据替代；应改用具备该粒度的领星 OpenAPI 或报表导出。
+`tests/` 使用合成夹具验证 D61 扩行、手动字段保留、广告费用规则、MCP 协议、OpenAPI 请求签名、商品映射和每日查询处理。用户仅已对动态店铺列表完成 Windows 真实验收；SKU/销量/销售额 API 仍待 Windows 对照领星后台，历史完整首单日期和广告实际花费接口也尚待官方资料与真实验证。云端模拟测试不代表真实数据验收。
