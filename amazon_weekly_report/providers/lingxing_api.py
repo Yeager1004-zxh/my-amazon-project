@@ -64,6 +64,66 @@ class SkuProductMapping:
 
 
 @dataclass(frozen=True)
+class ProductPerformanceMetrics:
+    """One local-SKU summary returned for an explicitly requested date interval.
+
+    The endpoint response has no per-row date. Callers must retain the request
+    interval and must not treat a multi-day value as a daily observation.
+    """
+
+    store_sid: int = field(repr=False)
+    local_sku: str = field(repr=False)
+    seller_skus: tuple[str, ...] = field(repr=False)
+    asins: tuple[str, ...] = field(repr=False)
+    start_date: date = field(repr=False)
+    end_date: date = field(repr=False)
+    currency_code: str | None = field(repr=False)
+    values: dict[str, Any] = field(repr=False)
+    present_fields: frozenset[str] = field(repr=False)
+
+
+PRODUCT_PERFORMANCE_PREVIEW_FIELDS: tuple[str, ...] = (
+    "sessions_total",
+    "ad_order_quantity",
+    "ad_sales_amount",
+    "impressions",
+    "clicks",
+    "ctr",
+    "ad_cvr",
+    "avg_star",
+    "reviews_count",
+    "small_cate_rank",
+    "cate_rank",
+    "prev_cate_rank",
+    "rank_category",
+    "ranking_update_time",
+    "spend",
+    "ads_sp_cost",
+    "shared_ads_sb_cost",
+    "shared_ads_sbv_cost",
+    "ads_sd_cost",
+    "shared_ads_al_cost",
+    "shared_ads_cc_cost",
+    "shared_ads_sspaot_cost",
+    "shared_ads_sar_cost",
+    "shared_cost_of_advertising",
+    "adv_rate",
+    "currency_code",
+)
+
+_PRODUCT_PERFORMANCE_INTEGER_FIELDS = frozenset({
+    "sessions_total", "ad_order_quantity", "impressions", "clicks", "reviews_count",
+    "cate_rank", "prev_cate_rank", "volume", "order_items",
+})
+_PRODUCT_PERFORMANCE_NUMBER_FIELDS = frozenset({
+    "ad_sales_amount", "ctr", "ad_cvr", "avg_star", "spend", "ads_sp_cost",
+    "shared_ads_sb_cost", "shared_ads_sbv_cost", "ads_sd_cost", "shared_ads_al_cost",
+    "shared_ads_cc_cost", "shared_ads_sspaot_cost", "shared_ads_sar_cost",
+    "shared_cost_of_advertising", "adv_rate", "amount", "acos",
+})
+
+
+@dataclass(frozen=True)
 class _DailyMetricRecord:
     sid: int = field(repr=False)
     event_date: date = field(repr=False)
@@ -508,6 +568,154 @@ def parse_product_performance_page(
             )
         )
     return total, mappings
+
+
+def _performance_number(value: Any, field_name: str, *, integer: bool = False) -> Decimal | int | None:
+    """Accept JSON numbers and numeric strings documented by SDK examples.
+
+    The published schema declares many Product Performance fields as numbers,
+    while its success example serializes them as strings. This parser accepts
+    only finite decimal representations and keeps absent/null values distinct
+    from explicit zero.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise LingxingApiError(f"产品表现响应字段 {field_name} 数值类型无效。")
+    if isinstance(value, str):
+        value = value.strip()
+        if not value or not re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)", value):
+            raise LingxingApiError(f"产品表现响应字段 {field_name} 数值格式无效。")
+    elif not isinstance(value, (int, float, Decimal)):
+        raise LingxingApiError(f"产品表现响应字段 {field_name} 数值类型无效。")
+    try:
+        parsed = Decimal(str(value))
+    except InvalidOperation as exc:
+        raise LingxingApiError(f"产品表现响应字段 {field_name} 数值无效。") from exc
+    if not parsed.is_finite():
+        raise LingxingApiError(f"产品表现响应字段 {field_name} 数值无效。")
+    if integer:
+        if parsed != parsed.to_integral_value():
+            raise LingxingApiError(f"产品表现响应字段 {field_name} 应为整数。")
+        return int(parsed)
+    return parsed
+
+
+def parse_product_performance_metrics_page(
+    payload: Any,
+    *,
+    store_sid: int,
+    requested_skus: set[str],
+    start_date: date,
+    end_date: date,
+) -> tuple[int, list[ProductPerformanceMetrics]]:
+    """Parse the official AsinListNew SKU summary without asserting daily scope."""
+    endpoint = "产品表现新版"
+    response = _business_code(payload, endpoint, message_field="msg")
+    if not isinstance(response.get("trace_id"), str):
+        raise LingxingApiError(f"{endpoint}响应字段 trace_id 类型无效。")
+    data = response.get("data")
+    if not isinstance(data, dict):
+        raise LingxingApiError(f"{endpoint}响应字段 data 必须是对象。")
+    total = data.get("total")
+    if isinstance(total, bool) or not isinstance(total, int) or total < 0:
+        raise LingxingApiError(f"{endpoint}响应字段 total 类型无效。")
+    records = data.get("list")
+    if not isinstance(records, list) or any(not isinstance(row, dict) for row in records):
+        raise LingxingApiError(f"{endpoint}响应字段 data.list 必须是对象数组。")
+
+    parsed_rows: list[ProductPerformanceMetrics] = []
+    seen_skus: set[str] = set()
+    for item in records:
+        local_sku = _required_text(item.get("sku"), "sku", endpoint)
+        if local_sku not in requested_skus:
+            raise LingxingApiError(f"{endpoint}返回了本次未请求的 local SKU；已停止归属。")
+        if local_sku in seen_skus:
+            raise LingxingApiError(f"{endpoint}在 SKU 汇总维度返回重复 SKU {local_sku}；已停止归属。")
+        seen_skus.add(local_sku)
+
+        raw_sids = item.get("sids")
+        if not isinstance(raw_sids, list) or not raw_sids:
+            raise LingxingApiError(f"{endpoint}响应字段 sids 必须是非空数组。")
+        row_sids = {_documented_sid(value, "sids") for value in raw_sids}
+        if row_sids != {store_sid}:
+            raise LingxingApiError(f"{endpoint} SKU 汇总行的店铺范围与所选 SID 不一致或不唯一。")
+
+        raw_price_list = item.get("price_list")
+        if not isinstance(raw_price_list, list):
+            raise LingxingApiError(f"{endpoint}响应字段 price_list 必须是数组。")
+        seller_skus: set[str] = set()
+        for price in raw_price_list:
+            if not isinstance(price, dict):
+                raise LingxingApiError(f"{endpoint}响应字段 price_list 必须包含对象。")
+            row_local_sku = _required_text(price.get("local_sku"), "price_list.local_sku", endpoint)
+            row_sid = _documented_sid(price.get("sid"), "price_list.sid")
+            if row_local_sku == local_sku and row_sid == store_sid:
+                seller_skus.add(_required_text(price.get("seller_sku"), "price_list.seller_sku", endpoint))
+        if not seller_skus:
+            raise LingxingApiError(f"{endpoint}没有可核验的本店 MSKU 与 local SKU 对应关系。")
+
+        raw_asins = item.get("asins")
+        if not isinstance(raw_asins, list):
+            raise LingxingApiError(f"{endpoint}响应字段 asins 必须是数组。")
+        asins: set[str] = set()
+        for asin_record in raw_asins:
+            if not isinstance(asin_record, dict):
+                raise LingxingApiError(f"{endpoint}响应字段 asins 必须包含对象。")
+            row_sid = _documented_sid(asin_record.get("sid"), "asins.sid")
+            if row_sid == store_sid:
+                asins.add(_required_text(asin_record.get("asin"), "asins.asin", endpoint))
+
+        currency_code = item.get("currency_code")
+        if currency_code is not None and not isinstance(currency_code, str):
+            raise LingxingApiError(f"{endpoint}响应字段 currency_code 类型无效。")
+
+        values: dict[str, Any] = {}
+        present_fields = frozenset(item)
+        for field_name in _PRODUCT_PERFORMANCE_INTEGER_FIELDS:
+            values[field_name] = _performance_number(
+                item.get(field_name), field_name, integer=True
+            )
+        for field_name in _PRODUCT_PERFORMANCE_NUMBER_FIELDS:
+            values[field_name] = _performance_number(item.get(field_name), field_name)
+        for field_name in ("rank_category", "ranking_update_time"):
+            value = item.get(field_name)
+            if value is not None and not isinstance(value, str):
+                raise LingxingApiError(f"{endpoint}响应字段 {field_name} 类型无效。")
+            values[field_name] = value
+
+        raw_ranks = item.get("small_cate_rank")
+        if raw_ranks is None:
+            values["small_cate_rank"] = None
+        elif not isinstance(raw_ranks, list):
+            raise LingxingApiError(f"{endpoint}响应字段 small_cate_rank 应为数组或 null。")
+        else:
+            ranks: list[dict[str, Any]] = []
+            for rank_row in raw_ranks:
+                if not isinstance(rank_row, dict):
+                    raise LingxingApiError(f"{endpoint}响应字段 small_cate_rank 必须包含对象。")
+                category = rank_row.get("category")
+                if category is not None and not isinstance(category, str):
+                    raise LingxingApiError(f"{endpoint}响应字段 small_cate_rank.category 类型无效。")
+                ranks.append({
+                    "category": category,
+                    "rank": _performance_number(rank_row.get("rank"), "small_cate_rank.rank", integer=True),
+                    "prev_rank": _performance_number(rank_row.get("prev_rank"), "small_cate_rank.prev_rank", integer=True),
+                })
+            values["small_cate_rank"] = tuple(ranks)
+        values["currency_code"] = currency_code
+        parsed_rows.append(ProductPerformanceMetrics(
+            store_sid=store_sid,
+            local_sku=local_sku,
+            seller_skus=tuple(sorted(seller_skus)),
+            asins=tuple(sorted(asins)),
+            start_date=start_date,
+            end_date=end_date,
+            currency_code=currency_code,
+            values=values,
+            present_fields=present_fields,
+        ))
+    return total, parsed_rows
 
 
 def parse_asin_daily_page(
@@ -983,6 +1191,90 @@ class LingxingOpenApiClient:
             raise LingxingApiError("结束日期不能早于开始日期。")
         if (end_date - start_date).days + 1 > MAX_PRODUCT_QUERY_DAYS:
             raise LingxingApiError("本次查询范围不能超过 92 个自然日（含首尾日期）。")
+
+    def query_product_performance_single_day(
+        self,
+        *,
+        access_token: str,
+        store_sid: int,
+        local_skus: list[str],
+        event_date: date,
+    ) -> list[ProductPerformanceMetrics]:
+        """Read SKU-summary metrics for one site date; never writes report data.
+
+        This deliberately accepts a single date only. The endpoint returns no
+        row-level date, so a multi-day aggregate must not be mistaken for daily
+        values. Historical rating and ranking scope still requires external
+        verification even for a one-day request.
+        """
+        if not isinstance(access_token, str) or not access_token.strip():
+            raise LingxingApiError("Access Token 为空，未发送产品表现指标查询。")
+        if isinstance(store_sid, bool) or not isinstance(store_sid, int) or store_sid <= 0:
+            raise LingxingApiError("产品表现指标查询必须使用动态店铺 SID。")
+        if type(event_date) is not date:
+            raise LingxingApiError("产品表现指标查询日期必须是有效的站点日期。")
+        if not isinstance(local_skus, list) or not 1 <= len(local_skus) <= 50:
+            raise LingxingApiError("产品表现指标查询需要 1–50 个 local SKU。")
+        normalized_skus: list[str] = []
+        for sku in local_skus:
+            if not isinstance(sku, str) or not sku.strip():
+                raise LingxingApiError("产品表现指标查询包含空白或无效 SKU。")
+            value = sku.strip()
+            if value not in normalized_skus:
+                normalized_skus.append(value)
+        requested_skus = set(normalized_skus)
+
+        offset = 0
+        expected_total: int | None = None
+        seen_skus: set[str] = set()
+        rows_by_sku: dict[str, ProductPerformanceMetrics] = {}
+        while True:
+            body: dict[str, Any] = {
+                "offset": offset,
+                "length": PRODUCT_PERFORMANCE_PAGE_LENGTH,
+                "sort_field": "volume",
+                "sort_type": "desc",
+                "search_field": "local_sku",
+                "search_value": normalized_skus,
+                # Official docs specify a string SID for a single-store query.
+                "sid": str(store_sid),
+                "start_date": event_date.isoformat(),
+                "end_date": event_date.isoformat(),
+                "summary_field": "sku",
+                "is_recently_enum": False,
+                # Explicitly retain the documented default refund-date rule.
+                "purchase_status": 0,
+            }
+            payload = self._request_product_performance_page(
+                access_token=access_token.strip(),
+                body=body,
+            )
+            total, page_rows = parse_product_performance_metrics_page(
+                payload,
+                store_sid=store_sid,
+                requested_skus=requested_skus,
+                start_date=event_date,
+                end_date=event_date,
+            )
+            raw_records = payload["data"]["list"]
+            if expected_total is None:
+                expected_total = total
+            elif total != expected_total:
+                raise LingxingApiError("产品表现指标分页期间 total 发生变化，已停止查询。")
+            if len(raw_records) > PRODUCT_PERFORMANCE_PAGE_LENGTH or offset + len(raw_records) > total:
+                raise LingxingApiError("产品表现指标分页返回数量无效。")
+            if not raw_records and offset < total:
+                raise LingxingApiError("产品表现指标分页提前返回空页，数据可能不完整。")
+            for row in page_rows:
+                if row.local_sku in seen_skus:
+                    raise LingxingApiError("产品表现指标分页返回重复 local SKU；已停止归属。")
+                seen_skus.add(row.local_sku)
+                rows_by_sku[row.local_sku] = row
+            if offset + len(raw_records) >= total:
+                break
+            offset += len(raw_records)
+
+        return [rows_by_sku[sku] for sku in normalized_skus if sku in rows_by_sku]
 
     def query_product_mappings(
         self,

@@ -53,6 +53,7 @@ from amazon_weekly_report.providers.lingxing_api import (
     LingxingApiNotReady,
     LingxingOpenApiClient,
     AdProductCatalogRecord,
+    ProductPerformanceMetrics,
     SbAdGroupSpend,
     SpAdSpendWindow,
     SpCampaignSpend,
@@ -63,6 +64,7 @@ from amazon_weekly_report.providers.lingxing_api import (
     SkuProductMapping,
     parse_asin_daily_page,
     parse_product_performance_page,
+    parse_product_performance_metrics_page,
     parse_sb_ad_group_report_page,
     parse_sb_campaign_report_page,
     parse_sb_product_ads_page,
@@ -85,7 +87,7 @@ from amazon_weekly_report.report_generation import ReportGenerationError, genera
 from amazon_weekly_report.template_expansion import ensure_day_rows
 from amazon_weekly_report.template_inspection import inspect_template
 from amazon_weekly_report.timeline import build_timeline
-from amazon_weekly_report.gui import WeeklyReportApp
+from amazon_weekly_report.gui import WeeklyReportApp, _product_performance_value
 
 
 HEADERS = [
@@ -1985,6 +1987,169 @@ class LingxingOpenApiTests(unittest.TestCase):
             "data": {"total": len(records) if total is None else total, "list": records},
         }
 
+    @classmethod
+    def _product_metrics_record(
+        cls,
+        local_sku: str = "local-test-a",
+        *,
+        sid: int | str = 987654,
+    ) -> dict[str, object]:
+        record = cls._product_record(local_sku)
+        record.update({
+            "sids": [sid],
+            "currency_code": "USD",
+            "sessions_total": 5,
+            "ad_order_quantity": 2,
+            "ad_sales_amount": "18.75",
+            "impressions": 250,
+            "clicks": 10,
+            "ctr": "0.04",
+            "ad_cvr": "0.2",
+            "avg_star": "4.3",
+            "reviews_count": 7,
+            "small_cate_rank": [{"category": "Synthetic Category", "rank": 42, "prev_rank": 45}],
+            "cate_rank": 120,
+            "prev_cate_rank": 130,
+            "rank_category": "Synthetic Category",
+            "ranking_update_time": None,
+            "spend": "12.34",
+            "ads_sp_cost": "2.00",
+            "shared_ads_sb_cost": "3.47",
+            "shared_ads_sbv_cost": "1.00",
+            "ads_sd_cost": "5.87",
+            "shared_ads_al_cost": "0.00",
+            "shared_ads_cc_cost": "0.00",
+            "shared_ads_sspaot_cost": "0.00",
+            "shared_ads_sar_cost": "0.00",
+            "shared_cost_of_advertising": None,
+            "adv_rate": "0.25",
+        })
+        return record
+
+    def test_product_performance_parser_preserves_metrics_and_missing_zero_distinction(self) -> None:
+        day = date(2026, 8, 29)
+        record = self._product_metrics_record()
+        # Synthetic fixture values only; no live account data is used here.
+        record["shared_ads_sb_cost"] = "0.00"
+        record["shared_ads_sbv_cost"] = None
+        del record["ads_sd_cost"]
+        total, rows = parse_product_performance_metrics_page(
+            self._product_response([record]),
+            store_sid=987654,
+            requested_skus={"local-test-a"},
+            start_date=day,
+            end_date=day,
+        )
+        self.assertEqual(total, 1)
+        row = rows[0]
+        self.assertIsInstance(row, ProductPerformanceMetrics)
+        self.assertEqual(row.seller_skus, ("market-test-1",))
+        self.assertEqual(row.asins, ("ASINTEST0001",))
+        self.assertEqual((row.start_date, row.end_date), (day, day))
+        self.assertEqual(row.currency_code, "USD")
+        self.assertEqual(row.values["shared_ads_sb_cost"], Decimal("0.00"))
+        self.assertIn("shared_ads_sb_cost", row.present_fields)
+        self.assertIsNone(row.values["shared_ads_sbv_cost"])
+        self.assertIn("shared_ads_sbv_cost", row.present_fields)
+        self.assertIsNone(row.values["ads_sd_cost"])
+        self.assertNotIn("ads_sd_cost", row.present_fields)
+        self.assertEqual(row.values["ad_sales_amount"], Decimal("18.75"))
+        self.assertEqual(row.values["small_cate_rank"][0], {
+            "category": "Synthetic Category", "rank": 42, "prev_rank": 45,
+        })
+
+    def test_product_performance_parser_accepts_documented_null_rank_and_rejects_scope_errors(self) -> None:
+        day = date(2026, 8, 29)
+        record = self._product_metrics_record()
+        record["small_cate_rank"] = None
+        _, rows = parse_product_performance_metrics_page(
+            self._product_response([record]),
+            store_sid=987654,
+            requested_skus={"local-test-a"},
+            start_date=day,
+            end_date=day,
+        )
+        self.assertIsNone(rows[0].values["small_cate_rank"])
+
+        for changes, message in (
+            ({"sids": [987654, 123456]}, "店铺范围"),
+            ({"sku": "other-sku"}, "未请求的 local SKU"),
+            ({"spend": "not-a-number"}, "数值格式无效"),
+            ({"small_cate_rank": {"rank": 3}}, "small_cate_rank 应为数组或 null"),
+        ):
+            bad_record = {**self._product_metrics_record(), **changes}
+            with self.subTest(message=message), self.assertRaisesRegex(LingxingApiError, message):
+                parse_product_performance_metrics_page(
+                    self._product_response([bad_record]),
+                    store_sid=987654,
+                    requested_skus={"local-test-a"},
+                    start_date=day,
+                    end_date=day,
+                )
+
+        with self.assertRaisesRegex(LingxingApiError, "业务 code 7"):
+            parse_product_performance_metrics_page(
+                {**self._product_response([]), "code": 7},
+                store_sid=987654,
+                requested_skus={"local-test-a"},
+                start_date=day,
+                end_date=day,
+            )
+
+    def test_product_performance_single_day_query_uses_local_sku_sku_summary_and_paginates(self) -> None:
+        app_id = "synthetic-app-id"
+        token = "synthetic-token"
+        day = date(2026, 8, 29)
+        sku_names = ["local-test-a", "local-test-b"]
+        requests: list[tuple[httpx.Request, dict[str, object]]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content.decode("utf-8"))
+            requests.append((request, body))
+            offset = body["offset"]
+            record = self._product_metrics_record(sku_names[offset]) if offset < len(sku_names) else None
+            records = [record] if record else []
+            return httpx.Response(200, json=self._product_response(records, total=len(sku_names)))
+
+        http = httpx.Client(transport=httpx.MockTransport(handler))
+        with patch("amazon_weekly_report.providers.lingxing_api.PRODUCT_PERFORMANCE_PAGE_LENGTH", 1), \
+                patch("amazon_weekly_report.providers.lingxing_api._PRODUCT_PERFORMANCE_LAST_RESPONSE_AT", None), \
+                patch("amazon_weekly_report.providers.lingxing_api.time.time", return_value=1639734344), \
+                patch("amazon_weekly_report.providers.lingxing_api.time.monotonic", return_value=100.0), \
+                patch("amazon_weekly_report.providers.lingxing_api.time.sleep"):
+            with LingxingOpenApiClient(app_id, "synthetic-secret", http_client=http) as client:
+                rows = client.query_product_performance_single_day(
+                    access_token=token,
+                    store_sid=987654,
+                    local_skus=sku_names,
+                    event_date=day,
+                )
+        http.close()
+
+        self.assertEqual([row.local_sku for row in rows], sku_names)
+        self.assertEqual([body["offset"] for _, body in requests], [0, 1])
+        self.assertEqual(len(requests), 2)
+        for request, body in requests:
+            self.assertEqual(request.method, "POST")
+            self.assertEqual(request.url.path, "/bd/productPerformance/openApi/asinList")
+            self.assertEqual(body["search_field"], "local_sku")
+            self.assertEqual(body["search_value"], sku_names)
+            self.assertEqual(body["summary_field"], "sku")
+            self.assertEqual(body["sid"], "987654")
+            self.assertEqual(body["start_date"], day.isoformat())
+            self.assertEqual(body["end_date"], day.isoformat())
+            self.assertEqual(body["purchase_status"], 0)
+            self.assertIs(body["is_recently_enum"], False)
+            self.assertNotIn("currency_code", body)
+            query = parse_qs(request.url.query.decode("ascii"))
+            self.assertEqual(query["access_token"], [token])
+            self.assertEqual(query["timestamp"], ["1639734344"])
+            self.assertEqual(query["sign"], [signed_post_query_parameters({
+                "access_token": token,
+                "app_key": app_id,
+                "timestamp": 1639734344,
+            }, body, app_id)["sign"]])
+
     @staticmethod
     def _daily_record(
         day: str,
@@ -2584,6 +2749,22 @@ class OpenApiPreviewTests(unittest.TestCase):
         self.assertIn("ASIN 候选未假定与某个 MSKU 一一对应", app.report_mapping_status.value)
         self.assertIn("所选范围未发现明确正销量记录", app.report_query_status.value)
         self.assertIn("不是已核验的历史首单日期", app.report_query_status.value)
+
+    def test_product_performance_preview_distinguishes_zero_null_and_absent_fields(self) -> None:
+        row = ProductPerformanceMetrics(
+            store_sid=987654,
+            local_sku="local-test-a",
+            seller_skus=("market-test-1",),
+            asins=("ASINTEST0001",),
+            start_date=date(2026, 8, 29),
+            end_date=date(2026, 8, 29),
+            currency_code="USD",
+            values={"shared_ads_sb_cost": Decimal("0"), "shared_ads_sbv_cost": None},
+            present_fields=frozenset({"shared_ads_sb_cost", "shared_ads_sbv_cost"}),
+        )
+        self.assertEqual(_product_performance_value(row, "shared_ads_sb_cost"), "0")
+        self.assertIn("null", _product_performance_value(row, "shared_ads_sbv_cost"))
+        self.assertEqual(_product_performance_value(row, "ads_sd_cost"), "字段未返回")
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ import queue
 import re
 import threading
 from datetime import date, datetime
+from decimal import Decimal
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 import tkinter as tk
@@ -34,11 +35,68 @@ from .providers.lingxing_api import (
     LingxingApiError,
     LingxingOpenApiClient,
     LingxingSeller,
+    PRODUCT_PERFORMANCE_PREVIEW_FIELDS,
+    ProductPerformanceMetrics,
     SkuDailySales,
     SkuDailySalesWindow,
     SkuProductMapping,
 )
 from .report_generation import ReportGenerationError, generate_reports, read_existing_d01_dates
+
+
+_PRODUCT_PERFORMANCE_FIELD_LABELS = {
+    "sessions_total": "Sessions-Total",
+    "ad_order_quantity": "广告订单量",
+    "ad_sales_amount": "广告销售额",
+    "impressions": "曝光量",
+    "clicks": "点击量",
+    "ctr": "CTR",
+    "ad_cvr": "广告 CVR",
+    "avg_star": "当前评分字段 avg_star",
+    "reviews_count": "当前评论数字段 reviews_count",
+    "small_cate_rank": "小类排名结构",
+    "cate_rank": "大类排名",
+    "prev_cate_rank": "上一次大类排名",
+    "rank_category": "排名类别",
+    "ranking_update_time": "排名更新时间（文档标记已废弃）",
+    "spend": "广告花费总计 spend",
+    "ads_sp_cost": "SP 花费",
+    "shared_ads_sb_cost": "SB 花费 shared_ads_sb_cost",
+    "shared_ads_sbv_cost": "SBV 花费 shared_ads_sbv_cost",
+    "ads_sd_cost": "SD 花费",
+    "shared_ads_al_cost": "其他广告花费 shared_ads_al_cost",
+    "shared_ads_cc_cost": "其他广告花费 shared_ads_cc_cost",
+    "shared_ads_sspaot_cost": "其他广告花费 shared_ads_sspaot_cost",
+    "shared_ads_sar_cost": "其他广告花费 shared_ads_sar_cost",
+    "shared_cost_of_advertising": "差异分摊字段",
+    "adv_rate": "广告订单量占比",
+    "currency_code": "币种",
+}
+
+
+def _product_performance_value(row: ProductPerformanceMetrics, field_name: str) -> str:
+    if field_name not in row.present_fields:
+        return "字段未返回"
+    value = row.values.get(field_name)
+    if value is None:
+        return "null（接口返回空值）"
+    if isinstance(value, Decimal):
+        return format(value, "f")
+    if isinstance(value, tuple):
+        return json.dumps(value, ensure_ascii=False, default=str)
+    return str(value)
+
+
+def _product_performance_scope_note(field_name: str) -> str:
+    if field_name in {"avg_star", "reviews_count", "small_cate_rank", "cate_rank", "prev_cate_rank", "rank_category", "ranking_update_time"}:
+        return "历史时点未由 Schema 证明；禁止回填历史日期"
+    if field_name in {
+        "spend", "ads_sp_cost", "shared_ads_sb_cost", "shared_ads_sbv_cost", "ads_sd_cost",
+        "shared_ads_al_cost", "shared_ads_cc_cost", "shared_ads_sspaot_cost", "shared_ads_sar_cost",
+        "shared_cost_of_advertising",
+    }:
+        return "SKU 汇总候选；须核对币种、日期和广告明细后才可入周报"
+    return "仅限请求的单日筛选；响应行无日期，须与后台单日数据核对"
 
 
 class WeeklyReportApp(tk.Tk):
@@ -136,6 +194,12 @@ class WeeklyReportApp(tk.Tk):
         ttk.Entry(query_box, textvariable=self.query_end_date_var, width=13).grid(row=0, column=3, sticky="w", padx=4, pady=4)
         self.report_query_button = ttk.Button(query_box, text="查询并预览真实数据", command=self._query_report_sku_data)
         self.report_query_button.grid(row=0, column=4, sticky="w", padx=6, pady=4)
+        self.product_performance_query_button = ttk.Button(
+            query_box,
+            text="AsinListNew\n单日只读查询",
+            command=self._query_product_performance_preview,
+        )
+        self.product_performance_query_button.grid(row=0, column=5, sticky="w", padx=6, pady=4)
         self.report_mapping_status = tk.StringVar(value="商品映射尚未查询。")
         ttk.Label(query_box, textvariable=self.report_mapping_status, wraplength=900).grid(
             row=1, column=0, columnspan=5, sticky="w", padx=4, pady=(0, 5)
@@ -164,6 +228,41 @@ class WeeklyReportApp(tk.Tk):
         sales_scrollbar = ttk.Scrollbar(query_box, orient="vertical", command=self.report_sales_tree.yview)
         sales_scrollbar.grid(row=3, column=5, sticky="ns", pady=4)
         self.report_sales_tree.configure(yscrollcommand=sales_scrollbar.set)
+
+        performance_box = ttk.LabelFrame(
+            query_box,
+            text="AsinListNew 产品表现（单日只读预览；不写入 Excel 或日志）",
+            padding=6,
+        )
+        performance_box.grid(row=4, column=0, columnspan=6, sticky="nsew", padx=4, pady=(7, 3))
+        self.product_performance_status = tk.StringVar(
+            value="请将开始日和结束日设为同一天，再点击“AsinListNew 单日只读查询”。"
+        )
+        ttk.Label(performance_box, textvariable=self.product_performance_status, wraplength=950).grid(
+            row=0, column=0, columnspan=4, sticky="w", padx=4, pady=(0, 4)
+        )
+        performance_columns = ("local_sku", "field", "value", "currency", "scope")
+        self.product_performance_tree = ttk.Treeview(
+            performance_box, columns=performance_columns, show="headings", height=8
+        )
+        for column, heading, width in (
+            ("local_sku", "本地 SKU", 130),
+            ("field", "API 字段", 190),
+            ("value", "接口返回值（空白 / null / 0 分开显示）", 220),
+            ("currency", "币种", 75),
+            ("scope", "口径核验状态", 430),
+        ):
+            self.product_performance_tree.heading(column, text=heading)
+            self.product_performance_tree.column(column, width=width, anchor="w")
+        self.product_performance_tree.grid(row=1, column=0, columnspan=4, sticky="nsew", padx=4, pady=3)
+        performance_scrollbar = ttk.Scrollbar(
+            performance_box, orient="vertical", command=self.product_performance_tree.yview
+        )
+        performance_scrollbar.grid(row=1, column=4, sticky="ns", pady=3)
+        self.product_performance_tree.configure(yscrollcommand=performance_scrollbar.set)
+        performance_box.columnconfigure(3, weight=1)
+        performance_box.rowconfigure(1, weight=1)
+
         query_box.columnconfigure(4, weight=1)
         query_box.rowconfigure(3, weight=1)
         self.report_ad_query_button = ttk.Button(
@@ -171,18 +270,18 @@ class WeeklyReportApp(tk.Tk):
             text="查询 SP / SB / SD 广告费用并预览",
             command=self._query_report_ad_data,
         )
-        self.report_ad_query_button.grid(row=4, column=0, sticky="w", padx=4, pady=(8, 3))
+        self.report_ad_query_button.grid(row=5, column=0, sticky="w", padx=4, pady=(8, 3))
         ttk.Label(query_box, text="广告费用汇总与明细（只读预览，不写入周报）").grid(
-            row=4, column=1, columnspan=4, sticky="w", padx=4, pady=(8, 3)
+            row=5, column=1, columnspan=4, sticky="w", padx=4, pady=(8, 3)
         )
         self.report_ad_status = tk.StringVar(
             value="按广告商品 MSKU/ASIN 自动匹配；SB 商品目录/分摊接口及日期币种口径仍待核验。"
         )
         ttk.Label(query_box, textvariable=self.report_ad_status, wraplength=900).grid(
-            row=5, column=0, columnspan=5, sticky="w", padx=4, pady=(0, 3)
+            row=6, column=0, columnspan=5, sticky="w", padx=4, pady=(0, 3)
         )
         ttk.Label(query_box, text="按日期及 SKU 汇总；“未归属（店铺级）”行分别显示无法归属金额，各广告类型不会互相加总。", wraplength=900).grid(
-            row=6, column=0, columnspan=5, sticky="w", padx=4, pady=(2, 2)
+            row=7, column=0, columnspan=5, sticky="w", padx=4, pady=(2, 2)
         )
         ad_summary_columns = (
             "report_date", "local_sku", "sp_cost", "sb_cost", "sd_cost",
@@ -203,16 +302,16 @@ class WeeklyReportApp(tk.Tk):
         ):
             self.report_ad_summary_tree.heading(column, text=heading)
             self.report_ad_summary_tree.column(column, width=width, anchor="w")
-        self.report_ad_summary_tree.grid(row=7, column=0, columnspan=5, sticky="nsew", padx=4, pady=4)
+        self.report_ad_summary_tree.grid(row=8, column=0, columnspan=5, sticky="nsew", padx=4, pady=4)
         ad_summary_scrollbar = ttk.Scrollbar(query_box, orient="vertical", command=self.report_ad_summary_tree.yview)
-        ad_summary_scrollbar.grid(row=7, column=5, sticky="ns", pady=4)
+        ad_summary_scrollbar.grid(row=8, column=5, sticky="ns", pady=4)
         ad_summary_xscrollbar = ttk.Scrollbar(query_box, orient="horizontal", command=self.report_ad_summary_tree.xview)
-        ad_summary_xscrollbar.grid(row=8, column=0, columnspan=5, sticky="ew", padx=4)
+        ad_summary_xscrollbar.grid(row=9, column=0, columnspan=5, sticky="ew", padx=4)
         self.report_ad_summary_tree.configure(
             yscrollcommand=ad_summary_scrollbar.set, xscrollcommand=ad_summary_xscrollbar.set
         )
         ttk.Label(query_box, text="原始活动与商品 / 广告组行；活动行只用于核对，不与明细重复累计。", wraplength=900).grid(
-            row=9, column=0, columnspan=5, sticky="w", padx=4, pady=(5, 2)
+            row=10, column=0, columnspan=5, sticky="w", padx=4, pady=(5, 2)
         )
         ad_detail_columns = (
             "report_date", "ad_type", "report_level", "local_sku", "report_sku", "asin", "ad_id",
@@ -237,16 +336,16 @@ class WeeklyReportApp(tk.Tk):
         ):
             self.report_ad_detail_tree.heading(column, text=heading)
             self.report_ad_detail_tree.column(column, width=width, anchor="w")
-        self.report_ad_detail_tree.grid(row=10, column=0, columnspan=5, sticky="nsew", padx=4, pady=4)
+        self.report_ad_detail_tree.grid(row=11, column=0, columnspan=5, sticky="nsew", padx=4, pady=4)
         ad_detail_scrollbar = ttk.Scrollbar(query_box, orient="vertical", command=self.report_ad_detail_tree.yview)
-        ad_detail_scrollbar.grid(row=10, column=5, sticky="ns", pady=4)
+        ad_detail_scrollbar.grid(row=11, column=5, sticky="ns", pady=4)
         ad_detail_xscrollbar = ttk.Scrollbar(query_box, orient="horizontal", command=self.report_ad_detail_tree.xview)
-        ad_detail_xscrollbar.grid(row=11, column=0, columnspan=5, sticky="ew", padx=4)
+        ad_detail_xscrollbar.grid(row=12, column=0, columnspan=5, sticky="ew", padx=4)
         self.report_ad_detail_tree.configure(
             yscrollcommand=ad_detail_scrollbar.set, xscrollcommand=ad_detail_xscrollbar.set
         )
-        query_box.rowconfigure(7, weight=1)
-        query_box.rowconfigure(10, weight=1)
+        query_box.rowconfigure(8, weight=1)
+        query_box.rowconfigure(11, weight=1)
 
         mode_box = ttk.LabelFrame(parent, text="D01 起算日期（手动确认）", padding=8)
         mode_box.grid(row=9, column=0, columnspan=3, sticky="ew", pady=8)
@@ -494,6 +593,100 @@ class WeeklyReportApp(tk.Tk):
             }
 
         self._start_task(query_sellers, self.openapi_status, "店铺列表请求完成。")
+
+    def _query_product_performance_preview(self) -> None:
+        if self._busy:
+            return
+        seller = self._selected_report_seller()
+        if seller is None:
+            messagebox.showwarning("请选择店铺", "请先刷新并选择领星授权店铺。")
+            return
+
+        local_skus = list(dict.fromkeys(
+            value.strip()
+            for value in self.skus_var.get().replace("，", ",").split(",")
+            if value.strip()
+        ))
+        if not 1 <= len(local_skus) <= 50:
+            messagebox.showwarning("SKU 数量无效", "请输入 1–50 个不重复的本地 SKU。")
+            return
+
+        start_text = self.query_start_date_var.get().strip()
+        end_text = self.query_end_date_var.get().strip()
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", start_text) or start_text != end_text:
+            messagebox.showwarning(
+                "单日范围无效",
+                "AsinListNew 预览测试只接受单日范围。请将查询开始日和结束日都设为同一个 YYYY-MM-DD 站点日期。",
+            )
+            return
+        try:
+            event_date = date.fromisoformat(start_text)
+        except ValueError:
+            messagebox.showwarning("日期格式错误", "请输入有效的 YYYY-MM-DD 站点日期。")
+            return
+        try:
+            app_id, app_secret = self._openapi_credentials()
+        except CredentialStoreError as exc:
+            messagebox.showerror("OpenAPI 配置错误", str(exc))
+            return
+
+        for item_id in self.product_performance_tree.get_children():
+            self.product_performance_tree.delete(item_id)
+        self.product_performance_status.set("正在按 local_sku + sku 汇总维度执行单日只读查询…")
+
+        def query() -> dict[str, Any]:
+            with LingxingOpenApiClient(app_id, app_secret) as client:
+                token_result = client.get_access_token()
+                rows = client.query_product_performance_single_day(
+                    access_token=token_result.token,
+                    store_sid=seller.sid,
+                    local_skus=local_skus,
+                    event_date=event_date,
+                )
+            return {
+                "_product_performance_rows": rows,
+                "_product_performance_skus": local_skus,
+                "_product_performance_date": event_date,
+                "_product_performance_store": seller.name,
+                "_product_performance_sid": seller.sid,
+            }
+
+        self._start_task(
+            query,
+            self.product_performance_status,
+            "AsinListNew 单日只读查询完成。",
+        )
+
+    def _apply_product_performance_preview(self, result: dict[str, Any]) -> None:
+        rows: list[ProductPerformanceMetrics] = result["_product_performance_rows"]
+        requested_skus: list[str] = result["_product_performance_skus"]
+        event_date: date = result["_product_performance_date"]
+        row_by_sku = {row.local_sku: row for row in rows}
+        self.product_performance_status.set(
+            f"OpenAPI 请求已成功（HTTP 2xx，业务 code=0）；店铺 {result['_product_performance_store']} "
+            f"（本次 SID {result['_product_performance_sid']}），站点日期筛选 {event_date.isoformat()}，"
+            f"返回 {len(rows)} 条 SKU 汇总记录。结果只在本机预览，不写入工作簿或日志。"
+            "响应行没有日期字段；需与领星同日数据核对后才能判断为日值。"
+        )
+        for sku in requested_skus:
+            row = row_by_sku.get(sku)
+            if row is None:
+                self.product_performance_tree.insert(
+                    "", "end", values=(sku, "记录状态", "未返回商品记录（不是零值）", "", "查询范围内没有对应 data.list 记录")
+                )
+                continue
+            for field_name in PRODUCT_PERFORMANCE_PREVIEW_FIELDS:
+                self.product_performance_tree.insert(
+                    "",
+                    "end",
+                    values=(
+                        row.local_sku,
+                        _PRODUCT_PERFORMANCE_FIELD_LABELS.get(field_name, field_name),
+                        _product_performance_value(row, field_name),
+                        row.currency_code or "",
+                        _product_performance_scope_note(field_name),
+                    ),
+                )
 
     def _query_report_sku_data(self) -> None:
         if self._busy:
@@ -840,6 +1033,7 @@ class WeeklyReportApp(tk.Tk):
         self.generate_button.configure(state="disabled")
         self.generate_api_button.configure(state="disabled")
         self.report_query_button.configure(state="disabled")
+        self.product_performance_query_button.configure(state="disabled")
         self.report_ad_query_button.configure(state="disabled")
         self.progress.start(10)
         status_var.set("处理中…")
@@ -887,6 +1081,8 @@ class WeeklyReportApp(tk.Tk):
                         self._show_openapi_result(result.get("output", status_var.get()))
                     elif status_var is self.report_query_status and isinstance(result, dict):
                         self._apply_daily_sales_preview(result)
+                    elif status_var is self.product_performance_status and isinstance(result, dict):
+                        self._apply_product_performance_preview(result)
                     elif status_var is self.report_ad_status and isinstance(result, dict) and result.get("_ad_windows_by_type") is not None:
                         self._apply_ad_spend_preview(result)
                     elif isinstance(result, dict):
@@ -897,6 +1093,8 @@ class WeeklyReportApp(tk.Tk):
                     status_var, error = payload
                     if status_var is self.report_ad_status:
                         status_var.set("广告查询失败；SP/SB/SD 花费均保持未知，不作为零值或正式周报数据。")
+                    elif status_var is self.product_performance_status:
+                        status_var.set("AsinListNew 查询失败；没有数据写入周报或日志。")
                     else:
                         status_var.set("处理失败。")
                     messagebox.showerror("处理失败", error)
@@ -909,6 +1107,7 @@ class WeeklyReportApp(tk.Tk):
             self.generate_button.configure(state="normal")
             self.generate_api_button.configure(state="normal")
             self.report_query_button.configure(state="normal")
+            self.product_performance_query_button.configure(state="normal")
             self.report_ad_query_button.configure(state="normal")
         self.after(150, self._poll_events)
 
