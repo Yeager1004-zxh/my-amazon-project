@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import json
+import copy
 import hashlib
+import json
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -332,7 +333,7 @@ def _validate_schema_value(schema: Any, value: Any, path: str) -> None:
 
 
 def build_action_arguments(action_tool: McpTool, business_tool: BusinessTool, arguments: dict[str, Any]) -> dict[str, Any]:
-    """Map a verified business ID and args into the wrapper's declared schema."""
+    """Build an action envelope using the searched business schema for params."""
     schema = action_tool.input_schema
     properties = schema.get("properties") if isinstance(schema, dict) else None
     if not isinstance(properties, dict):
@@ -344,8 +345,20 @@ def build_action_arguments(action_tool: McpTool, business_tool: BusinessTool, ar
     args_key = next((normalized[name] for name in args_names if name in normalized and normalized[name] != id_key), None)
     if id_key is None or args_key is None:
         raise McpClientError("action Schema 未声明业务工具 ID 和参数对象字段，已阻止调用。")
+    action_params_schema = properties.get(args_key)
+    business_params_schema = business_tool.input_schema
+    if not isinstance(action_params_schema, dict) or action_params_schema.get("type") != "object":
+        raise McpClientError("action 的 params 字段必须声明为 object，已阻止调用。")
+    if not isinstance(business_params_schema, dict) or business_params_schema.get("type") != "object":
+        raise McpClientError("search 返回的业务 inputSchema 不是 object，已阻止调用。")
+
     envelope = {id_key: business_tool.tool_id, args_key: arguments}
-    validate_json_schema(schema, envelope, path="action 参数")
+    dynamic_schema = copy.deepcopy(schema)
+    dynamic_properties = dynamic_schema["properties"]
+    dynamic_params_schema = copy.deepcopy(action_params_schema)
+    dynamic_params_schema.update(copy.deepcopy(business_params_schema))
+    dynamic_properties[args_key] = dynamic_params_schema
+    validate_json_schema(dynamic_schema, envelope, path="action 参数")
     return envelope
 
 
