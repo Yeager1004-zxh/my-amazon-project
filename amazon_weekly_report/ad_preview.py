@@ -76,6 +76,18 @@ def _type_state(kind: str, window: SpAdSpendWindow | None, *, matched_rows: int 
     if not window.report_complete:
         if window.discrepancies:
             return f"{kind} 部分活动未核平；相关记录阻止归属"
+        if kind == "SB":
+            if window.campaign_rows and not window.ad_group_rows:
+                return f"SB 活动报表有 {len(window.campaign_rows)} 条记录，广告组报表无记录；SKU 花费未知"
+            if window.ad_group_rows and not window.campaign_rows:
+                return f"SB 广告组报表有 {len(window.ad_group_rows)} 条记录，活动报表无记录；金额未核平"
+        else:
+            if window.campaign_rows and not window.product_rows:
+                return f"{kind} 活动报表有 {len(window.campaign_rows)} 条记录，商品报表无记录；SKU 花费未知"
+            if window.product_rows and not window.campaign_rows:
+                return f"{kind} 商品报表有 {len(window.product_rows)} 条记录，活动报表无记录；金额未核平"
+        if not window.campaign_rows and not window.product_rows and not window.ad_group_rows:
+            return f"{kind} 报表接口已返回空记录（不视为零花费）"
         return f"{kind} 活动或商品明细无记录（未知，不视为零）"
     return f"{kind} 商品报表无该 SKU 记录（未知，不视为零）"
 
@@ -91,6 +103,18 @@ def _window_state(kind: str, window: SpAdSpendWindow | None) -> str:
         return f"{kind} 活动与{detail}成本已核平"
     if window.discrepancies:
         return f"{kind} 活动与明细成本不一致，相关活动金额未知"
+    if kind == "SB":
+        if window.campaign_rows and not window.ad_group_rows:
+            return "SB 活动接口有记录，但广告组接口返回空记录"
+        if window.ad_group_rows and not window.campaign_rows:
+            return "SB 广告组接口有记录，但活动接口返回空记录"
+    else:
+        if window.campaign_rows and not window.product_rows:
+            return f"{kind} 活动接口有记录，但商品接口返回空记录"
+        if window.product_rows and not window.campaign_rows:
+            return f"{kind} 商品接口有记录，但活动接口返回空记录"
+    if not window.campaign_rows and not window.product_rows and not window.ad_group_rows:
+        return f"{kind} 活动及明细接口返回空记录；花费未知，不作为零值"
     return f"{kind} 活动或明细报表缺记录，金额未知"
 
 

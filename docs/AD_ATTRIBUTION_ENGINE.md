@@ -11,6 +11,12 @@
 5. 活动总额与其唯一明细粒度的 cost 逐活动核平。活动报表不加到商品/广告组费用上。某活动不平时只隔离该活动，其他已核平活动仍可在预览中显示。
 6. 缺少商品记录不是 0。只有接口明确返回商品级 `cost=0` 才显示 0。未知归属、查询失败、成本不平和未映射分别显示。
 
+## Windows 实测反馈（用户报告）
+
+EX-shop-US / `ex3114`，2026-08-28 至 2026-08-29：SP 商品花费可按 MSKU/ASIN 匹配；SB 当前创意目录返回 12 条，SD 当前商品目录返回 39 条；SP 和 SB 活动/明细报表差异均为 0。用户已在领星后台核实 2026-08-29 的 SKU 级 SB 花费为 `$19.21`，店铺级 SB 为 `$23.08`，差额来自其他商品。该结果是真实业务验收反馈，但程序当前还不能从返回关系自动得到 `$19.21`，没有在代码中硬编码该金额。
+
+用户另报告 SD 当前目录有记录但所选日期的历史广告报表没有历史明细。当前商品目录 `sdProductAds` 没有 `report_date` 或 `cost`，所以这不能证明指定日期花费为 0。预览会把“成功响应但无历史行”显示为未知；若活动报表有行而商品报表为空，会明确显示商品接口无记录，不能把活动总额复制到 SKU。
+
 金额运算使用 `Decimal`。一个 local SKU 可具有多个 MSKU、ASIN；历史别名仅在其有效日期经过核验时使用。当前产品表现接口返回的别名集合没有提供逐日有效期，因此 UI 会将自动匹配标为预览，不能作为正式周报广告输入。正式写入还需验证日期时区、币种、覆盖范围和真实后台总额。
 
 ## SP
@@ -31,11 +37,24 @@
 - `POST /pb/openapi/newad/hsaProductAds`：游标或 offset 分页；读取顶层 ASIN 和真实广告关系 ID，不用活动名、creative/landing page 内的 ASIN 或视频素材 URL 猜测商品归属。
 - `POST /pb/openapi/newad/sdProductAds`：带 `X-API-VERSION: 2`，读取当前 MSKU/ASIN/ad ID 目录作交叉核对；历史费用仍以 SD 商品报表按日返回的 SKU/ASIN/cost 为准。
 
-SB 分摊接口 `POST /pb/openapi/newad/sbDivideAsinReports` 当前被阻止。上述目录接口只用于展示当前商品标识，不能代替历史快照。所有分页必须按 `total` 完整读取、检查重复与空页；分页游标仅在内存中传递。
+SB 分摊接口 `POST /pb/openapi/newad/sbDivideAsinReports` 当前被阻止。公开页面正文虽列出请求字段 `profile_id`、`report_date`、`offset`、`length`、`next_token`，但返回字段表和成功示例明显错位。实现自动归属前还缺：
+
+- 修正的官方 `data` 记录结构与字段类型，特别是 `report_date`、`profile_id`、`campaign_id`、`ad_group_id`、`sku`、`asin`。
+- `spends` 和 `percent` 的每项结构、单位、金额含义、舍入规则。必须确认 `spends` 是否直接表示 ASIN/SKU 级实际花费，或只是列表/归因值/待分摊输入。
+- 该接口是否覆盖 SP/SB 视频和所有 SB campaign 类型，以及 `sum(SKU spends)` 应如何与 SB 商品报表、广告组报表、活动报表核平。
+- 该报表数据的历史保留范围、结算延迟、站点日期时区和币种。
+
+Codex 云端用普通 HTTPS 请求访问领星文档时得到代理 `403 Forbidden`，不尝试绕过。已上传的 2024 Java SDK 包含通用签名/HTTP 客户端和订单示例，没有 SB/SD 广告报表实现可用于核对该响应语义。
+
+如果 `sbDivideAsinReports` 不返回 SKU/ASIN 级实际花费，就需要领星官方提供报表日商品推广身份历史或 SB 商品级实际花费接口；当前 `hsaProductAds` 的实时目录不足以把 `$23.08` 店铺费用拆到 `ex3114`。
+
+所有分页必须按 `total` 完整读取、检查重复与空页；分页游标仅在内存中传递。
 
 ## SD
 
-现有 SD 商品报表本身包含 `ad_id`、`campaign_id`、`ad_group_id`、MSKU、ASIN 和 cost，可按精确商品身份匹配并与活动 cost 核对。已接入 `sdProductAds` 当前目录用作商品身份 ID 交叉核验，不覆盖历史商品报表中矛盾的数据，也不把当前状态当作历史有效期证明。
+历史费用请求使用 `POST /pb/openapi/newad/sdProductAdReports`，每个站点日期发送 `sid`、`report_date`、`show_detail=0`、`offset`、`length`，并带 `X-API-VERSION: 2`。预期历史商品行含 `ad_id`、`campaign_id`、`ad_group_id`、MSKU、ASIN、`cost` 和 `report_date`。只有这些商品行完整返回、日期/活动费用核平后才按 MSKU/ASIN 归属。已接入 `sdProductAds` 当前目录用作身份交叉核验，不覆盖历史商品报表中矛盾的数据，也不把当前状态当作历史有效期证明。
+
+本次 Windows 反馈指出历史 SD 明细无记录，但没有说明响应 envelope 的 `code`、`total` 以及同日活动报表行数。需要确认具体属于 `code=0,total=0`、活动有行但商品无行，还是业务响应/请求失败；这些状态不能混为零花费。若 `sdProductAdReports` 对该日成功但返回 0 行，关键缺口就是领星对该历史日期是否有该类型商品级 spend 行、报表保留范围/生成延迟，或是否有另一个按日返回 `ad_id + SKU/ASIN + cost` 的官方接口。
 
 ## 当前 Windows 预览验收
 
@@ -47,4 +66,4 @@ SB 分摊接口 `POST /pb/openapi/newad/sbDivideAsinReports` 当前被阻止。�
 4. 比对领星后台 SB 专属花费 `$19.21`。当前创意目录仅能展示 ASIN/SKU 候选，不会自动把历史 SB 广告组 cost 记入 `ex3114`；必须先补充修正后的分摊 Schema 或报表日历史身份证据。
 5. 不用 synthetic test 的金额证明真实数据。只反馈脱敏的字段结构、接口名、分页总数及本地/接口/业务阶段成功状态，不要发送凭证、Token、Seller ID、广告 ID、订单明细或完整响应。
 
-真实 ex3114 验收之前，当前费用仍只用于预览，不进入 Excel。验证完成后还需在正式接入前确认当前 ASIN/MSKU 映射覆盖历史广告商品变化，并完成 SB 视频广告及日期/币种核对。
+程序能自动归属 ex3114 之前，当前广告费用仍只用于预览，不进入 Excel。还需确认历史 ASIN/MSKU 映射有效期，并完成 SB 视频广告及日期/币种核对。

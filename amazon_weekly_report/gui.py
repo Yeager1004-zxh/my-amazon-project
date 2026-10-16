@@ -707,11 +707,28 @@ class WeeklyReportApp(tk.Tk):
             kind: (len(windows_by_type[kind][0].product_catalog_rows) if windows_by_type[kind] else 0)
             for kind in ("SB", "SD")
         }
+        report_row_counts = {
+            "SP": (
+                sum(len(window.campaign_rows) for window in windows_by_type["SP"]),
+                sum(len(window.product_rows) for window in windows_by_type["SP"]),
+            ),
+            "SB": (
+                sum(len(window.campaign_rows) for window in windows_by_type["SB"]),
+                sum(len(window.ad_group_rows) for window in windows_by_type["SB"]),
+            ),
+            "SD": (
+                sum(len(window.campaign_rows) for window in windows_by_type["SD"]),
+                sum(len(window.product_rows) for window in windows_by_type["SD"]),
+            ),
+        }
         self.report_ad_status.set(
             f"店铺 {result['_ad_store_name']}：{result['_ad_start'].isoformat()} 至 "
             f"{result['_ad_end'].isoformat()}（报表日期）。已核平日期数 SP/SB/SD="
             f"{complete_by_type['SP']}/{complete_by_type['SB']}/{complete_by_type['SD']}；"
             f"差异 campaign 数 SP/SB/SD={discrepancies['SP']}/{discrepancies['SB']}/{discrepancies['SD']}。"
+            f"接口成功返回的活动/明细行数 SP={report_row_counts['SP'][0]}/{report_row_counts['SP'][1]}、"
+            f"SB={report_row_counts['SB'][0]}/{report_row_counts['SB'][1]}、"
+            f"SD={report_row_counts['SD'][0]}/{report_row_counts['SD'][1]}。"
             f"SP/SD 按历史商品报表中的 MSKU/ASIN 精确标识预览；已读取 SB 创意目录 {catalog_counts['SB']} 条、SD 商品目录 {catalog_counts['SD']} 条。"
             "新目录仅是当前快照，不能证明广告在历史报表日推广相同商品，因此 SB 广告组花费不自动归属。"
             "SB 分摊接口字段语义仍待官方澄清；Schema 也未确认 cost 币种、report_date 时区及 SB 视频覆盖范围；跨类型合计留空。"

@@ -1196,6 +1196,27 @@ class AdPreviewTests(unittest.TestCase):
         self.assertIn("SB=查询结果缺失", unallocated_row.unattributed_cost)
         self.assertEqual(unallocated_row.sb_cost, "")
 
+    def test_sd_activity_without_historical_product_rows_remains_unknown(self) -> None:
+        report_day = date(2026, 8, 29)
+        sd = SpAdSpendWindow(
+            report_day, report_day,
+            (SpCampaignSpend(report_day, "campaign-1", Decimal("4.50"), "profile-1"),),
+            (), (), (), ad_type="SD", campaign_cost_total=Decimal("4.50"),
+            detail_cost_total=None, unattributed_cost=None, report_complete=False,
+            product_catalog_rows=(AdProductCatalogRecord(
+                "SD", "profile-1", "campaign-1", "group-1", "ad-1",
+                seller_sku="MSKU-A", asins=("ASIN-A",),
+            ),),
+        )
+        summaries, _details = build_ad_spend_preview(
+            windows_by_type={"SD": [sd]}, mappings=[SkuProductMapping("LOCAL-A", ("MSKU-A",), ("ASIN-A",))],
+            store_sid=77, requested_skus=["LOCAL-A"], start_date=report_day, end_date=report_day,
+        )
+        sku_row = next(row for row in summaries if row.local_sku == "LOCAL-A")
+        self.assertEqual(sku_row.sd_cost, "")
+        self.assertIn("SD 活动报表有 1 条记录，商品报表无记录", sku_row.integrity)
+        self.assertIn("SKU 花费未知", sku_row.integrity)
+
 
 class AdAttributionTests(unittest.TestCase):
     def _campaign(self, campaign_id: str, cost: str, *, profile: str = "profile-1") -> CampaignCostEvidence:
