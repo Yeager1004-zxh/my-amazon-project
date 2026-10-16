@@ -355,9 +355,12 @@ def build_action_arguments(action_tool: McpTool, business_tool: BusinessTool, ar
     envelope = {id_key: business_tool.tool_id, args_key: arguments}
     dynamic_schema = copy.deepcopy(schema)
     dynamic_properties = dynamic_schema["properties"]
-    dynamic_params_schema = copy.deepcopy(action_params_schema)
-    dynamic_params_schema.update(copy.deepcopy(business_params_schema))
-    dynamic_properties[args_key] = dynamic_params_schema
+    # action describes only that this slot is an object. Its placeholder
+    # properties and constraints do not describe the dynamically discovered
+    # business input and must not leak into validation. Validate the business
+    # object against the exact Schema returned by search; keep the outer action
+    # Schema intact for tool ID, required envelope fields and extra fields.
+    dynamic_properties[args_key] = copy.deepcopy(business_params_schema)
     validate_json_schema(dynamic_schema, envelope, path="action 参数")
     return envelope
 

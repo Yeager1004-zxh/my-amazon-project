@@ -477,7 +477,12 @@ class McpClientTests(unittest.TestCase):
                 "type": "object",
                 "properties": {
                     "toolId": {"type": "string"},
-                    "params": {"type": "object", "properties": {}, "additionalProperties": False},
+                    "params": {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": False,
+                        "maxProperties": 0,
+                    },
                 },
                 "required": ["toolId", "params"],
                 "additionalProperties": False,
