@@ -5,12 +5,12 @@ import queue
 import re
 import threading
 from datetime import date, datetime
-from decimal import Decimal
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 import tkinter as tk
 from typing import Any
 
+from .ad_preview import build_ad_spend_preview
 from .credential_store import (
     CredentialStoreError,
     LingxingOpenApiCredentialStore,
@@ -34,7 +34,6 @@ from .providers.lingxing_api import (
     LingxingApiError,
     LingxingOpenApiClient,
     LingxingSeller,
-    SpAdSpendWindow,
     SkuDailySales,
     SkuDailySalesWindow,
     SkuProductMapping,
@@ -169,35 +168,83 @@ class WeeklyReportApp(tk.Tk):
         query_box.rowconfigure(3, weight=1)
         self.report_ad_query_button = ttk.Button(
             query_box,
-            text="查询 SP 广告花费并预览",
-            command=self._query_report_sp_ad_data,
+            text="查询 SP / SB / SD 广告费用并预览",
+            command=self._query_report_ad_data,
         )
         self.report_ad_query_button.grid(row=4, column=0, sticky="w", padx=4, pady=(8, 3))
-        ttk.Label(query_box, text="SP 广告商品明细（按 campaign 与活动报表核对；仅预览，不写入周报）").grid(
+        ttk.Label(query_box, text="广告费用汇总与明细（只读预览，不写入周报）").grid(
             row=4, column=1, columnspan=4, sticky="w", padx=4, pady=(8, 3)
         )
-        self.report_ad_status = tk.StringVar(value="仅查询 SP；未接入的 SB/SD 不视为零。")
+        self.report_ad_status = tk.StringVar(
+            value="查询 SP、SB、SD 日报；缺少记录不视为零。币种、报表日期时区及 SB 视频覆盖范围需本机核验。"
+        )
         ttk.Label(query_box, textvariable=self.report_ad_status, wraplength=900).grid(
             row=5, column=0, columnspan=5, sticky="w", padx=4, pady=(0, 3)
         )
-        ad_columns = ("report_date", "local_sku", "seller_sku", "campaign_id", "ad_group_id", "cost", "check")
-        self.report_ad_tree = ttk.Treeview(query_box, columns=ad_columns, show="headings", height=4)
+        ttk.Label(query_box, text="按日期及 SKU 汇总；“未归属（店铺级）”行分别显示无法归属金额，各广告类型不会互相加总。", wraplength=900).grid(
+            row=6, column=0, columnspan=5, sticky="w", padx=4, pady=(2, 2)
+        )
+        ad_summary_columns = (
+            "report_date", "local_sku", "sp_cost", "sb_cost", "sd_cost",
+            "confirmed_total", "unattributed_cost", "integrity",
+        )
+        self.report_ad_summary_tree = ttk.Treeview(
+            query_box, columns=ad_summary_columns, show="headings", height=4
+        )
         for column, heading, width in (
-            ("report_date", "报表日期", 90),
-            ("local_sku", "本地 SKU", 105),
-            ("seller_sku", "报表 SKU/MSKU", 120),
-            ("campaign_id", "Campaign ID", 145),
-            ("ad_group_id", "Ad Group ID", 135),
-            ("cost", "SP cost", 90),
-            ("check", "核对状态", 205),
+            ("report_date", "报表日期", 95),
+            ("local_sku", "本地 SKU / 范围", 155),
+            ("sp_cost", "SP 实际花费", 100),
+            ("sb_cost", "SB 实际花费", 100),
+            ("sd_cost", "SD 实际花费", 100),
+            ("confirmed_total", "已确认归属合计", 115),
+            ("unattributed_cost", "未归属花费", 300),
+            ("integrity", "完整性 / 核对状态", 420),
         ):
-            self.report_ad_tree.heading(column, text=heading)
-            self.report_ad_tree.column(column, width=width, anchor="w")
-        self.report_ad_tree.grid(row=6, column=0, columnspan=5, sticky="nsew", padx=4, pady=4)
-        ad_scrollbar = ttk.Scrollbar(query_box, orient="vertical", command=self.report_ad_tree.yview)
-        ad_scrollbar.grid(row=6, column=5, sticky="ns", pady=4)
-        self.report_ad_tree.configure(yscrollcommand=ad_scrollbar.set)
-        query_box.rowconfigure(6, weight=1)
+            self.report_ad_summary_tree.heading(column, text=heading)
+            self.report_ad_summary_tree.column(column, width=width, anchor="w")
+        self.report_ad_summary_tree.grid(row=7, column=0, columnspan=5, sticky="nsew", padx=4, pady=4)
+        ad_summary_scrollbar = ttk.Scrollbar(query_box, orient="vertical", command=self.report_ad_summary_tree.yview)
+        ad_summary_scrollbar.grid(row=7, column=5, sticky="ns", pady=4)
+        ad_summary_xscrollbar = ttk.Scrollbar(query_box, orient="horizontal", command=self.report_ad_summary_tree.xview)
+        ad_summary_xscrollbar.grid(row=8, column=0, columnspan=5, sticky="ew", padx=4)
+        self.report_ad_summary_tree.configure(
+            yscrollcommand=ad_summary_scrollbar.set, xscrollcommand=ad_summary_xscrollbar.set
+        )
+        ttk.Label(query_box, text="原始活动与商品 / 广告组行；活动行只用于核对，不与明细重复累计。", wraplength=900).grid(
+            row=9, column=0, columnspan=5, sticky="w", padx=4, pady=(5, 2)
+        )
+        ad_detail_columns = (
+            "report_date", "ad_type", "report_level", "local_sku", "report_sku",
+            "profile_id", "campaign_id", "ad_group_id", "cost", "integrity",
+        )
+        self.report_ad_detail_tree = ttk.Treeview(
+            query_box, columns=ad_detail_columns, show="headings", height=4
+        )
+        for column, heading, width in (
+            ("report_date", "报表日期", 95),
+            ("ad_type", "类型", 55),
+            ("report_level", "报表粒度", 155),
+            ("local_sku", "本地 SKU", 120),
+            ("report_sku", "报表 SKU/MSKU", 130),
+            ("profile_id", "Profile ID", 135),
+            ("campaign_id", "Campaign ID", 145),
+            ("ad_group_id", "Ad Group ID", 130),
+            ("cost", "Cost", 85),
+            ("integrity", "归属 / 核对状态", 350),
+        ):
+            self.report_ad_detail_tree.heading(column, text=heading)
+            self.report_ad_detail_tree.column(column, width=width, anchor="w")
+        self.report_ad_detail_tree.grid(row=10, column=0, columnspan=5, sticky="nsew", padx=4, pady=4)
+        ad_detail_scrollbar = ttk.Scrollbar(query_box, orient="vertical", command=self.report_ad_detail_tree.yview)
+        ad_detail_scrollbar.grid(row=10, column=5, sticky="ns", pady=4)
+        ad_detail_xscrollbar = ttk.Scrollbar(query_box, orient="horizontal", command=self.report_ad_detail_tree.xview)
+        ad_detail_xscrollbar.grid(row=11, column=0, columnspan=5, sticky="ew", padx=4)
+        self.report_ad_detail_tree.configure(
+            yscrollcommand=ad_detail_scrollbar.set, xscrollcommand=ad_detail_xscrollbar.set
+        )
+        query_box.rowconfigure(7, weight=1)
+        query_box.rowconfigure(10, weight=1)
 
         mode_box = ttk.LabelFrame(parent, text="D01 起算日期（手动确认）", padding=8)
         mode_box.grid(row=9, column=0, columnspan=3, sticky="ew", pady=8)
@@ -530,7 +577,7 @@ class WeeklyReportApp(tk.Tk):
 
         self._start_task(query, self.report_query_status, "SKU 每日数据查询完成。")
 
-    def _query_report_sp_ad_data(self) -> None:
+    def _query_report_ad_data(self) -> None:
         if self._busy:
             return
         seller = self._selected_report_seller()
@@ -549,22 +596,23 @@ class WeeklyReportApp(tk.Tk):
             start_date = date.fromisoformat(start_text)
             end_date = date.fromisoformat(end_text)
         except ValueError:
-            messagebox.showwarning("日期格式错误", "SP 报表日期请输入有效的 YYYY-MM-DD。")
+            messagebox.showwarning("日期格式错误", "广告报表日期请输入有效的 YYYY-MM-DD。")
             return
         if end_date < start_date:
             messagebox.showwarning("日期范围错误", "结束日期不能早于开始日期。")
             return
         if (end_date - start_date).days + 1 > 92:
-            messagebox.showwarning("日期范围过长", "为控制请求量，SP 预览一次最多查询 92 个日期；遇到 429 会停止且不自动重试。")
+            messagebox.showwarning("日期范围过长", "为控制请求量，广告预览一次最多查询 92 个日期；遇到 429 会停止且不自动重试。")
             return
         try:
             app_id, app_secret = self._openapi_credentials()
         except CredentialStoreError as exc:
             messagebox.showerror("OpenAPI 配置错误", str(exc))
             return
-        for item_id in self.report_ad_tree.get_children():
-            self.report_ad_tree.delete(item_id)
-        self.report_ad_status.set("正在读取 SP 活动及商品报表并逐日核对……")
+        for tree in (self.report_ad_summary_tree, self.report_ad_detail_tree):
+            for item_id in tree.get_children():
+                tree.delete(item_id)
+        self.report_ad_status.set("正在读取 SP、SB、SD 报表并逐日核对；查询失败时费用保持未知……")
 
         def query() -> dict[str, Any]:
             with LingxingOpenApiClient(app_id, app_secret) as client:
@@ -580,93 +628,81 @@ class WeeklyReportApp(tk.Tk):
                 missing = [sku for sku in local_skus if sku.casefold() not in by_sku or not by_sku[sku.casefold()].seller_skus]
                 if missing:
                     raise LingxingApiError("以下 SKU 没有完整 MSKU 映射，未查询广告费用：" + ", ".join(missing))
-                windows = client.query_sp_ad_spend_history(
-                    access_token=token_result.token,
-                    store_sid=seller.sid,
-                    mappings=[by_sku[sku.casefold()] for sku in local_skus],
-                    start_date=start_date,
-                    end_date=end_date,
-                )
+                selected_mappings = [by_sku[sku.casefold()] for sku in local_skus]
+                windows_by_type = {
+                    "SP": client.query_sp_ad_spend_history(
+                        access_token=token_result.token,
+                        store_sid=seller.sid,
+                        mappings=selected_mappings,
+                        start_date=start_date,
+                        end_date=end_date,
+                    ),
+                    "SB": client.query_sb_ad_spend_history(
+                        access_token=token_result.token,
+                        store_sid=seller.sid,
+                        start_date=start_date,
+                        end_date=end_date,
+                    ),
+                    "SD": client.query_sd_ad_spend_history(
+                        access_token=token_result.token,
+                        store_sid=seller.sid,
+                        mappings=selected_mappings,
+                        start_date=start_date,
+                        end_date=end_date,
+                    ),
+                }
             return {
-                "_sp_ad_windows": windows,
-                "_sp_ad_mappings": mappings,
-                "_sp_ad_store_name": seller.name,
-                "_sp_ad_start": start_date,
-                "_sp_ad_end": end_date,
-                "message": "SP 广告费用预览查询完成；该预览未写入周报。",
+                "_ad_windows_by_type": windows_by_type,
+                "_ad_mappings": mappings,
+                "_ad_requested_skus": local_skus,
+                "_ad_store_name": seller.name,
+                "_ad_start": start_date,
+                "_ad_end": end_date,
+                "message": "SP、SB、SD 广告费用预览查询完成；该预览未写入周报。",
             }
 
-        self._start_task(query, self.report_ad_status, "SP 广告费用查询完成。")
+        self._start_task(query, self.report_ad_status, "SP、SB、SD 广告费用查询完成。")
 
-    def _apply_sp_ad_preview(self, result: dict[str, Any]) -> None:
-        windows: list[SpAdSpendWindow] = result["_sp_ad_windows"]
-        mappings: list[SkuProductMapping] = result["_sp_ad_mappings"]
-        local_by_msku = {
-            msku.casefold(): mapping.local_sku
-            for mapping in mappings
-            for msku in mapping.seller_skus
-        }
-        discrepancy_count = sum(len(window.discrepancies) for window in windows)
-        product_total = sum(
-            (row.cost for window in windows for row in window.product_rows),
-            start=Decimal("0"),
+    def _apply_ad_spend_preview(self, result: dict[str, Any]) -> None:
+        summaries, details = build_ad_spend_preview(
+            windows_by_type=result["_ad_windows_by_type"],
+            mappings=result["_ad_mappings"],
+            requested_skus=result["_ad_requested_skus"],
+            start_date=result["_ad_start"],
+            end_date=result["_ad_end"],
         )
-        campaign_total = sum(
-            (row.cost for window in windows for row in window.campaign_rows),
-            start=Decimal("0"),
-        )
-        sku_total_by_key: dict[str, Any] = {}
-        for window in windows:
-            blocked_dates = {item.report_date for item in window.discrepancies}
-            for spend in window.sku_daily_spends:
-                if spend.report_date not in blocked_dates:
-                    key = spend.local_sku.casefold()
-                    sku_total_by_key[key] = sku_total_by_key.get(key, 0) + spend.actual_spend
-            state = "日期内成本不一致；SKU 花费被阻止" if blocked_dates else "活动/商品总成本相等（待后台验收）"
-            for row in window.product_rows:
-                self.report_ad_tree.insert(
-                    "",
-                    "end",
-                    values=(
-                        row.report_date.isoformat(),
-                        local_by_msku.get(row.sku.casefold(), "未映射"),
-                        row.sku,
-                        row.campaign_id,
-                        row.ad_group_id,
-                        format(row.cost, "f"),
-                        state,
-                    ),
-                )
-        summary = [
-            f"店铺 {result['_sp_ad_store_name']}：{result['_sp_ad_start'].isoformat()} 至 {result['_sp_ad_end'].isoformat()}（报表日期）",
-            f"campaign cost 合计 {format(campaign_total, 'f')}；商品 cost 合计 {format(product_total, 'f')}；不一致 campaign {discrepancy_count} 个",
-            "SP cost 币种字段未在本次官方 Schema 中提供，金额只供对照；只有逐日活动/商品成本一致的日期才显示 SKU 汇总。",
-            "报表日期时区也未在已提供的官方 Schema 中说明；按返回的 YYYY-MM-DD 对照，不推断为店铺站点日期。",
-            "本结果仅供预览，尚未写入周报；SB/SD 未查询且不视为零。",
-        ]
-        incomplete_days = [
-            window for window in windows
-            if not window.campaign_rows or not window.product_rows
-        ]
-        if incomplete_days:
-            summary.append(
-                "缺少完整双报表记录的日期（未知，不当作零花费）：" + "、".join(
-                    f"{window.start_date.isoformat()}["
-                    f"{'活动报表缺记录' if not window.campaign_rows else ''}"
-                    f"{'；' if not window.campaign_rows and not window.product_rows else ''}"
-                    f"{'商品报表缺记录' if not window.product_rows else ''}]"
-                    for window in incomplete_days
+        for row in summaries:
+            self.report_ad_summary_tree.insert(
+                "", "end", values=(
+                    row.report_date, row.local_sku, row.sp_cost, row.sb_cost, row.sd_cost,
+                    row.confirmed_total, row.unattributed_cost, row.integrity,
                 )
             )
-        for local_key, amount in sorted(sku_total_by_key.items()):
-            summary.append(f"{local_key} SP SKU cost={format(amount, 'f')}")
-        if discrepancy_count:
-            sample = [item for window in windows for item in window.discrepancies][:5]
-            summary.append("差异示例：" + "；".join(
-                f"{item.report_date.isoformat()} campaign {item.campaign_id}：活动={item.campaign_cost if item.campaign_cost is not None else '缺失'}，商品={item.product_cost if item.product_cost is not None else '缺失'}"
-                for item in sample
-            ))
-        self.report_ad_status.set(" ".join(summary))
+        for row in details:
+            self.report_ad_detail_tree.insert(
+                "", "end", values=(
+                    row.report_date, row.ad_type, row.report_level, row.local_sku,
+                    row.report_sku, row.profile_id, row.campaign_id, row.ad_group_id, row.cost, row.integrity,
+                )
+            )
+        windows_by_type = result["_ad_windows_by_type"]
+        complete_by_type = {
+            kind: sum(1 for window in windows_by_type[kind] if window.report_complete)
+            for kind in ("SP", "SB", "SD")
+        }
+        discrepancies = {
+            kind: sum(len(window.discrepancies) for window in windows_by_type[kind])
+            for kind in ("SP", "SB", "SD")
+        }
+        self.report_ad_status.set(
+            f"店铺 {result['_ad_store_name']}：{result['_ad_start'].isoformat()} 至 "
+            f"{result['_ad_end'].isoformat()}（报表日期）。已核平日期数 SP/SB/SD="
+            f"{complete_by_type['SP']}/{complete_by_type['SB']}/{complete_by_type['SD']}；"
+            f"差异 campaign 数 SP/SB/SD={discrepancies['SP']}/{discrepancies['SB']}/{discrepancies['SD']}。"
+            "SB 活动/广告组报表没有 SKU/ASIN 归属字段，费用只显示在店铺级未归属行。"
+            "Schema 未说明 cost 币种、report_date 时区或 SB 视频覆盖范围；跨类型合计留空。"
+            "预览不写入周报；本次日期的 SP/SB/SD 数值都需在 Windows 逐日与领星后台核验。"
+        )
 
     def _apply_daily_sales_preview(self, result: dict[str, Any]) -> None:
         mappings: list[SkuProductMapping] = result["_mappings"]
@@ -820,15 +856,18 @@ class WeeklyReportApp(tk.Tk):
                         self._show_openapi_result(result.get("output", status_var.get()))
                     elif status_var is self.report_query_status and isinstance(result, dict):
                         self._apply_daily_sales_preview(result)
-                    elif status_var is self.report_ad_status and isinstance(result, dict) and result.get("_sp_ad_windows") is not None:
-                        self._apply_sp_ad_preview(result)
+                    elif status_var is self.report_ad_status and isinstance(result, dict) and result.get("_ad_windows_by_type") is not None:
+                        self._apply_ad_spend_preview(result)
                     elif isinstance(result, dict):
                         status_var.set(result.get("message", title))
                         if result.get("output"):
                             messagebox.showinfo("周报生成完成", result["message"])
                 else:
                     status_var, error = payload
-                    status_var.set("处理失败。")
+                    if status_var is self.report_ad_status:
+                        status_var.set("广告查询失败；SP/SB/SD 花费均保持未知，不作为零值或正式周报数据。")
+                    else:
+                        status_var.set("处理失败。")
                     messagebox.showerror("处理失败", error)
                 finished = True
         except queue.Empty:
