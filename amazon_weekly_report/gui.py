@@ -27,7 +27,7 @@ from .mcp_client import (
     is_read_only_query_candidate,
     redact_sensitive,
 )
-from .providers.lingxing_api import LingxingOpenApiClient
+from .providers.lingxing_api import LingxingApiError, LingxingOpenApiClient, LingxingSeller
 from .report_generation import ReportGenerationError, generate_reports
 
 
@@ -43,6 +43,8 @@ class WeeklyReportApp(tk.Tk):
         self._business_tools: list[BusinessTool] = []
         self._verified_query_grants: dict[str, VerifiedReadOnlyGrant] = {}
         self._viewed_business_fingerprints: set[str] = set()
+        self._sellers: list[LingxingSeller] = []
+        self._seller_choices: dict[str, LingxingSeller] = {}
         self._build_ui()
         self._load_mcp_settings()
         self.after(150, self._poll_events)
@@ -81,6 +83,7 @@ class WeeklyReportApp(tk.Tk):
         self.output_var = tk.StringVar()
         self.existing_var = tk.StringVar()
         self.skus_var = tk.StringVar()
+        self.report_store_var = tk.StringVar()
         self.d01_mode = tk.StringVar(value="first_sale")
         self.launch_dates_var = tk.StringVar()
         self._path_row(parent, 0, "Excel 格式模板", self.template_var)
@@ -88,11 +91,18 @@ class WeeklyReportApp(tk.Tk):
         self._path_row(parent, 2, "字段映射 JSON", self.mapping_var)
         self._path_row(parent, 3, "输出文件夹", self.output_var, directory=True)
         self._path_row(parent, 4, "已有周报（可选）", self.existing_var)
-        ttk.Label(parent, text="SKU（逗号分隔）", width=20).grid(row=5, column=0, sticky="w", pady=5)
-        ttk.Entry(parent, textvariable=self.skus_var).grid(row=5, column=1, columnspan=2, sticky="ew", padx=6, pady=5)
+        ttk.Label(parent, text="领星店铺", width=20).grid(row=5, column=0, sticky="w", pady=5)
+        self.report_store_combo = ttk.Combobox(parent, textvariable=self.report_store_var, state="readonly")
+        self.report_store_combo.grid(row=5, column=1, sticky="ew", padx=6, pady=5)
+        ttk.Button(parent, text="刷新店铺列表", command=self._openapi_seller_list).grid(row=5, column=2, sticky="w", padx=6, pady=5)
+        ttk.Label(parent, text="选择项会自动绑定接口返回的 SID；本地 Excel/CSV 模式仍按字段映射读取。", wraplength=850).grid(
+            row=6, column=1, columnspan=2, sticky="w", padx=6, pady=(0, 4)
+        )
+        ttk.Label(parent, text="SKU（逗号分隔）", width=20).grid(row=7, column=0, sticky="w", pady=5)
+        ttk.Entry(parent, textvariable=self.skus_var).grid(row=7, column=1, columnspan=2, sticky="ew", padx=6, pady=5)
 
         mode_box = ttk.LabelFrame(parent, text="D01 规则", padding=8)
-        mode_box.grid(row=6, column=0, columnspan=3, sticky="ew", pady=8)
+        mode_box.grid(row=8, column=0, columnspan=3, sticky="ew", pady=8)
         ttk.Radiobutton(mode_box, text="SKU 首个有销量日期", variable=self.d01_mode, value="first_sale").grid(row=0, column=0, sticky="w", padx=4)
         ttk.Radiobutton(mode_box, text="正式开售日期", variable=self.d01_mode, value="launch_date").grid(row=0, column=1, sticky="w", padx=4)
         ttk.Label(mode_box, text="选择正式开售日期时，每行填写 SKU=YYYY-MM-DD（不同 SKU 可用不同日期）").grid(row=1, column=0, columnspan=2, sticky="w", padx=4, pady=(5, 2))
@@ -101,11 +111,11 @@ class WeeklyReportApp(tk.Tk):
         mode_box.columnconfigure(1, weight=1)
 
         self.progress = ttk.Progressbar(parent, mode="indeterminate")
-        self.progress.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(10, 4))
+        self.progress.grid(row=9, column=0, columnspan=3, sticky="ew", pady=(10, 4))
         self.report_status = tk.StringVar(value="待处理。字段映射必须基于真实报表表头配置。")
-        ttk.Label(parent, textvariable=self.report_status, wraplength=880).grid(row=8, column=0, columnspan=3, sticky="w", pady=4)
+        ttk.Label(parent, textvariable=self.report_status, wraplength=880).grid(row=10, column=0, columnspan=3, sticky="w", pady=4)
         buttons = ttk.Frame(parent)
-        buttons.grid(row=9, column=0, columnspan=3, sticky="ew", pady=10)
+        buttons.grid(row=11, column=0, columnspan=3, sticky="ew", pady=10)
         self.generate_button = ttk.Button(buttons, text="开始生成周报", command=self._start_generation)
         self.generate_button.pack(side="left")
         ttk.Button(buttons, text="打开输出文件夹", command=self._open_output_folder).pack(side="left", padx=8)
@@ -114,7 +124,7 @@ class WeeklyReportApp(tk.Tk):
             text="程序不会自动推断导出字段；无法唯一匹配或缺少来源的数据留空，并写入校验日志。\n"
                  "新增周次按原模板七天一周延续。A2 推广阶段、G2 发货时间、M 列日目标销量由你手动维护。",
             justify="left",
-        ).grid(row=10, column=0, columnspan=3, sticky="w", pady=8)
+        ).grid(row=12, column=0, columnspan=3, sticky="w", pady=8)
 
     def _build_mcp_tab(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(1, weight=1)
@@ -189,12 +199,12 @@ class WeeklyReportApp(tk.Tk):
         actions = ttk.Frame(parent)
         actions.grid(row=2, column=0, columnspan=4, sticky="ew", pady=8)
         ttk.Button(actions, text="测试 API 身份验证", command=self._test_openapi_auth).pack(side="left")
-        ttk.Button(actions, text="获取店铺列表", command=self._openapi_seller_list).pack(side="left", padx=8)
+        ttk.Button(actions, text="刷新店铺列表", command=self._openapi_seller_list).pack(side="left", padx=8)
 
-        ttk.Label(parent, text="店铺名称 / SID / 站点 / 广告授权状态（响应 Schema 核验后映射）").grid(row=3, column=0, columnspan=4, sticky="w", pady=(6, 2))
+        ttk.Label(parent, text="授权店铺（业务码验证通过后动态映射）").grid(row=3, column=0, columnspan=4, sticky="w", pady=(6, 2))
         self.openapi_seller_tree = ttk.Treeview(
             parent,
-            columns=("seller_name", "sid", "site", "ad_auth"),
+            columns=("seller_name", "sid", "site", "ad_auth", "status"),
             show="headings",
             height=3,
         )
@@ -202,7 +212,8 @@ class WeeklyReportApp(tk.Tk):
             ("seller_name", "店铺名称", 260),
             ("sid", "SID", 150),
             ("site", "站点", 160),
-            ("ad_auth", "广告授权", 180),
+            ("ad_auth", "has_ads_setting 原值", 180),
+            ("status", "status 原值", 120),
         ):
             self.openapi_seller_tree.heading(column, text=heading)
             self.openapi_seller_tree.column(column, width=width, anchor="w")
@@ -222,7 +233,7 @@ class WeeklyReportApp(tk.Tk):
         self.openapi_output.grid(row=9, column=0, columnspan=4, sticky="nsew", pady=4)
         ttk.Label(
             parent,
-            text="已启用 Token 身份验证和只读店铺列表请求。列表响应先以脱敏原始 JSON 显示，业务码与字段需核对；SKU 查询及其他业务接口尚未接入。",
+            text="已启用 Token 身份验证和只读店铺列表请求。列表需通过业务码及字段类型校验后才会更新；status、has_ads_setting 显示原值，SKU 查询尚未接入。",
             wraplength=900,
         ).grid(row=10, column=0, columnspan=4, sticky="w", pady=6)
 
@@ -265,20 +276,68 @@ class WeeklyReportApp(tk.Tk):
 
         self._start_task(authenticate, self.openapi_status, "API 身份验证完成。")
 
+    def _apply_sellers(self, sellers: list[LingxingSeller]) -> None:
+        previous = self._seller_choices.get(self.report_store_var.get())
+        previous_sid = previous.sid if previous else None
+        self._sellers = list(sellers)
+        self._seller_choices = {seller.display_label: seller for seller in self._sellers}
+
+        for item_id in self.openapi_seller_tree.get_children():
+            self.openapi_seller_tree.delete(item_id)
+        for index, seller in enumerate(self._sellers):
+            self.openapi_seller_tree.insert(
+                "",
+                "end",
+                iid=f"seller-{index}",
+                values=(
+                    seller.name,
+                    seller.sid,
+                    seller.site_label,
+                    seller.has_ads_setting,
+                    seller.status,
+                ),
+            )
+
+        labels = tuple(self._seller_choices)
+        self.report_store_combo.configure(values=labels)
+        selected = next(
+            (seller.display_label for seller in self._sellers if seller.sid == previous_sid),
+            labels[0] if labels else "",
+        )
+        self.report_store_var.set(selected)
+        if selected:
+            self.report_status.set(f"已加载 {len(self._sellers)} 家授权店铺；所选店铺的 SID 已自动关联。")
+        else:
+            self.report_status.set("店铺列表为空；无法进行基于 OpenAPI 的店铺查询。")
+
+    def _selected_report_seller(self) -> LingxingSeller | None:
+        return self._seller_choices.get(self.report_store_var.get())
+
+    def _selected_report_sid(self) -> int | None:
+        """Resolve the selected display label to the API SID returned by Lingxing."""
+        seller = self._selected_report_seller()
+        return seller.sid if seller is not None else None
+
     def _openapi_seller_list(self) -> None:
+        if self._busy:
+            return
         try:
             app_id, app_secret = self._openapi_credentials()
         except CredentialStoreError as exc:
             messagebox.showerror("OpenAPI 配置错误", str(exc))
             return
+        self._apply_sellers([])
 
         def query_sellers() -> dict[str, str]:
             with LingxingOpenApiClient(app_id, app_secret) as client:
                 token_result = client.get_access_token()
-                response = client.list_sellers(token_result.token)
+                sellers = client.list_sellers(token_result.token)
+            if not isinstance(sellers, list) or any(not isinstance(item, LingxingSeller) for item in sellers):
+                raise LingxingApiError("店铺响应业务码或记录结构尚未完成官方契约核验，未更新店铺列表。")
             return {
-                "message": "店铺列表端点已返回 HTTP 2xx JSON；请核对响应业务码和字段，尚未判定业务查询成功。",
-                "output": json.dumps(response, ensure_ascii=False, indent=2, default=str)[:80_000],
+                "message": f"领星店铺列表业务查询成功，共 {len(sellers)} 家店铺。",
+                "output": f"已解析并显示 {len(sellers)} 家授权店铺；敏感账号字段不会显示。",
+                "_sellers": sellers,
             }
 
         self._start_task(query_sellers, self.openapi_status, "店铺列表请求完成。")
@@ -365,6 +424,8 @@ class WeeklyReportApp(tk.Tk):
                         self._show_mcp_result(result)
                     elif status_var is self.openapi_status and isinstance(result, dict):
                         status_var.set(result.get("message", title))
+                        if result.get("_sellers") is not None:
+                            self._apply_sellers(result["_sellers"])
                         self._show_openapi_result(result.get("output", status_var.get()))
                     elif isinstance(result, dict):
                         status_var.set(result.get("message", title))

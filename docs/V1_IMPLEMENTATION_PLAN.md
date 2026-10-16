@@ -13,8 +13,8 @@ V1.0 只实现新品推广周报。当前分支为 `feature/weekly-report-v1`，
 ## 当前基线
 
 - 已有：OpenAPI multipart Token 请求、Windows Credential Manager 凭证保存、连接测试 UI、按用户上传的领星 Java SDK 源码实现的签名和店铺列表只读请求；MCP 客户端与安全 Schema 校验；Excel/CSV 导入、D01、D61+、数据校验日志和模板生成。
-- 本阶段新增：OpenAPI 客户端仅在 Token 响应给出明确有效期时进行内存缓存；缺少有效期时每次重新获取。
-- 尚未完成：Windows 真实店铺列表查询与响应 Schema 核验、SKU/ASIN/MSKU 映射、首单日期/每日销量/销售额查询、实际广告花费查询、OpenAPI/MCP 统一数据层以及真实接口到 Excel 的集成。当前 SDK 是 Java，不是 Python；源代码已检查但由于云端未安装 Java 编译器，没有运行官方 SDK。
+- 本阶段新增：OpenAPI 客户端仅在 Token 响应给出明确有效期时进行内存缓存；SellerLists 严格检查 `code=0`、响应信封和 `data` 数组；校验确认的店铺字段类型并动态映射到 GUI 店铺表与周报页下拉框。`status`、`has_ads_setting` 保持原始整数，不推断业务含义。
+- 用户已在 Windows 真实验证过 Token 和店铺列表请求；本分支的业务响应解析/GUI 映射尚待更新后的 Windows 客户端复测。尚未完成：SKU/ASIN/MSKU 映射、首单日期/每日销量/销售额查询、实际广告花费查询、OpenAPI/MCP 统一数据层以及真实接口到 Excel 的集成。当前 SDK 是 Java，不是 Python；源代码已检查但由于云端未安装 Java 编译器，没有运行官方 SDK。
 - 云端夹具测试只验证程序行为，不表示真实接口或真实数据验收。不得用模拟业务结果填正式周报。
 
 ## 阶段和验收标准
@@ -30,18 +30,17 @@ V1.0 只实现新品推广周报。当前分支为 `feature/weekly-report-v1`，
 
 ## 第一阶段执行任务
 
-Token 请求为 `POST /api/auth-server/oauth/access-token`，使用 multipart/form-data 发送 `appId` 与 `appSecret`；用户曾在 Windows 确认 Token 获取成功。店铺列表 GET 请求和签名已实现：Java SDK 的 `ApiSign`/AES 源码定义 ASCII 排序、`key=value` 连接、大写 MD5、AES/ECB/PKCS5Padding、标准 Base64；SDK 请求层使用 UTF-8 `URLEncoder`。本地签名测试向量与 OpenSSL 独立计算结果一致。SDK 样例把 AppID 传入 AES 密钥参数。当前云端未执行 Java SDK（没有 `javac`），也未能访问官方文档站点；SellerLists 响应 Schema 尚未取得，Windows 真实查询仍待执行。接口返回 HTTP 2xx JSON 本身不视为业务成功。
+Token 请求为 `POST /api/auth-server/oauth/access-token`，使用 multipart/form-data 发送 `appId` 与 `appSecret`；用户已在 Windows 确认 Token 获取成功。店铺列表 GET 请求和签名已实现：Java SDK 的 `ApiSign`/AES 源码定义 ASCII 排序、`key=value` 连接、大写 MD5、AES/ECB/PKCS5Padding、标准 Base64；SDK 请求层使用 UTF-8 `URLEncoder`。本地签名测试向量与 OpenSSL 独立计算结果一致。SDK 样例把 AppID 传入 AES 密钥参数。当前云端未执行 Java SDK（没有 `javac`），也未能访问官方文档站点；SellerLists 字段结构来自用户在 Windows 的实际脱敏检查。HTTP 2xx JSON 本身不视为业务成功，仍需检查业务码和响应结构。
 
 实现顺序：
 
 1. 从用户上传的 Java SDK 源码移植并测试签名；覆盖 ASCII 排序、字符串 trim、MD5 大写、AES 填充、Base64 密文和 Java URL 编码。云端已通过固定测试向量及独立 OpenSSL 对照；该测试不等于官方 Java SDK 执行或真实请求验收。
-2. 已按 `GET /erp/sc/data/seller/lists` 实现只读请求和 GUI 脱敏 JSON 输出；不在 GUI 状态或日志显示 AppSecret、Token 或完整签名 URL。响应字段/分页定义需由官方 SellerLists 文档确认后再映射。
-3. 在 Windows 用 Credential Manager 凭证测试 Token 和店铺列表；仅在确认业务码和脱敏字段结构后，阶段 1 才通过。云端不使用用户凭证。
-4. 只有以上真实连接通过后，继续 SKU 映射及每日销售接口。
+2. 按用户提供的脱敏真实字段结构解析 SellerLists：成功码必须是整数 `0`，`data` 必须是直接店铺数组，店铺字段严格按确认类型解析；HTTP 2xx 不会单独被视为业务成功。通过全合成数据测试正常、空列表、业务失败和错误类型。
+3. Windows 刷新店铺列表后，GUI 动态显示名称、SID、站点和两个状态字段的原始值；周报页下拉框绑定实际返回 SID。此版本需在 Windows 本地复测动态列表及店铺选择。
+4. 完成上述复测后，再核验 local SKU→ASIN/MSKU、首单日期和每日销售接口，并使用真实授权数据对照。
 
-## 缺少的官方资料
+## 下一阶段缺少的官方资料
 
-- 店铺列表完整分页及响应字段定义（名称、SID、站点、授权状态）。上传压缩包为 Java SDK，未含 SellerLists Schema；如果官方文档页面在 Windows 可访问，可反馈脱敏字段名称/类型，或上传官方页面 PDF/HTML。
 - local SKU→ASIN/MSKU 映射接口/报表规范。
 - 首单日期、每日销量、销售额接口规范：路径、请求 Schema、分页、时区、日期口径、订单状态/退款处理和响应字段。
 - 后续广告实际花费接口规范：活动/广告组/SKU/ASIN 归属粒度、时区、分页与“实际花费”定义。
@@ -53,6 +52,9 @@ Token 请求为 `POST /api/auth-server/oauth/access-token`，使用 multipart/fo
 1. `git switch feature/weekly-report-v1`，然后 `git pull --ff-only origin feature/weekly-report-v1`。
 2. 在项目目录运行 `run_gui.bat`，在“领星 OpenAPI 连接”页保存 AppID/AppSecret 到 Windows Credential Manager。
 3. 点击“测试 API 身份验证”，仅确认成功状态和有效期。请求来自的 Windows 公网 IP 必须在领星白名单。
-4. 点击“获取店铺列表”，检查请求状态及脱敏 JSON 中的业务码。确认店铺名称、SID、站点和广告授权字段后，回传成功/失败和脱敏字段名称/类型即可；不要回传响应正文、店铺 SID、密钥、Token、签名请求或订单明细。
+4. 点击“刷新店铺列表”。确认成功时有店铺动态显示；`status` 和 `has_ads_setting` 会显示原始值，不对数值含义做假设。
+5. 回到周报页，确认下拉框由接口动态填充，并能选择店铺。此阶段尚未将 SKU 销量查询接入周报生成；当前下拉选择只完成店铺与返回 SID 的本地关联。
+
+只需反馈更新后刷新是否成功、店铺是否出现在两个界面及选择是否可用。不要回传店铺列表正文、SID、Seller ID、AppID、AppSecret、Token 或签名请求。
 
 真实验收必须在用户 Windows 环境完成。云端模拟测试、Token 单测或 SDK 代码审阅均不能替代真实业务数据对照。

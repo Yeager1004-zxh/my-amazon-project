@@ -27,6 +27,111 @@ class LingxingApiNotReady(LingxingApiError):
 
 
 @dataclass(frozen=True)
+class LingxingSeller:
+    """A store record parsed from the documented seller-list response."""
+
+    sid: int = field(repr=False)
+    mid: int = field(repr=False)
+    name: str = field(repr=False)
+    seller_id: str = field(repr=False)
+    account_name: str = field(repr=False)
+    seller_account_id: int = field(repr=False)
+    region: str = field(repr=False)
+    country: str = field(repr=False)
+    marketplace_id: str = field(repr=False)
+    status: int = field(repr=False)
+    has_ads_setting: int = field(repr=False)
+
+    @property
+    def site_label(self) -> str:
+        return " / ".join(value for value in (self.country, self.region, self.marketplace_id) if value) or "未知"
+
+    @property
+    def display_label(self) -> str:
+        return f"{self.name} — {self.site_label} — SID {self.sid}"
+
+
+_SELLER_INTEGER_FIELDS = ("sid", "mid", "seller_account_id", "status", "has_ads_setting")
+_SELLER_STRING_FIELDS = ("name", "seller_id", "account_name", "region", "country", "marketplace_id")
+
+
+def _seller_integer(record: dict[str, Any], key: str) -> int:
+    value = record.get(key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise LingxingApiError(f"店铺响应字段 {key} 的类型无效；要求 integer。")
+    return value
+
+
+def _seller_string(record: dict[str, Any], key: str) -> str:
+    value = record.get(key)
+    if not isinstance(value, str):
+        raise LingxingApiError(f"店铺响应字段 {key} 的类型无效；要求 string。")
+    if key == "name" and not value.strip():
+        raise LingxingApiError("店铺响应字段 name 不能为空。")
+    return value.strip()
+
+
+def parse_seller_records(records: Any) -> list[LingxingSeller]:
+    """Map store records without retaining unrecognized or sensitive response fields."""
+    if not isinstance(records, list):
+        raise LingxingApiError("店铺列表业务响应中的 data 必须是数组。")
+    sellers: list[LingxingSeller] = []
+    seen_sids: set[int] = set()
+    for index, record in enumerate(records):
+        if not isinstance(record, dict):
+            raise LingxingApiError(f"店铺列表第 {index + 1} 条记录不是对象。")
+        # Validate the complete, confirmed SellerLists record contract. Do not
+        # coerce strings/numbers: silently changing IDs can bind a query wrongly.
+        for key in _SELLER_INTEGER_FIELDS:
+            _seller_integer(record, key)
+        for key in _SELLER_STRING_FIELDS:
+            _seller_string(record, key)
+        sid = record["sid"]
+        if sid in seen_sids:
+            raise LingxingApiError("店铺列表包含重复 SID，已停止映射。")
+        seen_sids.add(sid)
+        sellers.append(
+            LingxingSeller(
+                sid=sid,
+                mid=record["mid"],
+                name=record["name"].strip(),
+                seller_id=record["seller_id"].strip(),
+                account_name=record["account_name"].strip(),
+                seller_account_id=record["seller_account_id"],
+                region=record["region"].strip(),
+                country=record["country"].strip(),
+                marketplace_id=record["marketplace_id"].strip(),
+                status=record["status"],
+                has_ads_setting=record["has_ads_setting"],
+            )
+        )
+    return sellers
+
+
+def parse_seller_list_response(payload: Any) -> list[LingxingSeller]:
+    """Parse the confirmed SellerLists envelope and its direct ``data`` array."""
+    if not isinstance(payload, dict):
+        raise LingxingApiError("店铺列表业务响应必须是 JSON 对象。")
+    code = payload.get("code")
+    if isinstance(code, bool) or not isinstance(code, int):
+        raise LingxingApiError("店铺列表响应缺少 integer 类型的业务 code，已拒绝接受响应。")
+    if code != 0:
+        raise LingxingApiError(f"店铺列表业务查询失败（业务 code {code}）。")
+
+    for key, expected_type in (
+        ("message", str),
+        ("error_details", list),
+        ("request_id", str),
+        ("response_time", str),
+    ):
+        if not isinstance(payload.get(key), expected_type):
+            raise LingxingApiError(f"店铺列表响应字段 {key} 的类型无效。")
+    if "data" not in payload:
+        raise LingxingApiError("店铺列表响应缺少 data 数组，已拒绝接受响应。")
+    return parse_seller_records(payload["data"])
+
+
+@dataclass(frozen=True)
 class AccessTokenResult:
     # Keep the token out of accidental repr/log output.
     token: str = field(repr=False)
@@ -253,12 +358,8 @@ class LingxingOpenApiClient:
             (self._app_id, self._app_secret, *sensitive_values),
         )
 
-    def list_sellers(self, access_token: str) -> Any:
-        """Call the read-only seller-list endpoint and return its redacted raw JSON.
-
-        The endpoint response envelope is intentionally not mapped to GUI fields
-        until its official response Schema is available in the development inputs.
-        """
+    def list_sellers(self, access_token: str) -> list[LingxingSeller]:
+        """Call SellerLists and return records only after business/schema validation."""
         if not isinstance(access_token, str) or not access_token.strip():
             raise LingxingApiError("Access Token 为空，未发送店铺列表请求。")
         parameters = {
@@ -267,11 +368,12 @@ class LingxingOpenApiClient:
             "timestamp": str(int(time.time())),
         }
         signed = signed_query_parameters(parameters, self._app_id)
-        return self._request_signed_get(
+        payload = self._request_signed_get(
             SELLER_LIST_PATH,
             signed,
             sensitive_values=(access_token, signed["sign"]),
         )
+        return parse_seller_list_response(payload)
 
     def query_sku_sales(
         self,

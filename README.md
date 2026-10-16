@@ -1,6 +1,6 @@
 # 亚马逊新品推广周报工具
 
-面向 Windows 10/11 的本地新品推广周报工具。V1.0 数据路线为：领星 OpenAPI 作为主数据接口、官方 MCP 作为辅助查询/交叉核验、领星 Excel/CSV 导入作为应急备用；三种来源最终进入统一标准数据层，再复用原周报模板生成器。当前离线 Excel/CSV 周报功能可用，OpenAPI 业务查询和自动写入尚未通过真实接口验收。
+面向 Windows 10/11 的本地新品推广周报工具。V1.0 数据路线为：领星 OpenAPI 作为主数据接口、官方 MCP 作为辅助查询/交叉核验、领星 Excel/CSV 导入作为应急备用；三种来源最终进入统一标准数据层，再复用原周报模板生成器。当前离线 Excel/CSV 周报功能可用。用户已在 Windows 真实验证 Token 和店铺列表接口；本分支现新增业务响应校验、店铺动态解析及 GUI 映射，更新后的客户端仍需在 Windows 本地复测。SKU 销量等 OpenAPI 查询和自动写入尚未接入。
 
 V1.0 分阶段任务、模块输入/输出、依赖、测试和验收门槛见 [正式实施清单](docs/V1_IMPLEMENTATION_PLAN.md)。当前版本仅聚焦新品推广周报。
 
@@ -66,23 +66,23 @@ Codex 云端没有 Windows 本机 MCP 会话、endpoint 或密钥，未连接你
 
 OpenAPI 使用固定官方域名 `https://openapi.lingxing.com`。Token 请求为 `POST /api/auth-server/oauth/access-token`，以 multipart/form-data 发送 `appId` 和 `appSecret`。在“领星 OpenAPI 连接”页安全保存凭证后，界面只显示身份验证结果和响应中可识别的有效期，不显示 Access Token。
 
-已根据本次上传的领星 **Java** SDK 源码实现签名和只读店铺列表请求：`GET /erp/sc/data/seller/lists`。签名按 ASCII 参数名排序、使用 SDK 的字符串转换/去空格规则拼接 `key=value`、计算大写 MD5，再用 AppID 执行 AES/ECB/PKCS5Padding，密文使用标准 Base64，并按 Java `URLEncoder` 的 UTF-8 规则编码查询参数。Python SDK 并未包含在压缩包内；本项目只移植与签名相关的 SDK 行为，没有复制其会输出签名输入的日志代码。签名向量已用独立 OpenSSL 结果核对，但当前环境没有 Java 编译器，未执行官方 Java SDK。本阶段的模拟测试不代表领星真实接口已打通。
+已根据本次上传的领星 **Java** SDK 源码实现签名和只读店铺列表请求：`GET /erp/sc/data/seller/lists`。签名按 ASCII 参数名排序、使用 SDK 的字符串转换/去空格规则拼接 `key=value`、计算大写 MD5，再用 AppID 执行 AES/ECB/PKCS5Padding，密文使用标准 Base64，并按 Java `URLEncoder` 的 UTF-8 规则编码查询参数。Python SDK 并未包含在压缩包内；本项目只移植与签名相关的 SDK 行为，没有复制其会输出签名输入的日志代码。签名向量已用独立 OpenSSL 结果核对，但当前环境没有 Java 编译器，未执行官方 Java SDK。
 
-店铺列表响应会在 GUI 中显示经过脱敏的原始 JSON，避免在没有核实响应 Schema 时猜测字段映射。此请求获得 HTTP 2xx JSON 不等于业务查询成功；需检查业务响应码和店铺字段。领星官方文档页面未能在当前云端环境访问，SellerLists 响应字段/分页仍未核实。SKU→ASIN/MSKU 映射、首单日期、每日销量/销售额的接口参数、分页和字段口径也尚未实现；广告接口未接入。
+店铺列表仅在业务 `code` 为整数 `0`、`data` 为直接数组且信封和每条店铺记录类型有效时才视为成功。名称、SID、站点会动态显示在 GUI 的店铺列表和周报页下拉框中；下拉框选项在内存中关联接口返回的 SID，不硬编码店铺。`status` 和 `has_ads_setting` 只显示接口返回的原始整数，不推断其业务含义。用户已在 Windows 报告过真实店铺列表接口成功；当前分支的结构解析与映射使用合成数据测试，更新后仍需按下文步骤在 Windows 本地复测。SKU→ASIN/MSKU 映射、首单日期、每日销量/销售额的接口参数、分页和字段口径尚未实现；广告接口未接入。
 
 ### 第一阶段 Windows 首测
 
 1. 更新开发分支并启动：`git switch feature/weekly-report-v1`、`git pull --ff-only origin feature/weekly-report-v1`、`run_gui.bat`。如 pip 环境尚未更新，先运行 `python -m pip install -r requirements.txt`。
 2. 在“领星 OpenAPI 连接”页安全保存 AppID/AppSecret（只写入 Windows Credential Manager）。
 3. 点击“测试 API 身份验证”，确认结果只显示成功/错误和有效期，不显示 Token。请求需从已加入领星 IP 白名单的 Windows 公网出口发出。
-4. 点击“获取店铺列表”。程序会获取 Token 并发送已签名 GET 请求；界面只显示脱敏 JSON。先确认 HTTP/业务响应码，再核对响应中店铺名称、SID、站点和广告授权字段。不要将响应正文、店铺 SID 或 Token 回传到聊天。
-5. 只反馈请求成功/失败、脱敏后的字段名称与类型，以及是否能看到授权店铺。真实响应字段需要根据官方 SellerLists 文档确认后，才会做结构化映射。
+4. 点击“刷新店铺列表”。程序会获取 Token 并发送已签名 GET 请求。成功时需满足业务 `code=0` 和确认过的响应字段类型；GUI 会显示店铺名称、SID、站点以及 `status`、`has_ads_setting` 的原始值。
+5. 打开“新品推广周报”页，确认店铺下拉框已从接口动态填充。选择一项时会在内存中关联响应里的 SID；当前 OpenAPI 销量查询尚未实现，现有 Excel/CSV 周报仍从导入文件读取数据。
+6. 可再次点击“刷新店铺列表”验证新增或变更店铺会重新读取。不要将响应正文、Seller ID、SID、Token 或请求记录回传到聊天。
 
 云端自动化测试使用 HTTP 模拟夹具，仅验证请求构造、Token 生命周期和错误脱敏；不代表真实 API 或业务数据验收。不要将 AppID、AppSecret、Access Token、完整签名 URL 或真实报表发到聊天或 GitHub。
 
-### 仍需的领星官方资料
+### 下一阶段所需的领星官方资料
 
-- 店铺列表接口完整响应字段定义（店铺名称、SID、站点、授权状态及分页规则）。压缩包只含 Java SDK，未包含 SellerLists 接口 Schema；若官方页面在你的 Windows 环境可访问，请按上述方式回传脱敏字段名称/类型，或上传官方接口文档页面的 PDF/HTML。
 - local SKU→ASIN/MSKU 的官方查询接口/报表定义。
 - 历史首单日期、每日销量和销售额接口的路径、参数、分页、日期时区、订单状态/退款口径及响应字段。
 

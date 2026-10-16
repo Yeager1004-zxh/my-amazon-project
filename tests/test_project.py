@@ -30,6 +30,7 @@ from amazon_weekly_report.providers.lingxing_api import (
     LingxingApiError,
     LingxingApiNotReady,
     LingxingOpenApiClient,
+    parse_seller_list_response,
 )
 from amazon_weekly_report.providers.lingxing_signing import (
     LingxingSignatureError,
@@ -612,6 +613,95 @@ class McpClientTests(unittest.TestCase):
 
 
 class LingxingOpenApiTests(unittest.TestCase):
+    @staticmethod
+    def _seller_record() -> dict[str, object]:
+        return {
+            "sid": 987654,
+            "mid": 3001,
+            "name": "Synthetic Store",
+            "seller_id": "synthetic-seller-id",
+            "account_name": "synthetic-account",
+            "seller_account_id": 40001,
+            "region": "R_TEST",
+            "country": "ZZ",
+            "marketplace_id": "MARKETPLACE_TEST",
+            "status": 17,
+            "has_ads_setting": 23,
+        }
+
+    @classmethod
+    def _seller_response(cls, data: object | None = None) -> dict[str, object]:
+        return {
+            "code": 0,
+            "message": "success",
+            "error_details": [],
+            "request_id": "synthetic-request-id",
+            "response_time": "2026-01-02T03:04:05Z",
+            "data": [cls._seller_record()] if data is None else data,
+        }
+
+    def test_seller_response_requires_business_success_code_and_maps_fields(self) -> None:
+        payload = self._seller_response()
+        sellers = parse_seller_list_response(payload)
+        self.assertEqual(len(sellers), 1)
+        seller = sellers[0]
+        self.assertEqual(seller.sid, 987654)
+        self.assertEqual(seller.mid, 3001)
+        self.assertEqual(seller.name, "Synthetic Store")
+        self.assertEqual(seller.seller_id, "synthetic-seller-id")
+        self.assertEqual(seller.account_name, "synthetic-account")
+        self.assertEqual(seller.seller_account_id, 40001)
+        self.assertEqual(seller.site_label, "ZZ / R_TEST / MARKETPLACE_TEST")
+        # These values remain raw integers; no business meaning is inferred.
+        self.assertEqual(seller.has_ads_setting, 23)
+        self.assertEqual(seller.status, 17)
+        self.assertEqual(seller.display_label, "Synthetic Store — ZZ / R_TEST / MARKETPLACE_TEST — SID 987654")
+        self.assertNotIn("synthetic-seller-id", repr(seller))
+        self.assertNotIn("987654", repr(seller))
+
+    def test_seller_response_accepts_empty_direct_data_array(self) -> None:
+        self.assertEqual(parse_seller_list_response(self._seller_response([])), [])
+
+    def test_seller_response_rejects_business_errors_and_wrong_envelope_types(self) -> None:
+        with self.assertRaisesRegex(LingxingApiError, "业务 code 9"):
+            parse_seller_list_response({**self._seller_response(), "code": 9})
+        with self.assertRaisesRegex(LingxingApiError, "integer 类型的业务 code"):
+            parse_seller_list_response({**self._seller_response(), "code": "0"})
+        with self.assertRaisesRegex(LingxingApiError, "integer 类型的业务 code"):
+            parse_seller_list_response({**self._seller_response(), "code": True})
+        with self.assertRaisesRegex(LingxingApiError, "data 数组"):
+            parse_seller_list_response({key: value for key, value in self._seller_response().items() if key != "data"})
+        with self.assertRaisesRegex(LingxingApiError, "data 必须是数组"):
+            parse_seller_list_response(self._seller_response({"list": [self._seller_record()]}))
+        for field, wrong_value in (
+            ("message", 1),
+            ("error_details", "none"),
+            ("request_id", 12),
+            ("response_time", None),
+        ):
+            with self.subTest(field=field), self.assertRaisesRegex(LingxingApiError, f"{field} 的类型无效"):
+                parse_seller_list_response({**self._seller_response(), field: wrong_value})
+
+    def test_seller_response_rejects_missing_or_wrong_record_field_types(self) -> None:
+        for field in ("sid", "mid", "seller_account_id", "status", "has_ads_setting"):
+            record = self._seller_record()
+            record[field] = "not-an-integer"
+            with self.subTest(field=field), self.assertRaisesRegex(LingxingApiError, f"字段 {field} 的类型无效"):
+                parse_seller_list_response(self._seller_response([record]))
+        for field in ("name", "seller_id", "account_name", "region", "country", "marketplace_id"):
+            record = self._seller_record()
+            record[field] = 123
+            with self.subTest(field=field), self.assertRaisesRegex(LingxingApiError, f"字段 {field} 的类型无效"):
+                parse_seller_list_response(self._seller_response([record]))
+        record = self._seller_record()
+        del record["seller_id"]
+        with self.assertRaisesRegex(LingxingApiError, "字段 seller_id 的类型无效"):
+            parse_seller_list_response(self._seller_response([record]))
+        record = self._seller_record()
+        record["sid"] = True
+        with self.assertRaisesRegex(LingxingApiError, "字段 sid 的类型无效"):
+            parse_seller_list_response(self._seller_response([record]))
+
     def test_signature_matches_reference_algorithm_vector(self) -> None:
         app_id = "ak_0123456789abc"
         parameters = {
@@ -648,7 +738,7 @@ class LingxingOpenApiTests(unittest.TestCase):
         encoded = encode_query_parameters({"value": "a b+/%~=中", "sign": "A+/="})
         self.assertEqual(encoded, "value=a+b%2B%2F%25%7E%3D%E4%B8%AD&sign=A%2B%2F%3D")
 
-    def test_list_sellers_sends_sdk_signed_get_and_redacts_response(self) -> None:
+    def test_list_sellers_sends_sdk_signed_get_and_parses_business_response(self) -> None:
         app_id = "ak_0123456789abc"
         token = "fixture-token"
         requests: list[httpx.Request] = []
@@ -658,11 +748,13 @@ class LingxingOpenApiTests(unittest.TestCase):
             return httpx.Response(
                 200,
                 json={
-                    "code": "0",
-                    "msg": "ok",
+                    "code": 0,
+                    "message": "success",
+                    "error_details": [],
+                    "request_id": "synthetic-request-id",
+                    "response_time": "2026-01-02T03:04:05Z",
                     "data": [
-                        {"seller_name": "Fixture Store", "sid": 123456, "access_token": token},
-                        {"appId": app_id, "ad_auth": True},
+                        self._seller_record(),
                     ],
                 },
             )
@@ -687,10 +779,21 @@ class LingxingOpenApiTests(unittest.TestCase):
             query["sign"],
             [generate_signature({"access_token": token, "app_key": app_id, "timestamp": 1639734344}, app_id)],
         )
-        self.assertEqual(response["code"], "0")
-        self.assertEqual(response["data"][0]["seller_name"], "Fixture Store")
-        self.assertEqual(response["data"][0]["access_token"], "[已隐藏]")
-        self.assertEqual(response["data"][1]["appId"], "[已隐藏]")
+        self.assertEqual(len(response), 1)
+        self.assertEqual(response[0].name, "Synthetic Store")
+        self.assertEqual(response[0].sid, 987654)
+        self.assertEqual(response[0].has_ads_setting, 23)
+        http.close()
+
+    def test_list_sellers_rejects_http_200_business_error(self) -> None:
+        payload = self._seller_response()
+        payload["code"] = 41
+        http = httpx.Client(
+            transport=httpx.MockTransport(lambda _request: httpx.Response(200, json=payload))
+        )
+        with LingxingOpenApiClient("ak_0123456789abc", "fixture-app-secret", http_client=http) as client:
+            with self.assertRaisesRegex(LingxingApiError, "业务 code 41"):
+                client.list_sellers("fixture-token")
         http.close()
 
     def test_list_sellers_http_error_does_not_echo_token_or_signature(self) -> None:
