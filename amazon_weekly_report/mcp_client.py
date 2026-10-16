@@ -355,9 +355,13 @@ def build_action_arguments(action_tool: McpTool, business_tool: BusinessTool, ar
     envelope = {id_key: business_tool.tool_id, args_key: arguments}
     dynamic_schema = copy.deepcopy(schema)
     dynamic_properties = dynamic_schema["properties"]
-    dynamic_params_schema = copy.deepcopy(action_params_schema)
-    dynamic_params_schema.update(copy.deepcopy(business_params_schema))
-    dynamic_properties[args_key] = dynamic_params_schema
+    # The wrapper only defines that params is an object. Its placeholder
+    # constraints (often an empty properties map plus additionalProperties=false)
+    # do not describe the dynamic business arguments and must not leak into the
+    # effective schema. The current search result is authoritative for that
+    # nested object; the root action schema still validates tool ID, params
+    # object structure, required envelope fields, and extra envelope fields.
+    dynamic_properties[args_key] = copy.deepcopy(business_params_schema)
     validate_json_schema(dynamic_schema, envelope, path="action 参数")
     return envelope
 

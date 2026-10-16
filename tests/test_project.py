@@ -477,7 +477,15 @@ class McpClientTests(unittest.TestCase):
                 "type": "object",
                 "properties": {
                     "toolId": {"type": "string"},
-                    "params": {"type": "object", "properties": {}, "additionalProperties": False},
+                    # This placeholder can carry constraints unrelated to the
+                    # dynamically searched business schema. It must not
+                    # reject valid business params such as offset/length.
+                    "params": {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": False,
+                        "maxProperties": 0,
+                    },
                 },
                 "required": ["toolId", "params"],
                 "additionalProperties": False,
