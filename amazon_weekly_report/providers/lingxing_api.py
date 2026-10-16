@@ -13,6 +13,7 @@ from typing import Any
 
 import httpx
 
+from ..ad_attribution import PromotionTargetEvidence
 from .lingxing_signing import (
     encode_query_parameters,
     signed_post_query_parameters,
@@ -113,6 +114,8 @@ class SpProductAdSpend:
     campaign_id: str = field(repr=False)
     cost: Decimal = field(repr=False)
     profile_id: str = field(default="", repr=False)
+    source: str = field(default="product_report", repr=False)
+    allocation_verified: bool = field(default=False, repr=False)
 
 
 @dataclass(frozen=True)
@@ -163,6 +166,8 @@ class SpAdSpendWindow:
     detail_cost_total: Decimal | None = field(default=None, repr=False)
     unattributed_cost: Decimal | None = field(default=None, repr=False)
     report_complete: bool = field(default=False, repr=False)
+    promotion_targets: tuple[PromotionTargetEvidence, ...] = field(default=(), repr=False)
+    promotion_catalog_complete: bool = field(default=False, repr=False)
 
 
 def split_date_windows(start_date: date, end_date: date, *, max_days: int = MAX_PRODUCT_QUERY_DAYS) -> list[tuple[date, date]]:
@@ -1213,16 +1218,21 @@ class LingxingOpenApiClient:
         if not mappings or any(not isinstance(item, SkuProductMapping) for item in mappings):
             raise LingxingApiError(f"{ad_type} 广告查询需要已验证的 local SKU→MSKU 映射。")
         local_by_msku: dict[str, tuple[str, str]] = {}
+        ambiguous_mskus: set[str] = set()
         seen_local: set[str] = set()
         for mapping in mappings:
             local_key = mapping.local_sku.casefold()
-            if local_key in seen_local or not mapping.seller_skus:
-                raise LingxingApiError(f"{ad_type} 广告查询的 SKU 映射重复或没有 MSKU。")
+            if local_key in seen_local or not (mapping.seller_skus or mapping.asins):
+                raise LingxingApiError(f"{ad_type} 广告查询的 SKU 映射重复或没有可识别的 MSKU/ASIN。")
             seen_local.add(local_key)
             for seller_sku in mapping.seller_skus:
                 key = seller_sku.casefold()
+                if key in ambiguous_mskus:
+                    continue
                 if key in local_by_msku and local_by_msku[key][0] != mapping.local_sku:
-                    raise LingxingApiError(f"多个 local SKU 共用同一 MSKU，{ad_type} 成本无法唯一归属。")
+                    local_by_msku.pop(key)
+                    ambiguous_mskus.add(key)
+                    continue
                 local_by_msku[key] = (mapping.local_sku, seller_sku)
 
         windows: list[SpAdSpendWindow] = []

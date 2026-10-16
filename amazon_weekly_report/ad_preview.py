@@ -7,6 +7,16 @@ from datetime import date, timedelta
 from decimal import Decimal
 from typing import Mapping, Sequence
 
+from .ad_attribution import (
+    AdCostEvidence,
+    AdGroupCostEvidence,
+    AttributionMapping,
+    AttributedAdCost,
+    CampaignCostEvidence,
+    ExclusiveAdGroupAttribution,
+    attribute_ad_costs,
+    attribute_exclusive_ad_group_costs,
+)
 from .providers.lingxing_api import SpAdSpendWindow, SkuProductMapping
 
 
@@ -29,6 +39,8 @@ class AdSpendDetailPreview:
     report_level: str
     local_sku: str
     report_sku: str
+    asin: str
+    ad_id: str
     profile_id: str
     campaign_id: str
     ad_group_id: str
@@ -36,54 +48,128 @@ class AdSpendDetailPreview:
     integrity: str
 
 
+@dataclass(frozen=True)
+class _WindowAttribution:
+    product_rows: tuple[AttributedAdCost, ...] = ()
+    ad_group_rows: tuple[ExclusiveAdGroupAttribution, ...] = ()
+
+
 def _money(value: Decimal | None) -> str:
     return "" if value is None else format(value, "f")
 
 
-def _type_state(kind: str, window: SpAdSpendWindow | None, *, sku_cost_known: bool = False) -> str:
+def _type_state(kind: str, window: SpAdSpendWindow | None, *, matched_rows: int = 0) -> str:
     if window is None:
         return f"{kind} 查询结果缺失（未知）"
+    if matched_rows:
+        blocked = len(window.discrepancies)
+        suffix = f"；另有 {blocked} 个活动未核平并被隔离" if blocked else ""
+        return f"{kind} {matched_rows} 条费用按 MSKU/ASIN 精确匹配本地 SKU{suffix}"
+    if kind == "SB" and not window.product_rows:
+        if window.report_complete:
+            if window.promotion_targets and window.promotion_catalog_complete:
+                return "SB 推广商品目录已核验，但没有该 SKU 的独占广告组费用记录"
+            return "SB 活动/广告组成本已核平；商品推广身份接口未接入，费用待自动归属"
+        if window.discrepancies:
+            return "SB 活动与广告组成本未核平；归属与金额均未知"
+        return "SB 活动或广告组无记录（未知，不视为零）"
     if not window.report_complete:
         if window.discrepancies:
-            return f"{kind} 活动与明细成本不一致（归属被阻止）"
-        return f"{kind} 活动或明细无记录（未知，不视为零）"
-    if kind == "SB":
-        return "SB 活动与广告组成本核平；无 SKU/ASIN 字段，保持店铺级未归属"
-    if sku_cost_known:
-        return f"{kind} 活动与商品成本核平；SKU 候选归属待 Windows 验证"
+            return f"{kind} 部分活动未核平；相关记录阻止归属"
+        return f"{kind} 活动或商品明细无记录（未知，不视为零）"
     return f"{kind} 商品报表无该 SKU 记录（未知，不视为零）"
 
 
 def _window_state(kind: str, window: SpAdSpendWindow | None) -> str:
     if window is None:
-        return f"{kind} 查询结果缺失（未知）"
+        return f"{kind} 查询结果缺失"
     if window.report_complete:
-        detail = "广告组" if kind == "SB" else "商品"
+        if kind == "SB":
+            detail = "ASIN 分摊" if window.product_rows else "广告组"
+        else:
+            detail = "商品"
         return f"{kind} 活动与{detail}成本已核平"
     if window.discrepancies:
-        return f"{kind} 活动与明细成本不一致，金额未知"
+        return f"{kind} 活动与明细成本不一致，相关活动金额未知"
     return f"{kind} 活动或明细报表缺记录，金额未知"
+
+
+def _normalized_attribution(window: SpAdSpendWindow, store_sid: int, mappings: Sequence[SkuProductMapping]) -> _WindowAttribution:
+    campaigns = [
+        CampaignCostEvidence(
+            window.ad_type, store_sid, row.report_date, row.profile_id, row.campaign_id, row.cost
+        )
+        for row in window.campaign_rows
+    ]
+    product_costs = [
+        AdCostEvidence(
+            ad_type=window.ad_type,
+            store_sid=store_sid,
+            report_date=row.report_date,
+            profile_id=row.profile_id,
+            campaign_id=row.campaign_id,
+            ad_group_id=row.ad_group_id,
+            ad_id=row.ad_id,
+            seller_sku=row.sku,
+            asin=row.asin,
+            cost=row.cost,
+            source=row.source,
+            allocation_verified=row.allocation_verified,
+        )
+        for row in window.product_rows
+    ]
+    result = attribute_ad_costs(
+        store_sid=store_sid,
+        mappings=[AttributionMapping(item.local_sku, item.seller_skus, item.asins) for item in mappings],
+        product_costs=product_costs,
+        campaign_costs=campaigns,
+    )
+    if window.ad_type == "SB" and not window.product_rows and window.ad_group_rows:
+        group_result = attribute_exclusive_ad_group_costs(
+            store_sid=store_sid,
+            mappings=[AttributionMapping(item.local_sku, item.seller_skus, item.asins) for item in mappings],
+            promoted_targets=window.promotion_targets,
+            ad_group_costs=[
+                AdGroupCostEvidence("SB", store_sid, row.report_date, row.profile_id, row.campaign_id, row.ad_group_id, row.cost)
+                for row in window.ad_group_rows
+            ],
+            campaign_costs=campaigns,
+            promotion_catalog_complete=window.promotion_catalog_complete,
+        )
+        group_rows = tuple(group_result.rows)
+    else:
+        group_rows = ()
+    return _WindowAttribution(tuple(result.rows), group_rows)
 
 
 def build_ad_spend_preview(
     *,
     windows_by_type: Mapping[str, Sequence[SpAdSpendWindow]],
     mappings: Sequence[SkuProductMapping],
+    store_sid: int,
     requested_skus: Sequence[str],
     start_date: date,
     end_date: date,
 ) -> tuple[list[AdSpendSummaryPreview], list[AdSpendDetailPreview]]:
-    """Build preview rows without treating absent records as zero or adding types.
+    """Build preview rows using exact product identifiers, without adding levels.
 
-    Campaign totals are reconciliation references only. Product/ad-group detail
-    costs are used for their own level, and never added again to campaign costs.
-    Currency and report-date timezone are undocumented, so cross-type totals are
-    deliberately blank.
+    SP/SD product rows are attributed by unique, exact MSKU and/or ASIN matches.
+    SB can use the same path once an adapter supplies verified product/allocation
+    rows. Activity totals remain reconciliation references only. Currency,
+    report-date timezone and historical identity validity are not yet certified,
+    so these values remain previews and the cross-type total remains blank.
     """
     if end_date < start_date:
         raise ValueError("广告预览日期范围无效。")
+    if isinstance(store_sid, bool) or not isinstance(store_sid, int) or store_sid <= 0:
+        raise ValueError("广告预览必须使用所选店铺的有效 SID。")
     kinds = ("SP", "SB", "SD")
     by_kind_date: dict[str, dict[date, SpAdSpendWindow]] = {}
+    outcomes_by_window: dict[tuple[str, date], _WindowAttribution] = {}
+    mapped_costs: dict[tuple[str, date, str], Decimal] = {}
+    matched_counts: dict[tuple[str, date, str], int] = {}
+    unmatched_costs: dict[tuple[str, date], Decimal | None] = {}
+
     for kind in kinds:
         day_map: dict[date, SpAdSpendWindow] = {}
         for window in windows_by_type.get(kind, ()):
@@ -92,6 +178,27 @@ def build_ad_spend_preview(
             if window.start_date in day_map:
                 raise ValueError(f"{kind} 报表日期重复，不能构建汇总预览。")
             day_map[window.start_date] = window
+            outcomes = _normalized_attribution(window, store_sid, mappings)
+            outcomes_by_window[(kind, window.start_date)] = outcomes
+            for outcome in outcomes.product_rows:
+                if outcome.local_sku:
+                    key = (kind, window.start_date, outcome.local_sku.casefold())
+                    mapped_costs[key] = mapped_costs.get(key, Decimal("0")) + outcome.evidence.cost
+                    matched_counts[key] = matched_counts.get(key, 0) + 1
+            for outcome in outcomes.ad_group_rows:
+                if outcome.local_sku:
+                    key = (kind, window.start_date, outcome.local_sku.casefold())
+                    mapped_costs[key] = mapped_costs.get(key, Decimal("0")) + outcome.evidence.cost
+                    matched_counts[key] = matched_counts.get(key, 0) + 1
+
+            if window.report_complete:
+                unmatched_costs[(kind, window.start_date)] = sum(
+                    (row.evidence.cost for row in outcomes.product_rows if not row.local_sku), Decimal("0")
+                ) + sum(
+                    (row.evidence.cost for row in outcomes.ad_group_rows if not row.local_sku), Decimal("0")
+                )
+            else:
+                unmatched_costs[(kind, window.start_date)] = None
         by_kind_date[kind] = day_map
 
     summaries: list[AdSpendSummaryPreview] = []
@@ -102,24 +209,14 @@ def build_ad_spend_preview(
         day_text = report_day.isoformat()
         day_windows = {kind: by_kind_date[kind].get(report_day) for kind in kinds}
 
-        mapped_costs: dict[str, dict[str, Decimal]] = {kind: {} for kind in ("SP", "SD")}
-        for kind in ("SP", "SD"):
-            window = day_windows[kind]
-            if window is not None and window.report_complete:
-                for spend in window.sku_daily_spends:
-                    key = spend.local_sku.casefold()
-                    mapped_costs[kind][key] = mapped_costs[kind].get(key, Decimal("0")) + spend.actual_spend
-
         for local_sku in requested_skus:
             sku_key = local_sku.casefold()
-            sku_states: list[str] = []
             values: dict[str, str] = {}
+            states: list[str] = []
             for kind in kinds:
-                window = day_windows[kind]
-                value = mapped_costs.get(kind, {}).get(sku_key) if kind in ("SP", "SD") else None
-                known = value is not None
-                values[kind] = _money(value)
-                sku_states.append(_type_state(kind, window, sku_cost_known=known))
+                key = (kind, report_day, sku_key)
+                values[kind] = _money(mapped_costs.get(key))
+                states.append(_type_state(kind, day_windows[kind], matched_rows=matched_counts.get(key, 0)))
             summaries.append(AdSpendSummaryPreview(
                 report_date=day_text,
                 local_sku=local_sku,
@@ -128,32 +225,32 @@ def build_ad_spend_preview(
                 sd_cost=values["SD"],
                 confirmed_total="",
                 unattributed_cost="",
-                integrity="；".join(sku_states + ["跨类型币种/日期口径未核验，合计留空"]),
+                integrity="；".join(states + ["精确 ID 自动归属供预览；币种/日期口径/历史映射时效尚未全部验收，合计留空"]),
             ))
 
         unallocated_parts: list[str] = []
-        unallocated_costs: dict[str, str] = {}
+        unallocated_values: dict[str, str] = {}
         for kind in kinds:
             window = day_windows[kind]
-            cost = window.unattributed_cost if window is not None and window.report_complete else None
-            unallocated_costs[kind] = _money(cost)
+            value = unmatched_costs.get((kind, report_day)) if window is not None else None
+            unallocated_values[kind] = _money(value)
             if window is None:
                 unallocated_parts.append(f"{kind}=查询结果缺失")
-            elif not window.report_complete:
-                unallocated_parts.append(f"{kind}=未知（报表未完整核对）")
+            elif value is None:
+                unallocated_parts.append(f"{kind}=未知（未完整核对）")
             else:
-                unallocated_parts.append(f"{kind}={_money(cost)}")
+                unallocated_parts.append(f"{kind}={_money(value)}")
         summaries.append(AdSpendSummaryPreview(
             report_date=day_text,
             local_sku="未归属（店铺级）",
-            sp_cost=unallocated_costs["SP"],
-            sb_cost=unallocated_costs["SB"],
-            sd_cost=unallocated_costs["SD"],
+            sp_cost=unallocated_values["SP"],
+            sb_cost=unallocated_values["SB"],
+            sd_cost=unallocated_values["SD"],
             confirmed_total="",
             unattributed_cost="；".join(unallocated_parts),
             integrity="；".join(
                 [_window_state(kind, day_windows[kind]) for kind in kinds]
-                + ["各类型未归属金额分开列示；币种/日期口径未核验，不相加"]
+                + ["活动费用不与商品/分摊明细相加；未归属费用按类型分开显示"]
             ),
         ))
 
@@ -164,34 +261,31 @@ def build_ad_spend_preview(
             discrepancy_campaigns = {(item.profile_id, item.campaign_id) for item in window.discrepancies}
             for row in window.campaign_rows:
                 state = (
-                    "活动级核对基准；不要与明细费用相加；该活动存在差异"
+                    "活动级核对基准；不与明细相加；活动存在差异"
                     if (row.profile_id, row.campaign_id) in discrepancy_campaigns
-                    else "活动级核对基准；不要与明细费用相加"
+                    else "活动级核对基准；不与明细相加"
                 )
                 details.append(AdSpendDetailPreview(
-                    day_text, kind, "活动总额（仅核对）", "", "", row.profile_id,
-                    row.campaign_id, "", _money(row.cost), state
+                    day_text, kind, "活动总额（仅核对）", "", "", "", "", row.profile_id,
+                    row.campaign_id, "", _money(row.cost), state,
                 ))
-            for row in window.product_rows:
-                local_sku = next(
-                    (mapping.local_sku for mapping in mappings
-                     if any(seller_sku.casefold() == row.sku.casefold() for seller_sku in mapping.seller_skus)),
-                    "",
-                )
-                if (row.profile_id, row.campaign_id) in discrepancy_campaigns or not window.report_complete:
-                    state = "活动与商品成本未核平；不能归属到 SKU"
-                    local_sku = ""
-                elif local_sku:
-                    state = "MSKU 精确匹配；候选归属待 Windows 真实验证"
-                else:
-                    state = "未匹配本次 SKU 映射；留在店铺级未归属费用"
+            outcomes = outcomes_by_window.get((kind, report_day), _WindowAttribution())
+            for row, outcome in zip(window.product_rows, outcomes.product_rows):
                 details.append(AdSpendDetailPreview(
-                    day_text, kind, "商品记录", local_sku, row.sku, row.profile_id, row.campaign_id,
-                    row.ad_group_id, _money(row.cost), state,
+                    day_text, kind, "商品/分摊明细", outcome.local_sku, row.sku, row.asin, row.ad_id,
+                    row.profile_id, row.campaign_id, row.ad_group_id, _money(row.cost), outcome.status,
                 ))
             for row in window.ad_group_rows:
+                outcome = next((item for item in outcomes.ad_group_rows if (
+                    item.evidence.report_date == row.report_date
+                    and item.evidence.profile_id == row.profile_id
+                    and item.evidence.campaign_id == row.campaign_id
+                    and item.evidence.ad_group_id == row.ad_group_id
+                )), None)
                 details.append(AdSpendDetailPreview(
-                    day_text, kind, "广告组记录（不重复计费）", "", "", row.profile_id, row.campaign_id,
-                    row.ad_group_id, _money(row.cost), "无 SKU/ASIN 字段；仅用于和活动总额核对",
+                    day_text, kind, "广告组费用" if outcome and outcome.local_sku else "广告组记录（不重复计费）",
+                    outcome.local_sku if outcome else "", "", "", "", row.profile_id,
+                    row.campaign_id, row.ad_group_id, _money(row.cost),
+                    outcome.status if outcome else "只用于和活动总额核对，不重复计费",
                 ))
     return summaries, details

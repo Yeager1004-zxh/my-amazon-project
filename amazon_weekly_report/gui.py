@@ -176,7 +176,7 @@ class WeeklyReportApp(tk.Tk):
             row=4, column=1, columnspan=4, sticky="w", padx=4, pady=(8, 3)
         )
         self.report_ad_status = tk.StringVar(
-            value="查询 SP、SB、SD 日报；缺少记录不视为零。币种、报表日期时区及 SB 视频覆盖范围需本机核验。"
+            value="按广告商品 MSKU/ASIN 自动匹配；SB 商品目录/分摊接口及日期币种口径仍待核验。"
         )
         ttk.Label(query_box, textvariable=self.report_ad_status, wraplength=900).grid(
             row=5, column=0, columnspan=5, sticky="w", padx=4, pady=(0, 3)
@@ -215,7 +215,7 @@ class WeeklyReportApp(tk.Tk):
             row=9, column=0, columnspan=5, sticky="w", padx=4, pady=(5, 2)
         )
         ad_detail_columns = (
-            "report_date", "ad_type", "report_level", "local_sku", "report_sku",
+            "report_date", "ad_type", "report_level", "local_sku", "report_sku", "asin", "ad_id",
             "profile_id", "campaign_id", "ad_group_id", "cost", "integrity",
         )
         self.report_ad_detail_tree = ttk.Treeview(
@@ -227,6 +227,8 @@ class WeeklyReportApp(tk.Tk):
             ("report_level", "报表粒度", 155),
             ("local_sku", "本地 SKU", 120),
             ("report_sku", "报表 SKU/MSKU", 130),
+            ("asin", "ASIN", 115),
+            ("ad_id", "Ad ID", 110),
             ("profile_id", "Profile ID", 135),
             ("campaign_id", "Campaign ID", 145),
             ("ad_group_id", "Ad Group ID", 130),
@@ -625,9 +627,13 @@ class WeeklyReportApp(tk.Tk):
                     end_date=end_date,
                 )
                 by_sku = {item.local_sku.casefold(): item for item in mappings}
-                missing = [sku for sku in local_skus if sku.casefold() not in by_sku or not by_sku[sku.casefold()].seller_skus]
+                missing = [
+                    sku for sku in local_skus
+                    if sku.casefold() not in by_sku
+                    or not (by_sku[sku.casefold()].seller_skus or by_sku[sku.casefold()].asins)
+                ]
                 if missing:
-                    raise LingxingApiError("以下 SKU 没有完整 MSKU 映射，未查询广告费用：" + ", ".join(missing))
+                    raise LingxingApiError("以下 SKU 没有可用于广告识别的 MSKU/ASIN 映射：" + ", ".join(missing))
                 selected_mappings = [by_sku[sku.casefold()] for sku in local_skus]
                 windows_by_type = {
                     "SP": client.query_sp_ad_spend_history(
@@ -654,6 +660,7 @@ class WeeklyReportApp(tk.Tk):
             return {
                 "_ad_windows_by_type": windows_by_type,
                 "_ad_mappings": mappings,
+                "_ad_store_sid": seller.sid,
                 "_ad_requested_skus": local_skus,
                 "_ad_store_name": seller.name,
                 "_ad_start": start_date,
@@ -667,6 +674,7 @@ class WeeklyReportApp(tk.Tk):
         summaries, details = build_ad_spend_preview(
             windows_by_type=result["_ad_windows_by_type"],
             mappings=result["_ad_mappings"],
+            store_sid=result["_ad_store_sid"],
             requested_skus=result["_ad_requested_skus"],
             start_date=result["_ad_start"],
             end_date=result["_ad_end"],
@@ -682,7 +690,8 @@ class WeeklyReportApp(tk.Tk):
             self.report_ad_detail_tree.insert(
                 "", "end", values=(
                     row.report_date, row.ad_type, row.report_level, row.local_sku,
-                    row.report_sku, row.profile_id, row.campaign_id, row.ad_group_id, row.cost, row.integrity,
+                    row.report_sku, row.asin, row.ad_id, row.profile_id, row.campaign_id,
+                    row.ad_group_id, row.cost, row.integrity,
                 )
             )
         windows_by_type = result["_ad_windows_by_type"]
@@ -699,8 +708,8 @@ class WeeklyReportApp(tk.Tk):
             f"{result['_ad_end'].isoformat()}（报表日期）。已核平日期数 SP/SB/SD="
             f"{complete_by_type['SP']}/{complete_by_type['SB']}/{complete_by_type['SD']}；"
             f"差异 campaign 数 SP/SB/SD={discrepancies['SP']}/{discrepancies['SB']}/{discrepancies['SD']}。"
-            "SB 活动/广告组报表没有 SKU/ASIN 归属字段，费用只显示在店铺级未归属行。"
-            "Schema 未说明 cost 币种、report_date 时区或 SB 视频覆盖范围；跨类型合计留空。"
+            "SP/SD 按 MSKU/ASIN 精确标识自动归属；SB 可依据完整商品目录归属独占广告组，或使用已核验的 ASIN 分摊金额。"
+            "Schema 未说明 cost 币种、report_date 时区、SB 视频覆盖范围及历史商品映射有效期；跨类型合计留空。"
             "预览不写入周报；本次日期的 SP/SB/SD 数值都需在 Windows 逐日与领星后台核验。"
         )
 

@@ -16,6 +16,15 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.formatting.rule import CellIsRule
 from openpyxl.styles import Border, Side
 
+from amazon_weekly_report.ad_attribution import (
+    AdCostEvidence,
+    AdGroupCostEvidence,
+    AttributionMapping,
+    CampaignCostEvidence,
+    PromotionTargetEvidence,
+    attribute_exclusive_ad_group_costs,
+    attribute_ad_costs,
+)
 from amazon_weekly_report.ad_preview import build_ad_spend_preview
 from amazon_weekly_report.mcp_client import (
     BusinessTool,
@@ -958,20 +967,70 @@ class AdPreviewTests(unittest.TestCase):
         summaries, details = build_ad_spend_preview(
             windows_by_type={"SP": [sp], "SB": [sb], "SD": [sd]},
             mappings=[mapping], requested_skus=["LOCAL-A"],
+            store_sid=1,
             start_date=report_day, end_date=report_day,
         )
         sku_row, unallocated_row = summaries
         self.assertEqual((sku_row.sp_cost, sku_row.sb_cost, sku_row.sd_cost), ("1.00", "", "2.00"))
         self.assertEqual(sku_row.confirmed_total, "")
         self.assertEqual(sku_row.unattributed_cost, "")
-        self.assertIn("SB 活动与广告组成本核平；无 SKU/ASIN 字段", sku_row.integrity)
-        self.assertIn("跨类型币种/日期口径未核验", sku_row.integrity)
+        self.assertIn("SB 活动/广告组成本已核平；商品推广身份接口未接入", sku_row.integrity)
+        self.assertIn("币种/日期口径/历史映射时效尚未全部验收", sku_row.integrity)
         self.assertEqual((unallocated_row.sp_cost, unallocated_row.sb_cost, unallocated_row.sd_cost), ("0.50", "4.00", "0.25"))
         self.assertEqual(unallocated_row.confirmed_total, "")
-        self.assertIn("各类型未归属金额分开列示", unallocated_row.integrity)
-        self.assertTrue(any(row.report_level == "活动总额（仅核对）" and "不要与明细费用相加" in row.integrity for row in details))
-        self.assertTrue(any(row.report_level == "广告组记录（不重复计费）" and "无 SKU/ASIN 字段" in row.integrity for row in details))
+        self.assertIn("未归属费用按类型分开显示", unallocated_row.integrity)
+        self.assertTrue(any(row.report_level == "活动总额（仅核对）" and "不与明细相加" in row.integrity for row in details))
+        self.assertTrue(any(
+            row.report_level == "广告组记录（不重复计费）" and not row.local_sku and row.cost == "4.00"
+            for row in details
+        ))
         self.assertTrue(any(row.report_sku == "UNKNOWN" and row.local_sku == "" for row in details))
+
+    def test_preview_uses_exact_asin_when_report_sku_is_missing_and_keeps_id_evidence(self) -> None:
+        report_day = date(2026, 8, 29)
+        sb = SpAdSpendWindow(
+            report_day, report_day,
+            (SpCampaignSpend(report_day, "campaign-1", Decimal("19.21"), "profile-1"),),
+            (SpProductAdSpend(report_day, "", "ASIN-A", "ad-1", "group-1", "campaign-1", Decimal("19.21"), "profile-1"),),
+            (), (), ad_type="SB", campaign_cost_total=Decimal("19.21"),
+            detail_cost_total=Decimal("19.21"), unattributed_cost=Decimal("0"), report_complete=True,
+        )
+        summaries, details = build_ad_spend_preview(
+            windows_by_type={"SB": [sb]},
+            mappings=[SkuProductMapping("LOCAL-A", (), ("ASIN-A",))],
+            store_sid=77,
+            requested_skus=["LOCAL-A"],
+            start_date=report_day,
+            end_date=report_day,
+        )
+        sku_row = next(row for row in summaries if row.local_sku == "LOCAL-A")
+        sb_detail = next(row for row in details if row.ad_type == "SB" and row.report_level == "商品/分摊明细")
+        self.assertEqual(sku_row.sb_cost, "19.21")
+        self.assertEqual((sb_detail.local_sku, sb_detail.asin, sb_detail.ad_id), ("LOCAL-A", "ASIN-A", "ad-1"))
+        self.assertIn("ASIN", sb_detail.integrity)
+
+    def test_preview_automatically_attributes_exclusive_sb_ad_group(self) -> None:
+        report_day = date(2026, 8, 29)
+        sb = SpAdSpendWindow(
+            report_day, report_day,
+            (SpCampaignSpend(report_day, "campaign-1", Decimal("19.21"), "profile-1"),),
+            (), (), (), ad_type="SB",
+            ad_group_rows=(SbAdGroupSpend(report_day, "campaign-1", "group-1", Decimal("19.21"), "profile-1"),),
+            campaign_cost_total=Decimal("19.21"), detail_cost_total=Decimal("19.21"),
+            unattributed_cost=Decimal("19.21"), report_complete=True,
+            promotion_targets=(
+                PromotionTargetEvidence("SB", 77, report_day, "profile-1", "campaign-1", "group-1", "ad-1", "", "ASIN-A"),
+            ),
+            promotion_catalog_complete=True,
+        )
+        summaries, details = build_ad_spend_preview(
+            windows_by_type={"SB": [sb]}, mappings=[SkuProductMapping("LOCAL-A", (), ("ASIN-A",))],
+            store_sid=77, requested_skus=["LOCAL-A"], start_date=report_day, end_date=report_day,
+        )
+        sku_row = next(row for row in summaries if row.local_sku == "LOCAL-A")
+        group_row = next(row for row in details if row.report_level == "广告组费用")
+        self.assertEqual(sku_row.sb_cost, "19.21")
+        self.assertEqual(group_row.local_sku, "LOCAL-A")
 
     def test_missing_report_is_not_zero_and_explicit_sku_zero_is_displayed(self) -> None:
         report_day = date(2026, 8, 29)
@@ -985,6 +1044,7 @@ class AdPreviewTests(unittest.TestCase):
         )
         summaries, _details = build_ad_spend_preview(
             windows_by_type={"SP": [zero]}, mappings=[SkuProductMapping("LOCAL-A", ("MSKU-A",), ())],
+            store_sid=1,
             requested_skus=["LOCAL-A"], start_date=report_day, end_date=report_day,
         )
         sku_row, unallocated_row = summaries
@@ -993,6 +1053,213 @@ class AdPreviewTests(unittest.TestCase):
         self.assertIn("SD 查询结果缺失（未知）", sku_row.integrity)
         self.assertIn("SB=查询结果缺失", unallocated_row.unattributed_cost)
         self.assertEqual(unallocated_row.sb_cost, "")
+
+
+class AdAttributionTests(unittest.TestCase):
+    def _campaign(self, campaign_id: str, cost: str, *, profile: str = "profile-1") -> CampaignCostEvidence:
+        return CampaignCostEvidence("SP", 10, date(2026, 8, 29), profile, campaign_id, Decimal(cost))
+
+    def _line(
+        self,
+        campaign_id: str,
+        cost: str,
+        *,
+        seller_sku: str = "",
+        asin: str = "",
+        ad_id: str = "ad-1",
+        profile: str = "profile-1",
+    ) -> AdCostEvidence:
+        return AdCostEvidence(
+            "SP", 10, date(2026, 8, 29), profile, campaign_id, Decimal(cost),
+            "group-1", ad_id, seller_sku, asin,
+        )
+
+    def test_exact_msku_and_asin_maps_multiple_aliases_to_one_sku(self) -> None:
+        result = attribute_ad_costs(
+            store_sid=10,
+            mappings=[AttributionMapping("LOCAL-A", ("MSKU-OLD", "MSKU-NEW"), ("ASIN-OLD", "ASIN-NEW"))],
+            product_costs=[
+                self._line("campaign-1", "7.21", seller_sku="msku-old", asin="ASIN-OLD", ad_id="ad-1"),
+                self._line("campaign-1", "12.00", seller_sku="MSKU-NEW", asin="asin-new", ad_id="ad-2"),
+            ],
+            campaign_costs=[self._campaign("campaign-1", "19.21")],
+        )
+        self.assertEqual([row.local_sku for row in result.rows], ["LOCAL-A", "LOCAL-A"])
+        self.assertEqual([row.matched_by for row in result.rows], ["MSKU+ASIN", "MSKU+ASIN"])
+        self.assertEqual(result.daily_costs()[("SP", date(2026, 8, 29), "local-a")], Decimal("19.21"))
+        self.assertFalse(any(row.formal_ready for row in result.rows))
+        self.assertIn(("SP", 10, date(2026, 8, 29), "profile-1", "campaign-1"), result.reconciled_campaigns)
+
+        verified = attribute_ad_costs(
+            store_sid=10,
+            mappings=[AttributionMapping("LOCAL-A", ("MSKU-A",), ("ASIN-A",))],
+            product_costs=[self._line("campaign-1", "19.21", seller_sku="MSKU-A", asin="ASIN-A")],
+            campaign_costs=[self._campaign("campaign-1", "19.21")],
+            currency_and_date_basis_verified=True,
+            mapping_temporal_scope_verified=True,
+        )
+        self.assertTrue(verified.rows[0].formal_ready)
+
+    def test_conflicting_or_nonunique_product_ids_are_not_attributed(self) -> None:
+        result = attribute_ad_costs(
+            store_sid=10,
+            mappings=[
+                AttributionMapping("LOCAL-A", ("MSKU-A",), ("ASIN-A",)),
+                AttributionMapping("LOCAL-B", ("MSKU-B",), ("ASIN-B",)),
+                AttributionMapping("LOCAL-C", ("MSKU-SHARED",), ()),
+                AttributionMapping("LOCAL-D", ("MSKU-SHARED",), ()),
+            ],
+            product_costs=[
+                self._line("campaign-1", "1", seller_sku="MSKU-A", asin="ASIN-B", ad_id="conflict"),
+                self._line("campaign-1", "2", seller_sku="MSKU-SHARED", ad_id="shared"),
+                self._line("campaign-1", "3", seller_sku="UNKNOWN", asin="UNKNOWN-ASIN", ad_id="unmatched"),
+            ],
+            campaign_costs=[self._campaign("campaign-1", "6")],
+        )
+        self.assertEqual([row.local_sku for row in result.rows], ["", "", ""])
+        self.assertIn("不同本地 SKU", result.rows[0].status)
+        self.assertIn("多个本地 SKU", result.rows[1].status)
+        self.assertIn("没有匹配", result.rows[2].status)
+
+    def test_campaign_reconciliation_is_per_campaign_and_does_not_guess_names(self) -> None:
+        result = attribute_ad_costs(
+            store_sid=10,
+            mappings=[AttributionMapping("LOCAL-A", ("MSKU-A",), ("ASIN-A",))],
+            product_costs=[
+                self._line("campaign-verified", "4.00", seller_sku="MSKU-A", asin="ASIN-A", ad_id="good"),
+                self._line("campaign-named-LOCAL-A", "3.00", seller_sku="MSKU-A", asin="ASIN-A", ad_id="bad"),
+            ],
+            campaign_costs=[
+                self._campaign("campaign-verified", "4.00"),
+                self._campaign("campaign-named-LOCAL-A", "5.00"),
+            ],
+        )
+        self.assertEqual(result.rows[0].local_sku, "LOCAL-A")
+        self.assertTrue(result.rows[0].campaign_reconciled)
+        self.assertEqual(result.rows[1].local_sku, "")
+        self.assertFalse(result.rows[1].campaign_reconciled)
+        self.assertEqual(result.daily_costs()[("SP", date(2026, 8, 29), "local-a")], Decimal("4.00"))
+
+    def test_conflicting_product_rows_for_one_ad_id_block_campaign(self) -> None:
+        result = attribute_ad_costs(
+            store_sid=10,
+            mappings=[
+                AttributionMapping("LOCAL-A", ("MSKU-A",), ("ASIN-A",)),
+                AttributionMapping("LOCAL-B", ("MSKU-B",), ("ASIN-B",)),
+            ],
+            product_costs=[
+                self._line("campaign-1", "1", seller_sku="MSKU-A", asin="ASIN-A", ad_id="reused-ad"),
+                self._line("campaign-1", "2", seller_sku="MSKU-B", asin="ASIN-B", ad_id="reused-ad"),
+            ],
+            campaign_costs=[self._campaign("campaign-1", "3")],
+        )
+        self.assertTrue(all(not row.local_sku for row in result.rows))
+        self.assertFalse(result.reconciled_campaigns)
+        self.assertIn("重复", result.rows[1].status)
+
+    def test_dated_mapping_and_unverified_allocation_fail_closed(self) -> None:
+        first = date(2026, 8, 29)
+        result = attribute_ad_costs(
+            store_sid=10,
+            mappings=[
+                AttributionMapping("LOCAL-A", ("OLD-MSKU",), (), valid_through=date(2026, 8, 28), validity_verified=True),
+                AttributionMapping("LOCAL-A", ("NEW-MSKU",), ("ASIN-A",), valid_from=first, validity_verified=True),
+            ],
+            product_costs=[
+                self._line("campaign-1", "19.21", seller_sku="NEW-MSKU", asin="ASIN-A"),
+            ],
+            campaign_costs=[self._campaign("campaign-1", "19.21")],
+        )
+        self.assertEqual(result.rows[0].local_sku, "LOCAL-A")
+
+        unverified = AdCostEvidence(
+            "SB", 10, first, "profile-1", "sb-campaign", Decimal("19.21"), "", "", "", "ASIN-A",
+            source="verified_asin_allocation", allocation_verified=False,
+        )
+        blocked = attribute_ad_costs(
+            store_sid=10,
+            mappings=[AttributionMapping("LOCAL-A", (), ("ASIN-A",))],
+            product_costs=[unverified],
+            campaign_costs=[CampaignCostEvidence("SB", 10, first, "profile-1", "sb-campaign", Decimal("19.21"))],
+        )
+        self.assertFalse(blocked.rows[0].local_sku)
+        self.assertIn("来源无效", blocked.rows[0].status)
+
+        verified = attribute_ad_costs(
+            store_sid=10,
+            mappings=[AttributionMapping("LOCAL-A", (), ("ASIN-A",))],
+            product_costs=[AdCostEvidence(
+                "SB", 10, first, "profile-1", "sb-campaign", Decimal("19.21"),
+                asin="ASIN-A", source="verified_asin_allocation", allocation_verified=True,
+            )],
+            campaign_costs=[CampaignCostEvidence("SB", 10, first, "profile-1", "sb-campaign", Decimal("19.21"))],
+        )
+        self.assertEqual(verified.rows[0].local_sku, "LOCAL-A")
+
+    def test_exclusive_ad_group_targets_assign_actual_group_spend_only_with_complete_catalog(self) -> None:
+        report_day = date(2026, 8, 29)
+        campaigns = [CampaignCostEvidence("SB", 10, report_day, "profile-1", "campaign-1", Decimal("19.21"))]
+        groups = [
+            AdGroupCostEvidence("SB", 10, report_day, "profile-1", "campaign-1", "group-a", Decimal("19.21")),
+        ]
+        targets = [
+            PromotionTargetEvidence("SB", 10, report_day, "profile-1", "campaign-1", "group-a", "ad-a", "", "ASIN-A"),
+            PromotionTargetEvidence("SB", 10, report_day, "profile-1", "campaign-1", "group-a", "ad-b", "", "ASIN-A2"),
+        ]
+        result = attribute_exclusive_ad_group_costs(
+            store_sid=10,
+            mappings=[AttributionMapping("LOCAL-A", (), ("ASIN-A", "ASIN-A2"))],
+            promoted_targets=targets,
+            ad_group_costs=groups,
+            campaign_costs=campaigns,
+            promotion_catalog_complete=True,
+        )
+        self.assertEqual(result.rows[0].local_sku, "LOCAL-A")
+        self.assertEqual(result.daily_costs()[("SB", report_day, "local-a")], Decimal("19.21"))
+
+        incomplete = attribute_exclusive_ad_group_costs(
+            store_sid=10,
+            mappings=[AttributionMapping("LOCAL-A", (), ("ASIN-A", "ASIN-A2"))],
+            promoted_targets=targets,
+            ad_group_costs=groups,
+            campaign_costs=campaigns,
+            promotion_catalog_complete=False,
+        )
+        self.assertFalse(incomplete.rows[0].local_sku)
+        self.assertIn("完整性未核验", incomplete.rows[0].status)
+
+    def test_shared_ad_group_targets_remain_unattributed(self) -> None:
+        report_day = date(2026, 8, 29)
+        result = attribute_exclusive_ad_group_costs(
+            store_sid=10,
+            mappings=[
+                AttributionMapping("LOCAL-A", (), ("ASIN-A",)),
+                AttributionMapping("LOCAL-B", (), ("ASIN-B",)),
+            ],
+            promoted_targets=[
+                PromotionTargetEvidence("SB", 10, report_day, "profile-1", "campaign-1", "group-a", asin="ASIN-A"),
+                PromotionTargetEvidence("SB", 10, report_day, "profile-1", "campaign-1", "group-a", asin="ASIN-B"),
+            ],
+            ad_group_costs=[AdGroupCostEvidence("SB", 10, report_day, "profile-1", "campaign-1", "group-a", Decimal("19.21"))],
+            campaign_costs=[CampaignCostEvidence("SB", 10, report_day, "profile-1", "campaign-1", Decimal("19.21"))],
+            promotion_catalog_complete=True,
+        )
+        self.assertFalse(result.rows[0].local_sku)
+        self.assertIn("推广多个本地 SKU", result.rows[0].status)
+
+    def test_duplicate_promotion_catalog_rows_block_exclusive_group_assignment(self) -> None:
+        report_day = date(2026, 8, 29)
+        target = PromotionTargetEvidence("SB", 10, report_day, "profile-1", "campaign-1", "group-a", "ad-a", "", "ASIN-A")
+        result = attribute_exclusive_ad_group_costs(
+            store_sid=10,
+            mappings=[AttributionMapping("LOCAL-A", (), ("ASIN-A",))],
+            promoted_targets=[target, target],
+            ad_group_costs=[AdGroupCostEvidence("SB", 10, report_day, "profile-1", "campaign-1", "group-a", Decimal("19.21"))],
+            campaign_costs=[CampaignCostEvidence("SB", 10, report_day, "profile-1", "campaign-1", Decimal("19.21"))],
+            promotion_catalog_complete=True,
+        )
+        self.assertFalse(result.rows[0].local_sku)
+        self.assertIn("重复记录", result.rows[0].status)
 
 
 class McpClientTests(unittest.TestCase):
