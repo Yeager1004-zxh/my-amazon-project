@@ -11,9 +11,9 @@
 - **D01 规则已由用户最终确认：手动输入并确认。** 每个店铺/SKU 独立设置 `YYYY-MM-DD`，按该店铺站点日期解释；本机持久化，后续更新复用。不能从商品创建日期、订单、首个有销量日期或其他来源自动替代。修改已有工作簿起算日之前必须警告日期错位并重新确认。订单列表不再是 V1.0 的 D01 依赖。
 - 用户已提供的 AsinDailyLists 文档未说明按日期查询的令牌桶补充速率；收到 429 必须停止，不猜测等待时间、不自动重放。多日历史查询的限流行为需在 Windows 授权环境实测。
 - 用户报告 SP 广告实际花费已在 Windows 与领星后台核对一致；此真实验收结果来自用户反馈，云端没有凭证或原始业务响应。
-- 最新 Windows 反馈：用户已核实一个 SB SKU 级费用及店铺级费用，但软件仍未能自动归属该历史费用。用户另报告多日 SD 历史商品报表与领星后台一致。历史 SD 商品行提供报表日 SKU、ASIN、ad_id、campaign_id、cost，应直接用于该日映射；当前目录只作补充诊断。云端未读取企业原始数据，仓库不记录具体店铺、SKU、日期或金额。
+- 最新 Windows 反馈纠正：此前作为普通 SB 研究的 SKU 专属花费实际属于 SBV 视频广告；普通 SB、店铺级 SBV 与 SKU 专属 SBV 是不同口径。代码和测试不保存用户提供的业务金额。用户另报告多日 SD 历史商品报表与领星后台一致。历史 SD 商品行提供报表日 SKU、ASIN、ad_id、campaign_id、cost，应直接用于该日映射；当前目录只作补充诊断。云端未读取企业原始数据，仓库不记录具体店铺、SKU、日期或金额。
 - 已收到 SP Campaign/Product Ad、SB Campaign/Ad Group、SD Campaign/Product Ad，以及 SB Product Ads、SD Product Ads 的官方 Schema。只读目录接口已接入：SB 顶层 `asin` 通过 profile/campaign/ad-group/creative ID 显示当前候选；SD SKU/ASIN/ad ID 显示当前交叉核验项。`hsaProductAds` 不含报表日期或历史版本，目录快照不会证明历史推广身份。
-- **广告归属方向已调整为自动匹配优先。** `ad_attribution.py`：SP/SD 历史商品报表按唯一 MSKU/ASIN 自动映射；SB 当前目录 ASIN 只显示候选，不自动将历史广告组 cost 归入 SKU。只有历史有效推广身份、唯一商品归属、活动与广告组金额核平，或官方 SKU 级分摊语义被核验后才可自动归属。现有 GUI 详情显示 ASIN、Ad ID、广告创意目录和历史有效性状态。
+- **广告归属方向已调整为自动匹配优先。** `ad_attribution.py`：SP/SD 历史商品报表按唯一 MSKU/ASIN 自动映射；HSA 活动报表作为普通 SB/SBV 未拆分的来源保留在未分类金额，绝不填入 SB/SBV SKU 列。`hsaProductAds.video_creatives[].creative_type=VIDEO` 只显示 SBV 候选，不作历史证明。只有类型明确、报表日推广身份完整、唯一商品归属及活动/广告组金额核平后，SB/SBV 才可自动归属。GUI 详情显示广告关系 ID 和候选状态。
 - 当前 `productPerformance` 映射没有逐日 MSKU/ASIN 有效期；缺少历史身份时效证据、广告 cost 币种、`report_date` 时区时，匹配只作为预览，不写正式周报。广告活动名称、广告成交归因销售额不参与归属。活动差异按活动隔离。
 - `hsaProductAds`、`sdProductAds` 只读当前目录查询已接入并通过合成分页测试；SB `sbDivideAsinReports` 因用户提供的字段表与示例错位被安全阻止，不发送请求。缺少修正后的官方响应字段结构、`spends`/`percent` 逐项类型及语义、是否返回每个 SKU/ASIN 的实际分摊金额和如何与活动 cost 核平。SB 视频费用覆盖和历史推广身份有效期也未由现有 Schema 说明。普通 HTTPS 文档访问在 Codex 云端被代理拒绝（403）；上传的旧版 Java SDK 中未找到 SB/SD 报表实现。
 - 六份广告报表接口文档列出的令牌桶容量为 10，但没有说明补充速率或跨接口共享方式；遇到 429 时停止，不自动重试或猜测限速间隔。多日报表分页需在 Windows 授权环境验证实际限流表现。
@@ -31,8 +31,8 @@
 | 优先级 / 阶段 | 输入 → 输出 | 主要模块 | 依赖 | 验收标准 |
 |---|---|---|---|---|
 | **P0：手动 D01 与销售进入 Excel** | 店铺 SID、SKU、用户确认 D01、查询范围 → 按 SKU 写入日销售数据的工作簿与校验日志 | `d01_settings.py`、`providers/lingxing_api.py`、`report_generation.py`、`gui.py` | SellerLists、SKU 映射和每日销量接口；本机 Credential Manager；模板 | ① 用户报告 ex3106 销售查询与后台一致；② D01 只能用户输入确认，按 SID/SKU 保存及恢复；③ 缺 D01 阻止正式生成；④ 修改已有周报起算日有日期错位警告和二次确认；⑤ 自动化验证缺失/零值、D61+、人工字段保护、分段和失败停止；⑥ Windows 验证查询→工作簿、日志、模板及增量更新。 |
-| **P1：SP/SB/SD 自动归属与预览验收** | SID/SKU/日期 + 广告商品目录、分摊行和活动报表 → 分类型自动归属预览与异常明细 | `ad_attribution.py` 统一归属；`providers/lingxing_api.py` 只读调用/分页/核对；`ad_preview.py`；`gui.py` 明细视图 | 六份广告报表 Schema、已提供的 SB/SD 当前商品目录 Schema；SB 分摊口径或历史目录有效期资料仍缺；动态店铺与 SKU→MSKU/ASIN 映射；用户报告 SP 已核对 | ① 每行以 SID/profile/campaign/ad group/ad ID + SKU/ASIN 建关系，不用名称或广告销售归因；② SP/SD 商品 cost 逐 campaign 核平再映射；③ SB 仅在历史推广身份完整且报表日有效、唯一目标、活动成本核平或已核验的官方分摊金额时自动归属；④ 一个广告组多本地 SKU、MSKU/ASIN 冲突、历史映射过期时不分摊；⑤ 活动只作核对，不重复计费；⑥ 缺失、失败、明确零、未归属和不一致分开；⑦ 用用户指定的 SKU/日期，在 Windows 核对 SB SKU 花费、店铺花费及 SP/SB/SD 日期/币种；⑧ 以上通过前仅预览，不写 Excel。 |
-| **P2：完整周报与历史更新** | 已验收销售数据、用户确认 D01、模板；可选的 SP/SD 商品级证据与已有周报 → SKU 分页签、部分来源诊断和校验 JSONL | 统一日数据层、业务校验、模板扩展、`report_generation.py` | P0；完整广告总额另需对应 P1 口径和真实后台核验；SB 受阻不阻断销售 | ① 多 SKU/不同 D01；② 日期连续及 D61+ 周次、样式、公式、合并单元格保真；③ 新建不覆盖模板；④ 增量更新保留日目标、发货时间、推广阶段和其他人工值；⑤ SP/SB/SD 覆盖不完整时总广告花费和 ACOS 空白并提示，历史旧值也清除；⑥ 完整核验的离线总广告费用可通过 Excel/CSV 输入补齐；⑦ Excel 回归与 Windows 对照通过。 |
+| **P1：SP/SB/SBV/SD 自动归属与预览验收** | SID/SKU/日期 + 广告商品目录、分摊行和活动报表 → 分类型自动归属预览与异常明细 | `ad_attribution.py` 统一归属；`providers/lingxing_api.py` 只读调用/分页/核对；`ad_preview.py`；`gui.py` 明细视图 | 当前有 SP/SB/SD 报表与 HSA 创意目录 Schema；SB/SBV 历史归属及分摊口径仍缺；动态店铺与 SKU→MSKU/ASIN 映射；用户报告 SP 已核对 | ① 以 SID/profile/campaign/ad group/ad ID + SKU/ASIN 建关系，不用名称或广告销售归因；② SP/SD 商品 cost 逐 campaign 核平再映射；③ HSA 未区分普通 SB/SBV 时金额留在未分类区域；④ SBV 视频字段只显示候选；⑤ SB/SBV 仅在类型明确、报表日历史商品关系完整、唯一 SKU 归属且活动/广告组金额核平或官方 SKU 分摊金额核验后自动归属；⑥ 共享活动、映射冲突、历史关系不明时不分摊；⑦ 活动只作核对，不重复计费；⑧ 缺失、失败、明确零、未归属和不一致分开；⑨ Windows 逐日核对 SKU 与店铺口径/币种；⑩ 以上通过前仅预览，不写 Excel。 |
+| **P2：完整周报与历史更新** | 已验收销售数据、用户确认 D01、模板；可选的广告商品级证据与已有周报 → SKU 分页签、部分来源诊断和校验 JSONL | 统一日数据层、业务校验、模板扩展、`report_generation.py` | P0；完整广告总额另需 P1 类型、归属与真实后台核验；HSA 未分型不阻断销售 | ① 多 SKU/不同 D01；② 日期连续及 D61+ 周次、样式、公式、合并单元格保真；③ 新建不覆盖模板；④ 增量更新保留日目标、发货时间、推广阶段和其他人工值；⑤ SP/SB/SBV/SD 覆盖不完整时总广告花费和 ACOS 空白并提示，历史旧值也清除；⑥ 完整核验的离线广告总额可通过 Excel/CSV 输入补齐；⑦ Excel 回归与 Windows 对照通过。 |
 | **P3：公司内 Windows 交付** | 源码版本与随附模板 → 可在 Windows 10/11 无 Python/Git/Codex 电脑运行的版本 | `windows_app.py`、PyInstaller 构建、资源路径、版本显示/检查 | P0–P2 的可交付代码；Windows 构建机；管理员稳定版发布地址 | ① EXE/安装包包含依赖和模板，不含凭证/Token；② 用户首次启动可将共用公司 AppID/AppSecret 存入本机 Windows Credential Manager，并可重设；③ 配置、输出目录与历史 Excel 更新后保留；④ 显示版本号；⑤ 读取固定可信 HTTPS 版本清单，仅提示管理员发布的更新，不破坏当前安装；初期由管理员分发安装包；⑥ README/安装使用说明和版本记录齐全。Linux 云环境不声称产出 Windows EXE。 |
 | **P4：独立电脑交付验收** | 稳定 EXE → 第二台未预装 Python 的 Windows 10/11 电脑端到端结果 | 发布包、首次配置向导、安装说明 | P3 稳定构建；用户提供的公司授权环境 | ① 独立安装且不需 Python/Git/Codex；② 首次配置凭证成功、店铺动态读取；③ SKU 查询真实结果一致；④ 广告实际花费逐日一致；⑤ 生成原模板周报；⑥ 检查更新后凭证/用户配置/已有文件保留；⑦ 凭证失效时无密钥泄露地提示重新配置。完成前不得宣布 V1.0 正式验收。 |
 
@@ -61,7 +61,7 @@
 ### P1 的 Windows 本机验收步骤
 
 1. 更新 Windows 分支，刷新店铺，选择授权店铺，输入用户指定的测试 SKU 和站点日期范围，点击广告费用预览。
-2. 比较 SB 当前创意目录 ASIN、广告组/活动 ID 与领星后台，并核对用户指定 SKU 的 SB 专属花费。当前目录不含历史快照，预览应显示候选 ID 并将 SB 历史费用留为未归属；再按日核对 SP/SD 商品 cost 与对应活动 cost。
+2. 比较 HSA 活动/广告组成本及当前创意目录的 `video_creatives[].creative_type`、ASIN、广告组/活动 ID。`VIDEO` 只作 SBV 候选；当前目录没有历史有效期时，HSA 费用应留在未分类区域，不进入普通 SB、SBV 或 SKU 列。再按日核对 SP/SD 商品 cost 与对应活动 cost。
 3. 检查页面按日期、类型显示本地 SKU、MSKU、ASIN、Ad ID、Profile ID、Campaign ID、Ad Group ID 和状态。活动值仅用于核对、不重复相加；未归属、冲突、不核平记录独立提示。币种、日期口径未确认前跨类型合计空白，预览不写入 Excel。
 4. 分别反馈本地参数校验、各 API 请求及业务码成功/失败、是否返回真实记录、活动/明细成本是否逐日一致。仅需脱敏状态和字段结构，不要发送 AppID、AppSecret、Token、SID、订单/商品明细或原始响应。
 

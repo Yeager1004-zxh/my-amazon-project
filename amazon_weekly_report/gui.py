@@ -294,7 +294,7 @@ class WeeklyReportApp(tk.Tk):
         query_box.rowconfigure(3, weight=1)
         self.report_ad_query_button = ttk.Button(
             query_box,
-            text="查询 SP / SB / SD 广告费用并预览",
+            text="查询 SP / SB / SBV / SD 广告费用并预览",
             command=self._query_report_ad_data,
         )
         self.report_ad_query_button.grid(row=5, column=0, sticky="w", padx=4, pady=(8, 3))
@@ -302,7 +302,7 @@ class WeeklyReportApp(tk.Tk):
             row=5, column=1, columnspan=4, sticky="w", padx=4, pady=(8, 3)
         )
         self.report_ad_status = tk.StringVar(
-            value="按广告商品 MSKU/ASIN 自动匹配；SB 商品目录/分摊接口及日期币种口径仍待核验。"
+            value="SP/SD 使用历史商品报表；HSA 活动报表暂合并 SB/SBV，视频创意字段只作 SBV 候选。"
         )
         ttk.Label(query_box, textvariable=self.report_ad_status, wraplength=900).grid(
             row=6, column=0, columnspan=5, sticky="w", padx=4, pady=(0, 3)
@@ -311,7 +311,7 @@ class WeeklyReportApp(tk.Tk):
             row=7, column=0, columnspan=5, sticky="w", padx=4, pady=(2, 2)
         )
         ad_summary_columns = (
-            "report_date", "local_sku", "sp_cost", "sb_cost", "sd_cost",
+            "report_date", "local_sku", "sp_cost", "sb_cost", "sbv_cost", "sd_cost",
             "confirmed_total", "unattributed_cost", "integrity",
         )
         self.report_ad_summary_tree = ttk.Treeview(
@@ -321,7 +321,8 @@ class WeeklyReportApp(tk.Tk):
             ("report_date", "报表日期", 95),
             ("local_sku", "本地 SKU / 范围", 155),
             ("sp_cost", "SP 实际花费", 100),
-            ("sb_cost", "SB 实际花费", 100),
+            ("sb_cost", "普通 SB 实际花费", 110),
+            ("sbv_cost", "SBV 视频实际花费", 115),
             ("sd_cost", "SD 实际花费", 100),
             ("confirmed_total", "已确认归属合计", 115),
             ("unattributed_cost", "未归属花费", 300),
@@ -993,7 +994,7 @@ class WeeklyReportApp(tk.Tk):
                         start_date=start_date,
                         end_date=end_date,
                     ),
-                    "SB": client.query_sb_ad_spend_history(
+                    "HSA": client.query_sb_ad_spend_history(
                         access_token=token_result.token,
                         store_sid=seller.sid,
                         start_date=start_date,
@@ -1006,6 +1007,10 @@ class WeeklyReportApp(tk.Tk):
                         start_date=start_date,
                         end_date=end_date,
                     ),
+                    # HSA campaign/ad-group reports currently do not carry
+                    # an official subtype field. Keep SBV unknown rather than
+                    # treating the combined HSA amount as ordinary SB or zero.
+                    "SBV": [],
                 }
             return {
                 "_ad_windows_by_type": windows_by_type,
@@ -1015,10 +1020,10 @@ class WeeklyReportApp(tk.Tk):
                 "_ad_store_name": seller.name,
                 "_ad_start": start_date,
                 "_ad_end": end_date,
-                "message": "SP、SB、SD 广告费用预览查询完成；该预览未写入周报。",
+                "message": "SP、HSA（SB/SBV 未拆分）、SD 广告费用预览查询完成；该预览未写入周报。",
             }
 
-        self._start_task(query, self.report_ad_status, "SP、SB、SD 广告费用查询完成。")
+        self._start_task(query, self.report_ad_status, "SP、HSA（SB/SBV 未拆分）、SD 广告费用查询完成。")
 
     def _apply_ad_spend_preview(self, result: dict[str, Any]) -> None:
         summaries, details = build_ad_spend_preview(
@@ -1032,7 +1037,7 @@ class WeeklyReportApp(tk.Tk):
         for row in summaries:
             self.report_ad_summary_tree.insert(
                 "", "end", values=(
-                    row.report_date, row.local_sku, row.sp_cost, row.sb_cost, row.sd_cost,
+                    row.report_date, row.local_sku, row.sp_cost, row.sb_cost, row.sbv_cost, row.sd_cost,
                     row.confirmed_total, row.unattributed_cost, row.integrity,
                 )
             )
@@ -1047,24 +1052,24 @@ class WeeklyReportApp(tk.Tk):
         windows_by_type = result["_ad_windows_by_type"]
         complete_by_type = {
             kind: sum(1 for window in windows_by_type[kind] if window.report_complete)
-            for kind in ("SP", "SB", "SD")
+            for kind in ("SP", "HSA", "SD")
         }
         discrepancies = {
             kind: sum(len(window.discrepancies) for window in windows_by_type[kind])
-            for kind in ("SP", "SB", "SD")
+            for kind in ("SP", "HSA", "SD")
         }
         catalog_counts = {
             kind: (len(windows_by_type[kind][0].product_catalog_rows) if windows_by_type[kind] else 0)
-            for kind in ("SB", "SD")
+            for kind in ("HSA", "SD")
         }
         report_row_counts = {
             "SP": (
                 sum(len(window.campaign_rows) for window in windows_by_type["SP"]),
                 sum(len(window.product_rows) for window in windows_by_type["SP"]),
             ),
-            "SB": (
-                sum(len(window.campaign_rows) for window in windows_by_type["SB"]),
-                sum(len(window.ad_group_rows) for window in windows_by_type["SB"]),
+            "HSA": (
+                sum(len(window.campaign_rows) for window in windows_by_type["HSA"]),
+                sum(len(window.ad_group_rows) for window in windows_by_type["HSA"]),
             ),
             "SD": (
                 sum(len(window.campaign_rows) for window in windows_by_type["SD"]),
@@ -1073,16 +1078,16 @@ class WeeklyReportApp(tk.Tk):
         }
         self.report_ad_status.set(
             f"店铺 {result['_ad_store_name']}：{result['_ad_start'].isoformat()} 至 "
-            f"{result['_ad_end'].isoformat()}（报表日期）。已核平日期数 SP/SB/SD="
-            f"{complete_by_type['SP']}/{complete_by_type['SB']}/{complete_by_type['SD']}；"
-            f"差异 campaign 数 SP/SB/SD={discrepancies['SP']}/{discrepancies['SB']}/{discrepancies['SD']}。"
+            f"{result['_ad_end'].isoformat()}（报表日期）。已核平日期数 SP/HSA/SD="
+            f"{complete_by_type['SP']}/{complete_by_type['HSA']}/{complete_by_type['SD']}；"
+            f"差异 campaign 数 SP/HSA/SD={discrepancies['SP']}/{discrepancies['HSA']}/{discrepancies['SD']}。"
             f"接口成功返回的活动/明细行数 SP={report_row_counts['SP'][0]}/{report_row_counts['SP'][1]}、"
-            f"SB={report_row_counts['SB'][0]}/{report_row_counts['SB'][1]}、"
+            f"HSA={report_row_counts['HSA'][0]}/{report_row_counts['HSA'][1]}、"
             f"SD={report_row_counts['SD'][0]}/{report_row_counts['SD'][1]}。"
-            f"SP/SD 按历史商品报表中的 MSKU/ASIN 精确标识预览；已读取 SB 创意目录 {catalog_counts['SB']} 条、SD 商品目录 {catalog_counts['SD']} 条。"
-            "新目录仅是当前快照，不能证明广告在历史报表日推广相同商品，因此 SB 广告组花费不自动归属。"
-            "SB 分摊接口字段语义仍待官方澄清；Schema 也未确认 cost 币种、report_date 时区及 SB 视频覆盖范围；跨类型合计留空。"
-            "预览不写入周报；本次日期的 SP/SB/SD 数值都需在 Windows 逐日与领星后台核验。"
+            f"SP/SD 按历史商品报表中的 MSKU/ASIN 精确标识预览；已读取 HSA 创意目录 {catalog_counts['HSA']} 条、SD 商品目录 {catalog_counts['SD']} 条。"
+            "HSA 活动/广告组报表未给出 SB/SBV 类型；创意 creative_type 或 video_creatives[].creative_type=VIDEO 仅显示为 SBV 候选，目录快照不能证明报表日商品归属。"
+            "普通 SB 与 SBV 实际花费分列；无法拆分的 HSA 金额只列为未分类说明，不写入任一 SKU 类型列。"
+            "分摊接口字段语义、费用币种与报表日期口径仍待核验；跨类型合计留空。预览不写入周报。"
         )
 
     def _apply_daily_sales_preview(self, result: dict[str, Any]) -> None:

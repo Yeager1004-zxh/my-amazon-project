@@ -226,10 +226,11 @@ def attribute_exclusive_ad_group_costs(
 ) -> AdGroupAttributionResult:
     """Attribute an ad group's spend only when every promoted item maps uniquely.
 
-    This is suitable for SB when official product-ad data proves complete
-    campaign/ad-group target coverage. The caller must establish that coverage
-    from the official endpoint contract; incomplete catalogs never trigger a
-    full group-cost assignment.
+    This is suitable for SB or SBV when official, date-valid product-ad data
+    proves complete campaign/ad-group target coverage. The caller must
+    establish subtype and coverage from the official endpoint contract;
+    incomplete or current-only catalogs never trigger a full group-cost
+    assignment.
     """
     if isinstance(store_sid, bool) or not isinstance(store_sid, int) or store_sid <= 0:
         raise ValueError("store_sid must be a positive integer.")
@@ -405,14 +406,14 @@ def attribute_ad_costs(
     seen_ad_ids: dict[tuple[str, int, date, str, str], tuple[tuple[object, ...], int]] = {}
     for index, line in enumerate(lines):
         _validate_cost(line.cost, "product")
-        if line.ad_type.upper() not in {"SP", "SB", "SD"}:
+        if line.ad_type.upper() not in {"SP", "SB", "SBV", "SD"}:
             invalid_lines.add(index)
             continue
         if line.store_sid != store_sid:
             invalid_lines.add(index)
             continue
         if line.source == "verified_asin_allocation" and (
-            not line.allocation_verified or line.ad_type.upper() != "SB"
+            not line.allocation_verified or line.ad_type.upper() not in {"SB", "SBV"}
         ):
             invalid_lines.add(index)
             continue

@@ -26,6 +26,7 @@ class AdSpendSummaryPreview:
     local_sku: str
     sp_cost: str
     sb_cost: str
+    sbv_cost: str
     sd_cost: str
     confirmed_total: str
     unattributed_cost: str
@@ -60,27 +61,35 @@ def _money(value: Decimal | None) -> str:
 
 def _type_state(kind: str, window: SpAdSpendWindow | None, *, matched_rows: int = 0) -> str:
     if window is None:
+        if kind == "SBV":
+            return "SBV 查询结果缺失（未知，不视为零）"
         return f"{kind} 查询结果缺失（未知）"
     if matched_rows:
         blocked = len(window.discrepancies)
         suffix = f"；另有 {blocked} 个活动未核平并被隔离" if blocked else ""
         return f"{kind} {matched_rows} 条费用按 MSKU/ASIN 精确匹配本地 SKU{suffix}"
-    if kind == "SB" and not window.product_rows:
+    if kind == "HSA":
         if window.report_complete:
             if window.promotion_targets and window.promotion_catalog_complete:
-                return "SB 当前创意目录已读取；报表日推广身份未核验，费用暂不归属"
-            return "SB 活动/广告组成本已核平；创意目录未确认，费用待自动归属"
+                return "HSA（普通 SB/SBV 未拆分）：当前创意目录已读取；报表日推广身份未核验"
+            return "HSA（普通 SB/SBV 未拆分）：活动/广告组成本已核平；类型与商品归属待确认"
         if window.discrepancies:
-            return "SB 活动与广告组成本未核平；归属与金额均未知"
-        return "SB 活动或广告组无记录（未知，不视为零）"
+            return "HSA（普通 SB/SBV 未拆分）：活动与广告组成本未核平"
+        return "HSA（普通 SB/SBV 未拆分）无记录（未知，不视为零）"
+    if kind == "SBV":
+        if window.discrepancies:
+            return "SBV 活动与广告组成本未核平；相关费用不归属"
+        if window.report_complete and window.ad_group_rows:
+            return "SBV 活动与广告组成本已核平；报表日推广商品尚未核验"
+        return "SBV 报表/历史商品关联缺失（未知，不视为零）"
     if not window.report_complete:
         if window.discrepancies:
             return f"{kind} 部分活动未核平；相关记录阻止归属"
-        if kind == "SB":
+        if kind == "HSA":
             if window.campaign_rows and not window.ad_group_rows:
-                return f"SB 活动报表有 {len(window.campaign_rows)} 条记录，广告组报表无记录；SKU 花费未知"
+                return f"HSA 活动报表有 {len(window.campaign_rows)} 条记录，广告组报表无记录；SB/SBV 类型和 SKU 花费未知"
             if window.ad_group_rows and not window.campaign_rows:
-                return f"SB 广告组报表有 {len(window.ad_group_rows)} 条记录，活动报表无记录；金额未核平"
+                return f"HSA 广告组报表有 {len(window.ad_group_rows)} 条记录，活动报表无记录；金额未核平"
         else:
             if window.campaign_rows and not window.product_rows:
                 return f"{kind} 活动报表有 {len(window.campaign_rows)} 条记录，商品报表无记录；SKU 花费未知"
@@ -96,18 +105,18 @@ def _window_state(kind: str, window: SpAdSpendWindow | None) -> str:
     if window is None:
         return f"{kind} 查询结果缺失"
     if window.report_complete:
-        if kind == "SB":
-            detail = "商品/分摊明细" if window.product_rows else "广告组"
+        if kind == "HSA":
+            detail = "商品/分摊明细" if window.product_rows else "广告组（SB/SBV 类型未拆分）"
         else:
             detail = "商品"
         return f"{kind} 活动与{detail}成本已核平"
     if window.discrepancies:
         return f"{kind} 活动与明细成本不一致，相关活动金额未知"
-    if kind == "SB":
+    if kind == "HSA":
         if window.campaign_rows and not window.ad_group_rows:
-            return "SB 活动接口有记录，但广告组接口返回空记录"
+            return "HSA 活动接口有记录，但广告组接口返回空记录；SB/SBV 类型未分"
         if window.ad_group_rows and not window.campaign_rows:
-            return "SB 广告组接口有记录，但活动接口返回空记录"
+            return "HSA 广告组接口有记录，但活动接口返回空记录"
     else:
         if window.campaign_rows and not window.product_rows:
             return f"{kind} 活动接口有记录，但商品接口返回空记录"
@@ -125,7 +134,9 @@ def _normalized_attribution(window: SpAdSpendWindow, store_sid: int, mappings: S
         )
         for row in window.campaign_rows
     ]
-    product_costs = [
+    # The Lingxing HSA report family combines ordinary SB and SBV. Never
+    # attribute its rows as ordinary SB merely because the endpoint is HSA.
+    product_costs = [] if window.ad_type == "HSA" else [
         AdCostEvidence(
             ad_type=window.ad_type,
             store_sid=store_sid,
@@ -148,13 +159,13 @@ def _normalized_attribution(window: SpAdSpendWindow, store_sid: int, mappings: S
         product_costs=product_costs,
         campaign_costs=campaigns,
     )
-    if window.ad_type == "SB" and not window.product_rows and window.ad_group_rows:
+    if window.ad_type == "SBV" and not window.product_rows and window.ad_group_rows:
         group_result = attribute_exclusive_ad_group_costs(
             store_sid=store_sid,
             mappings=[AttributionMapping(item.local_sku, item.seller_skus, item.asins) for item in mappings],
             promoted_targets=window.promotion_targets,
             ad_group_costs=[
-                AdGroupCostEvidence("SB", store_sid, row.report_date, row.profile_id, row.campaign_id, row.ad_group_id, row.cost)
+                AdGroupCostEvidence(window.ad_type, store_sid, row.report_date, row.profile_id, row.campaign_id, row.ad_group_id, row.cost)
                 for row in window.ad_group_rows
             ],
             campaign_costs=campaigns,
@@ -187,7 +198,10 @@ def build_ad_spend_preview(
         raise ValueError("广告预览日期范围无效。")
     if isinstance(store_sid, bool) or not isinstance(store_sid, int) or store_sid <= 0:
         raise ValueError("广告预览必须使用所选店铺的有效 SID。")
-    kinds = ("SP", "SB", "SD")
+    # HSA activity/group reports combine Sponsored Brands and Sponsored
+    # Brands Video. Keep that amount separate until the official source proves
+    # both the ad subtype and its historical product target.
+    kinds = ("SP", "SB", "SBV", "SD", "HSA")
     by_kind_date: dict[str, dict[date, SpAdSpendWindow]] = {}
     outcomes_by_window: dict[tuple[str, date], _WindowAttribution] = {}
     mapped_costs: dict[tuple[str, date, str], Decimal] = {}
@@ -215,7 +229,11 @@ def build_ad_spend_preview(
                     mapped_costs[key] = mapped_costs.get(key, Decimal("0")) + outcome.evidence.cost
                     matched_counts[key] = matched_counts.get(key, 0) + 1
 
-            if window.report_complete:
+            if window.report_complete and kind == "HSA":
+                # The HSA campaign total is the only safe single-level amount
+                # while ordinary SB and SBV are not distinguished.
+                unmatched_costs[(kind, window.start_date)] = window.campaign_cost_total
+            elif window.report_complete:
                 unmatched_costs[(kind, window.start_date)] = sum(
                     (row.evidence.cost for row in outcomes.product_rows if not row.local_sku), Decimal("0")
                 ) + sum(
@@ -259,6 +277,7 @@ def build_ad_spend_preview(
                 local_sku=local_sku,
                 sp_cost=values["SP"],
                 sb_cost=values["SB"],
+                sbv_cost=values["SBV"],
                 sd_cost=values["SD"],
                 confirmed_total="",
                 unattributed_cost="",
@@ -275,19 +294,24 @@ def build_ad_spend_preview(
                 unallocated_parts.append(f"{kind}=查询结果缺失")
             elif value is None:
                 unallocated_parts.append(f"{kind}=未知（未完整核对）")
+            elif kind == "HSA":
+                unallocated_parts.append(f"HSA普通SB/SBV未拆分={_money(value)}")
             else:
                 unallocated_parts.append(f"{kind}={_money(value)}")
         summaries.append(AdSpendSummaryPreview(
             report_date=day_text,
             local_sku="未归属（店铺级）",
             sp_cost=unallocated_values["SP"],
-            sb_cost=unallocated_values["SB"],
+            # Do not place the combined HSA report total into the ordinary-SB
+            # or SBV column. It remains visible only in unattributed_cost.
+            sb_cost="",
+            sbv_cost=unallocated_values["SBV"],
             sd_cost=unallocated_values["SD"],
             confirmed_total="",
             unattributed_cost="；".join(unallocated_parts),
             integrity="；".join(
                 [_window_state(kind, day_windows[kind]) for kind in kinds]
-                + ["活动费用不与商品/分摊明细相加；未归属费用按类型分开显示"]
+                + ["HSA 活动费用暂不拆成普通 SB/SBV；活动费用不与明细相加；未归属金额保留在说明中"]
             ),
         ))
 
@@ -295,6 +319,7 @@ def build_ad_spend_preview(
             window = day_windows[kind]
             if window is None:
                 continue
+            display_kind = kind
             discrepancy_campaigns = {(item.profile_id, item.campaign_id) for item in window.discrepancies}
             for row in window.campaign_rows:
                 state = (
@@ -303,14 +328,16 @@ def build_ad_spend_preview(
                     else "活动级核对基准；不与明细相加"
                 )
                 details.append(AdSpendDetailPreview(
-                    day_text, kind, "活动总额（仅核对）", "", "", "", "", row.profile_id,
+                    day_text, display_kind, "活动总额（仅核对）", "", "", "", "", row.profile_id,
                     row.campaign_id, "", _money(row.cost), state,
                 ))
             outcomes = outcomes_by_window.get((kind, report_day), _WindowAttribution())
-            for row, outcome in zip(window.product_rows, outcomes.product_rows):
+            for index, row in enumerate(window.product_rows):
+                outcome = outcomes.product_rows[index] if index < len(outcomes.product_rows) else None
                 details.append(AdSpendDetailPreview(
-                    day_text, kind, "商品/分摊明细", outcome.local_sku, row.sku, row.asin, row.ad_id,
-                    row.profile_id, row.campaign_id, row.ad_group_id, _money(row.cost), outcome.status,
+                    day_text, display_kind, "商品/分摊明细", outcome.local_sku if outcome else "", row.sku, row.asin, row.ad_id,
+                    row.profile_id, row.campaign_id, row.ad_group_id, _money(row.cost),
+                    outcome.status if outcome else "HSA 类型未拆分；不将记录归入普通 SB 或 SBV",
                 ))
             for row in window.ad_group_rows:
                 outcome = next((item for item in outcomes.ad_group_rows if (
@@ -320,7 +347,7 @@ def build_ad_spend_preview(
                     and item.evidence.ad_group_id == row.ad_group_id
                 )), None)
                 details.append(AdSpendDetailPreview(
-                    day_text, kind, "广告组费用" if outcome and outcome.local_sku else "广告组记录（不重复计费）",
+                    day_text, display_kind, "广告组费用" if outcome and outcome.local_sku else "广告组记录（不重复计费）",
                     outcome.local_sku if outcome else "", "", "", "", row.profile_id,
                     row.campaign_id, row.ad_group_id, _money(row.cost),
                     outcome.status if outcome else "只用于和活动总额核对，不重复计费",
@@ -331,9 +358,23 @@ def build_ad_spend_preview(
                 for catalog in window.product_catalog_rows:
                     catalog_asins = catalog.asins or ("",)
                     for asin in catalog_asins:
+                        has_video_field = any(
+                            value.strip().upper() == "VIDEO" for value in catalog.video_creative_types
+                        )
+                        is_video_candidate = catalog.creative_type.strip().upper() == "VIDEO" or has_video_field
+                        catalog_type = "SBV候选" if is_video_candidate else "HSA创意候选"
+                        creative_note = (
+                            (
+                                "creative_type=VIDEO；仅为 SBV 类型候选，非报表日历史证明"
+                                if catalog.creative_type.strip().upper() == "VIDEO"
+                                else "video_creatives[].creative_type=VIDEO；仅为 SBV 类型候选，非报表日历史证明"
+                            )
+                            if is_video_candidate
+                            else f"creative_type={catalog.creative_type}；HSA 报表未给出 SB/SBV 类型，历史也未证明"
+                        )
                         details.append(AdSpendDetailPreview(
                             day_text,
-                            kind,
+                            catalog_type,
                             "当前商品目录快照（非历史费用）",
                             catalog_sku_candidate(catalog.seller_sku, (asin,)),
                             catalog.seller_sku,
@@ -343,6 +384,6 @@ def build_ad_spend_preview(
                             catalog.campaign_id,
                             catalog.ad_group_id,
                             "",
-                            "当前目录 ID 关系仅供定位；未证明在报表日有效，不参与费用归属或合计",
+                            f"{creative_note}；当前目录 ID 关系仅供定位，不参与费用归属或合计",
                         ))
     return summaries, details

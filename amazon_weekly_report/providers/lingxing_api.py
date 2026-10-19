@@ -200,6 +200,7 @@ class AdProductCatalogRecord:
     serving_status: str = field(default="", repr=False)
     creation_date_value: Decimal | None = field(default=None, repr=False)
     last_updated_date_value: Decimal | None = field(default=None, repr=False)
+    video_creative_types: tuple[str, ...] = field(default=(), repr=False)
 
 
 @dataclass(frozen=True)
@@ -422,8 +423,8 @@ def _catalog_timestamp(value: Any, field_name: str, endpoint: str) -> Decimal:
 
 
 def parse_sb_product_ads_page(payload: Any) -> tuple[int, list[AdProductCatalogRecord], str]:
-    """Parse the current SB creative catalog without treating it as history."""
-    endpoint = "SB 广告创意目录"
+    """Parse the current HSA creative catalog without treating it as history."""
+    endpoint = "HSA 广告创意目录"
     total, records, next_token = _catalog_page_envelope(payload, endpoint)
     parsed: list[AdProductCatalogRecord] = []
     for item in records:
@@ -434,8 +435,21 @@ def parse_sb_product_ads_page(payload: Any) -> tuple[int, list[AdProductCatalogR
         raw_asins = item.get("asin")
         if not isinstance(raw_asins, list) or any(not isinstance(asin, str) or not asin.strip() for asin in raw_asins):
             raise LingxingApiError(f"{endpoint}响应字段 asin 必须是非空字符串组成的数组。")
+        # video_creatives is an explicit documented field, so it can provide a
+        # format candidate without relying on a campaign name. It is still a
+        # current catalog snapshot and does not prove historical SBV identity.
+        raw_video_creatives = item.get("video_creatives", [])
+        if not isinstance(raw_video_creatives, list) or any(not isinstance(entry, dict) for entry in raw_video_creatives):
+            raise LingxingApiError(f"{endpoint}响应字段 video_creatives 必须是对象数组。")
+        video_creative_types: list[str] = []
+        for entry in raw_video_creatives:
+            creative_type = entry.get("creative_type")
+            if creative_type is not None and not isinstance(creative_type, str):
+                raise LingxingApiError(f"{endpoint}响应字段 video_creatives[].creative_type 类型无效。")
+            if isinstance(creative_type, str) and creative_type.strip():
+                video_creative_types.append(creative_type.strip())
         parsed.append(AdProductCatalogRecord(
-            ad_type="SB",
+            ad_type="HSA",
             profile_id=profile_id,
             campaign_id=campaign_id,
             ad_group_id=ad_group_id,
@@ -446,6 +460,7 @@ def parse_sb_product_ads_page(payload: Any) -> tuple[int, list[AdProductCatalogR
             serving_status=_required_text(item.get("serving_status"), "serving_status", endpoint),
             creation_date_value=_catalog_timestamp(item.get("creation_date"), "creation_date", endpoint),
             last_updated_date_value=_catalog_timestamp(item.get("last_updated_date"), "last_updated_date", endpoint),
+            video_creative_types=tuple(video_creative_types),
         ))
     return total, parsed, next_token
 
@@ -1911,7 +1926,7 @@ class LingxingOpenApiClient:
         start_date: date,
         end_date: date,
     ) -> list[SpAdSpendWindow]:
-        """Compare SB campaign and ad-group cost; neither schema identifies an SKU."""
+        """Compare combined HSA campaign/ad-group cost; subtype and SKU are unknown."""
         if not isinstance(access_token, str) or not access_token.strip():
             raise LingxingApiError("Access Token 为空，未发送 SB 广告报表查询。")
         if isinstance(store_sid, bool) or not isinstance(store_sid, int):
@@ -1968,7 +1983,9 @@ class LingxingOpenApiClient:
                 product_rows=(),
                 sku_daily_spends=(),
                 discrepancies=tuple(discrepancies),
-                ad_type="SB",
+                # HSA reports currently combine ordinary Sponsored Brands
+                # and Sponsored Brands Video without an explicit subtype.
+                ad_type="HSA",
                 ad_group_rows=tuple(ad_groups),
                 campaign_cost_total=campaign_total,
                 detail_cost_total=detail_total,
@@ -1979,7 +1996,7 @@ class LingxingOpenApiClient:
                 report_complete=report_complete,
                 promotion_targets=tuple(
                     PromotionTargetEvidence(
-                        ad_type="SB",
+                        ad_type="HSA",
                         store_sid=store_sid,
                         report_date=report_day,
                         profile_id=row.profile_id,
