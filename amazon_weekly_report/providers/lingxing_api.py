@@ -254,6 +254,7 @@ class SpAdSpendWindow:
     promotion_targets: tuple[PromotionTargetEvidence, ...] = field(default=(), repr=False)
     promotion_catalog_complete: bool = field(default=False, repr=False)
     product_catalog_rows: tuple[AdProductCatalogRecord, ...] = field(default=(), repr=False)
+    product_catalog_observed_at: datetime | None = field(default=None, repr=False)
 
 
 def split_date_windows(start_date: date, end_date: date, *, max_days: int = MAX_PRODUCT_QUERY_DAYS) -> list[tuple[date, date]]:
@@ -1937,9 +1938,11 @@ class LingxingOpenApiClient:
         try:
             catalog_rows = self.query_sb_product_ads(access_token=access_token, store_sid=store_sid)
             catalog_complete = True
+            catalog_observed_at = datetime.now(timezone.utc)
         except LingxingApiError:
             catalog_rows = ()
             catalog_complete = False
+            catalog_observed_at = None
         windows: list[SpAdSpendWindow] = []
         day_count = (end_date - start_date).days + 1
         for day_offset in range(day_count):
@@ -2018,6 +2021,7 @@ class LingxingOpenApiClient:
                 ),
                 promotion_catalog_complete=catalog_complete,
                 product_catalog_rows=catalog_rows,
+                product_catalog_observed_at=catalog_observed_at,
             ))
         return windows
 

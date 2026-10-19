@@ -98,6 +98,10 @@ class ExclusiveAdGroupAttribution:
     evidence: AdGroupCostEvidence = field(repr=False)
     status: str = field(repr=False)
     local_sku: str = field(default="", repr=False)
+    candidate_local_skus: tuple[str, ...] = field(default=(), repr=False)
+    candidate_resolution_complete: bool = field(default=False, repr=False)
+    candidate_asins: tuple[str, ...] = field(default=(), repr=False)
+    candidate_creative_ids: tuple[str, ...] = field(default=(), repr=False)
 
 
 @dataclass(frozen=True)
@@ -303,9 +307,10 @@ def attribute_exclusive_ad_group_costs(
         if target.ad_id.strip():
             ad_identity = (target.ad_type.upper(), target.store_sid, target.report_date, _norm(target.profile_id), "ad", _norm(target.ad_id))
             target_bindings_by_ad_id[ad_identity].add((group_key, _norm(target.seller_sku), _norm(target.asin)))
-        if target.ad_creative_id.strip():
-            creative_identity = (target.ad_type.upper(), target.store_sid, target.report_date, _norm(target.profile_id), "creative", _norm(target.ad_creative_id))
-            target_bindings_by_ad_id[creative_identity].add((group_key, _norm(target.seller_sku), _norm(target.asin)))
+        # A creative may intentionally contain several ASINs (for example a
+        # product collection). It is an association identifier, not a unique
+        # one-product key, so multiple ASIN bindings do not constitute a
+        # duplicate ad row.
     for bindings in target_bindings_by_ad_id.values():
         if len(bindings) > 1:
             duplicate_target_groups.update(binding[0] for binding in bindings)
@@ -394,8 +399,53 @@ def attribute_exclusive_ad_group_costs(
         if not group_targets:
             result.append(ExclusiveAdGroupAttribution(group, status="该广告组没有可核验的推广商品记录"))
             continue
+        candidate_skus: set[str] = set()
+        candidate_complete = bool(promotion_catalog_complete and group_key not in duplicate_target_groups)
+        candidate_errors: list[str] = []
+        for target in group_targets:
+            if not target.seller_sku.strip() and not target.asin.strip():
+                candidate_complete = False
+                candidate_errors.append("缺少 MSKU/ASIN")
+                continue
+            candidate, _matched_by, candidate_error = _resolve_identity(
+                report_day=target.report_date,
+                seller_sku=target.seller_sku,
+                asin=target.asin,
+                msku_owners=msku_owners,
+                asin_owners=asin_owners,
+            )
+            if candidate_error:
+                candidate_complete = False
+                candidate_errors.append(candidate_error)
+            else:
+                candidate_skus.add(candidate)
+        if len(candidate_skus) != 1:
+            candidate_complete = False
+        candidate_names = tuple(sorted(candidate_skus, key=str.casefold))
+        candidate_asins = tuple(sorted({target.asin for target in group_targets if target.asin.strip()}, key=str.casefold))
+        candidate_creatives = tuple(sorted({target.ad_creative_id for target in group_targets if target.ad_creative_id.strip()}, key=str.casefold))
         if any(not target.identity_valid_for_report for target in group_targets):
-            result.append(ExclusiveAdGroupAttribution(group, status="商品目录仅为当前快照，未证明在报表日有效；费用待确认"))
+            if candidate_errors and candidate_names:
+                status = (
+                    f"目录存在未匹配推广项（{'; '.join(sorted(set(candidate_errors)))}）；"
+                    f"候选 SKU {candidate_names[0]} 不完整，不能自动归属"
+                )
+            elif len(candidate_names) == 1:
+                status = f"当前创意目录候选 SKU {candidate_names[0]}；未证明报表日关系，待集中核验"
+            elif candidate_names:
+                status = "当前创意目录候选涉及多个 SKU，不能自动归属"
+            elif candidate_errors:
+                status = "当前创意目录无法完整匹配 SKU；费用待确认"
+            else:
+                status = "商品目录仅为当前快照，未证明在报表日有效；费用待确认"
+            result.append(ExclusiveAdGroupAttribution(
+                group,
+                status=status,
+                candidate_local_skus=candidate_names,
+                candidate_resolution_complete=candidate_complete,
+                candidate_asins=candidate_asins,
+                candidate_creative_ids=candidate_creatives,
+            ))
             continue
         resolved: set[str] = set()
         failure = ""

@@ -47,6 +47,9 @@ class AdSpendDetailPreview:
     ad_group_id: str
     cost: str
     integrity: str
+    ad_creative_id: str = ""
+    candidate_local_skus: tuple[str, ...] = ()
+    candidate_resolution_complete: bool = False
 
 
 @dataclass(frozen=True)
@@ -210,7 +213,7 @@ def build_ad_spend_preview(
                 unmatched_costs[(kind, window.start_date)] = None
         by_kind_date[kind] = day_map
 
-    def catalog_sku_candidate(catalog: Any, asin: str) -> str:
+    def catalog_sku_candidates(catalog: Any, asin: str) -> tuple[str, ...]:
         owners: set[str] = set()
         for mapping in mappings:
             if catalog.seller_sku and any(
@@ -219,11 +222,7 @@ def build_ad_spend_preview(
                 owners.add(mapping.local_sku)
             if asin and any(asin.casefold() == value.casefold() for value in mapping.asins):
                 owners.add(mapping.local_sku)
-        if len(owners) == 1:
-            return next(iter(owners))
-        if owners:
-            return "归属冲突候选：" + ", ".join(sorted(owners))
-        return ""
+        return tuple(sorted(owners, key=str.casefold))
 
     summaries: list[AdSpendSummaryPreview] = []
     details: list[AdSpendDetailPreview] = []
@@ -307,10 +306,21 @@ def build_ad_spend_preview(
                     and item.evidence.campaign_id == row.campaign_id
                     and item.evidence.ad_group_id == row.ad_group_id
                 )), None)
+                has_candidate = bool(outcome and outcome.candidate_local_skus)
+                report_level = (
+                    "广告组实际花费（已归属）" if outcome and outcome.local_sku
+                    else "广告组实际花费（SKU候选）" if has_candidate
+                    else "广告组实际花费（未归属）"
+                )
                 details.append(AdSpendDetailPreview(
-                    day_text, kind, "广告组实际花费（已归属）" if outcome and outcome.local_sku else "广告组实际花费（未归属）",
-                    outcome.local_sku if outcome else "", "", "", "", row.profile_id, row.campaign_id,
-                    row.ad_group_id, _money(row.cost), outcome.status if outcome else "仅供活动总额核对，未归属",
+                    day_text, kind, report_level,
+                    outcome.local_sku if outcome and outcome.local_sku else "", "",
+                    ", ".join(outcome.candidate_asins) if outcome else "", "", row.profile_id,
+                    row.campaign_id, row.ad_group_id, _money(row.cost),
+                    outcome.status if outcome else "仅供活动总额核对，未归属",
+                    ad_creative_id=", ".join(outcome.candidate_creative_ids) if outcome else "",
+                    candidate_local_skus=outcome.candidate_local_skus if outcome else (),
+                    candidate_resolution_complete=bool(outcome and outcome.candidate_resolution_complete),
                 ))
             # Current creative catalogs help locate IDs, but contain no historical
             # validity interval and therefore cannot authorize historical spend.
@@ -319,8 +329,10 @@ def build_ad_spend_preview(
                     asins = catalog.asins or ("",)
                     for asin in asins:
                         details.append(AdSpendDetailPreview(
-                            day_text, "HSA", "当前创意目录快照（非历史费用）", catalog_sku_candidate(catalog, asin), "", asin,
+                            day_text, "HSA", "当前创意目录快照（非历史费用）", "", "", asin,
                             catalog.ad_id or catalog.ad_creative_id, catalog.profile_id, catalog.campaign_id,
                             catalog.ad_group_id, "", "仅用于核对标识；不证明报表日推广关系，不参与费用归属或计费",
+                            ad_creative_id=catalog.ad_creative_id,
+                            candidate_local_skus=catalog_sku_candidates(catalog, asin),
                         ))
     return summaries, details
