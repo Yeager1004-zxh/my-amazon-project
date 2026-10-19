@@ -27,6 +27,12 @@
 
 请求成功必须同时满足 HTTP 2xx、`code=0`、`data` 为对象、`data.total` 为非负整数、`data.list` 为对象数组。SKU 结果使用 `sku`、`sids`、`price_list.local_sku/sid/seller_sku` 与所选 SID 复核；未返回记录、字段未返回、`null` 和明确的 `0` 分开处理。
 
+## 广告费用日期与汇总维度诊断
+
+用户提供的官方 Markdown 明确说明 `start_date`、`end_date` 为必填、双闭区间、最多 92 天；`summary_field` 支持 `sku` 和 `msku`，并说明 SKU 维度键为 `sku + sid`、MSKU 维度键为 `seller_sku + sid`。现有只读诊断按钮要求输入一个 SKU 和连续三天，将串行发送四组请求：三天各一次 `summary_field=sku`，以及中间日一次 `summary_field=msku`。每一日请求都令 `start_date=end_date`，沿用 `search_field=local_sku` 与同一个 local SKU 条件；MSKU 结果只在 `price_list` 能唯一映射回所选 SID 和请求 SKU 时显示。
+
+诊断展示 `spend`、SP、SB、SBV、SD 和差异分摊字段及币种，但不求和、不转换口径、不写周报。日期筛选参数确实发送到 API，但 AsinListNew 响应没有行级报表日期；所以跨日数值变化只能提供筛选行为的线索，不能单凭该结果证明费用字段采用了请求日期。官方 Markdown 将 `spend` 描述为广告花费组成项总计，并列出 `shared_ads_sb_cost`/`shared_ads_sbv_cost` 为 SB/SBV 广告费，但未说明它们的统计来源、分摊算法、广告活动关联、历史覆盖或费用日期时点。若单 SKU 数值仍高于同日全店活动实际花费，必须继续以领星“产品表现”和“广告管理”页面分开比对，不得把该费用字段当作活动实际花费。
+
 ## 模板字段映射与当前状态
 
 “已接入”只表示现有生成流程已经处理该字段，不代表新 AsinListNew 字段已完成 Windows 验收。AsinListNew 候选字段在单日实测及口径确认前不写入正式周报。

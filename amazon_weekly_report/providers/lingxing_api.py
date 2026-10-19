@@ -65,7 +65,7 @@ class SkuProductMapping:
 
 @dataclass(frozen=True)
 class ProductPerformanceMetrics:
-    """One local-SKU summary returned for an explicitly requested date interval.
+    """One SKU or MSKU summary returned for an explicitly requested date interval.
 
     The endpoint response has no per-row date. Callers must retain the request
     interval and must not treat a multi-day value as a daily observation.
@@ -80,6 +80,8 @@ class ProductPerformanceMetrics:
     currency_code: str | None = field(repr=False)
     values: dict[str, Any] = field(repr=False)
     present_fields: frozenset[str] = field(repr=False)
+    summary_field: str = field(default="sku", repr=False)
+    summary_key: str | None = field(default=None, repr=False)
 
 
 PRODUCT_PERFORMANCE_PREVIEW_FIELDS: tuple[str, ...] = (
@@ -608,8 +610,11 @@ def parse_product_performance_metrics_page(
     requested_skus: set[str],
     start_date: date,
     end_date: date,
+    summary_field: str = "sku",
 ) -> tuple[int, list[ProductPerformanceMetrics]]:
-    """Parse the official AsinListNew SKU summary without asserting daily scope."""
+    """Parse one official AsinListNew summary dimension without asserting daily scope."""
+    if summary_field not in {"sku", "msku"}:
+        raise LingxingApiError("产品表现预览仅支持已记录的 sku 或 msku 汇总维度。")
     endpoint = "产品表现新版"
     response = _business_code(payload, endpoint, message_field="msg")
     if not isinstance(response.get("trace_id"), str):
@@ -625,35 +630,53 @@ def parse_product_performance_metrics_page(
         raise LingxingApiError(f"{endpoint}响应字段 data.list 必须是对象数组。")
 
     parsed_rows: list[ProductPerformanceMetrics] = []
-    seen_skus: set[str] = set()
+    seen_summary_keys: set[tuple[str, str]] = set()
     for item in records:
-        local_sku = _required_text(item.get("sku"), "sku", endpoint)
-        if local_sku not in requested_skus:
-            raise LingxingApiError(f"{endpoint}返回了本次未请求的 local SKU；已停止归属。")
-        if local_sku in seen_skus:
-            raise LingxingApiError(f"{endpoint}在 SKU 汇总维度返回重复 SKU {local_sku}；已停止归属。")
-        seen_skus.add(local_sku)
-
         raw_sids = item.get("sids")
         if not isinstance(raw_sids, list) or not raw_sids:
             raise LingxingApiError(f"{endpoint}响应字段 sids 必须是非空数组。")
         row_sids = {_documented_sid(value, "sids") for value in raw_sids}
         if row_sids != {store_sid}:
-            raise LingxingApiError(f"{endpoint} SKU 汇总行的店铺范围与所选 SID 不一致或不唯一。")
+            raise LingxingApiError(f"{endpoint}汇总行的店铺范围与所选 SID 不一致或不唯一。")
 
         raw_price_list = item.get("price_list")
         if not isinstance(raw_price_list, list):
             raise LingxingApiError(f"{endpoint}响应字段 price_list 必须是数组。")
         seller_skus: set[str] = set()
+        matched_local_skus: set[str] = set()
         for price in raw_price_list:
             if not isinstance(price, dict):
                 raise LingxingApiError(f"{endpoint}响应字段 price_list 必须包含对象。")
             row_local_sku = _required_text(price.get("local_sku"), "price_list.local_sku", endpoint)
             row_sid = _documented_sid(price.get("sid"), "price_list.sid")
-            if row_local_sku == local_sku and row_sid == store_sid:
+            if row_sid == store_sid and row_local_sku in requested_skus:
+                matched_local_skus.add(row_local_sku)
                 seller_skus.add(_required_text(price.get("seller_sku"), "price_list.seller_sku", endpoint))
         if not seller_skus:
             raise LingxingApiError(f"{endpoint}没有可核验的本店 MSKU 与 local SKU 对应关系。")
+
+        if summary_field == "sku":
+            local_sku = _required_text(item.get("sku"), "sku", endpoint)
+            if local_sku not in requested_skus:
+                raise LingxingApiError(f"{endpoint}返回了本次未请求的 local SKU；已停止归属。")
+            if matched_local_skus != {local_sku}:
+                raise LingxingApiError(f"{endpoint} SKU 汇总行与 price_list 的本店 SKU 映射不一致。")
+            if local_sku in {key[0] for key in seen_summary_keys}:
+                raise LingxingApiError(f"{endpoint}在 SKU 汇总维度返回重复 SKU {local_sku}；已停止归属。")
+            summary_key = local_sku
+        else:
+            if len(matched_local_skus) != 1:
+                raise LingxingApiError(
+                    f"{endpoint} MSKU 汇总行无法唯一匹配一个本店、已请求的 local SKU；已停止归属。"
+                )
+            if len(seller_skus) != 1:
+                raise LingxingApiError(f"{endpoint} MSKU 汇总行未唯一标识 seller_sku；已停止归属。")
+            local_sku = next(iter(matched_local_skus))
+            summary_key = next(iter(seller_skus))
+        identity = (local_sku, summary_key)
+        if identity in seen_summary_keys:
+            raise LingxingApiError(f"{endpoint}返回重复的 {summary_field} 汇总行；已停止归属。")
+        seen_summary_keys.add(identity)
 
         raw_asins = item.get("asins")
         if not isinstance(raw_asins, list):
@@ -714,6 +737,8 @@ def parse_product_performance_metrics_page(
             currency_code=currency_code,
             values=values,
             present_fields=present_fields,
+            summary_field=summary_field,
+            summary_key=summary_key,
         ))
     return total, parsed_rows
 
@@ -1199,8 +1224,9 @@ class LingxingOpenApiClient:
         store_sid: int,
         local_skus: list[str],
         event_date: date,
+        summary_field: str = "sku",
     ) -> list[ProductPerformanceMetrics]:
-        """Read SKU-summary metrics for one site date; never writes report data.
+        """Read one supported summary dimension for one site date; never writes report data.
 
         This deliberately accepts a single date only. The endpoint returns no
         row-level date, so a multi-day aggregate must not be mistaken for daily
@@ -1213,6 +1239,8 @@ class LingxingOpenApiClient:
             raise LingxingApiError("产品表现指标查询必须使用动态店铺 SID。")
         if type(event_date) is not date:
             raise LingxingApiError("产品表现指标查询日期必须是有效的站点日期。")
+        if summary_field not in {"sku", "msku"}:
+            raise LingxingApiError("产品表现指标查询汇总维度仅支持 sku 或 msku。")
         if not isinstance(local_skus, list) or not 1 <= len(local_skus) <= 50:
             raise LingxingApiError("产品表现指标查询需要 1–50 个 local SKU。")
         normalized_skus: list[str] = []
@@ -1226,8 +1254,8 @@ class LingxingOpenApiClient:
 
         offset = 0
         expected_total: int | None = None
-        seen_skus: set[str] = set()
-        rows_by_sku: dict[str, ProductPerformanceMetrics] = {}
+        seen_summary_keys: set[tuple[str, str]] = set()
+        rows_by_key: dict[tuple[str, str], ProductPerformanceMetrics] = {}
         while True:
             body: dict[str, Any] = {
                 "offset": offset,
@@ -1240,7 +1268,7 @@ class LingxingOpenApiClient:
                 "sid": str(store_sid),
                 "start_date": event_date.isoformat(),
                 "end_date": event_date.isoformat(),
-                "summary_field": "sku",
+                "summary_field": summary_field,
                 "is_recently_enum": False,
                 # Explicitly retain the documented default refund-date rule.
                 "purchase_status": 0,
@@ -1255,6 +1283,7 @@ class LingxingOpenApiClient:
                 requested_skus=requested_skus,
                 start_date=event_date,
                 end_date=event_date,
+                summary_field=summary_field,
             )
             raw_records = payload["data"]["list"]
             if expected_total is None:
@@ -1266,15 +1295,61 @@ class LingxingOpenApiClient:
             if not raw_records and offset < total:
                 raise LingxingApiError("产品表现指标分页提前返回空页，数据可能不完整。")
             for row in page_rows:
-                if row.local_sku in seen_skus:
-                    raise LingxingApiError("产品表现指标分页返回重复 local SKU；已停止归属。")
-                seen_skus.add(row.local_sku)
-                rows_by_sku[row.local_sku] = row
+                identity = (row.local_sku, row.summary_key or "")
+                if identity in seen_summary_keys:
+                    raise LingxingApiError(f"产品表现指标分页返回重复 {summary_field} 汇总行；已停止归属。")
+                seen_summary_keys.add(identity)
+                rows_by_key[identity] = row
             if offset + len(raw_records) >= total:
                 break
             offset += len(raw_records)
 
-        return [rows_by_sku[sku] for sku in normalized_skus if sku in rows_by_sku]
+        return sorted(
+            rows_by_key.values(),
+            key=lambda row: (normalized_skus.index(row.local_sku), row.summary_key or ""),
+        )
+
+    def query_product_performance_cost_diagnostic(
+        self,
+        *,
+        access_token: str,
+        store_sid: int,
+        local_sku: str,
+        start_date: date,
+        end_date: date,
+    ) -> list[ProductPerformanceMetrics]:
+        """Compare three per-day SKU summaries with the middle-day MSKU summary.
+
+        This is a deliberately small, read-only diagnostic: it makes exactly
+        four paginated query sets, does not aggregate unlike dimensions, and
+        does not write or log returned business metrics.
+        """
+        if not isinstance(local_sku, str) or not local_sku.strip():
+            raise LingxingApiError("产品表现诊断需要一个 local SKU。")
+        if type(start_date) is not date or type(end_date) is not date:
+            raise LingxingApiError("产品表现诊断日期必须使用 YYYY-MM-DD 站点日期。")
+        if (end_date - start_date).days != 2:
+            raise LingxingApiError("产品表现日期诊断必须覆盖连续三天（开始日、次日、第三日）。")
+
+        requested_sku = local_sku.strip()
+        days = (start_date, start_date + timedelta(days=1), end_date)
+        rows: list[ProductPerformanceMetrics] = []
+        for event_date in days:
+            rows.extend(self.query_product_performance_single_day(
+                access_token=access_token,
+                store_sid=store_sid,
+                local_skus=[requested_sku],
+                event_date=event_date,
+                summary_field="sku",
+            ))
+        rows.extend(self.query_product_performance_single_day(
+            access_token=access_token,
+            store_sid=store_sid,
+            local_skus=[requested_sku],
+            event_date=days[1],
+            summary_field="msku",
+        ))
+        return rows
 
     def query_product_mappings(
         self,

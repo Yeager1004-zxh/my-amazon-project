@@ -92,6 +92,7 @@ OpenAPI 使用固定官方域名 `https://openapi.lingxing.com`。Token 请求�
 - 每日销量统计：`POST /erp/sc/data/sales_report/asinDailyLists`，以 `sid` 整数、`event_date` 站点日期、`asin_type=2`（MSKU）查询。`type=1/2/3` 分别读取销售额、销量、订单量；`offset` 从 0 开始，`length` 不超过 1000，逐页读到短页结束。只接受 `code=0` 和 `data` 直接数组，并核对返回 SID、站点日期和 MSKU。
 - 用户提供的两个页面没有完整历史首单日期字段/覆盖声明。`product_create_time` 表示商品创建时间，不是首单时间。因此界面只列出本次输入范围内最早的明确正销量日，不会据此填写 D01。
 - 「查询周报」页增加 AsinListNew 单日只读预览：只允许开始/结束日期相同；使用动态店铺 SID、`search_field=local_sku`、`summary_field=sku`，结果展示字段是否缺失、`null` 或明确为零，不写工作簿或日志。返回行没有日期字段，且评分、评论、排名缺少经证明的历史时点，因此这些字段仍不用于历史周报。
+- 增加 AsinListNew 广告费用口径诊断：输入一个 SKU 和连续三天后，串行执行 3 个按日 `summary_field=sku` 请求及中间日 1 个 `summary_field=msku` 请求。显示日期、汇总键、广告费用分项和币种；不把不同维度相加、不写周报或日志。MSKU 记录须经 `price_list` 唯一匹配所选店铺和本地 SKU，否则失败关闭。
 - `sessions_total`、广告订单/销售额、展示/点击/CTR/CVR 与 `spend`、SP/SB/SBV/SD 花费字段均只作为本地单日预览候选。尤其 `shared_ads_sb_cost` 与 `shared_ads_sbv_cost` 尚需核对币种、SKU 级归属及同日领星报表，未完成 Windows 实测前不接入 Excel。完整模板字段映射和接口限制见 [AsinListNew 字段映射表](docs/ASIN_LIST_NEW_FIELD_MAPPING.md)。
 - 用户提供的 `AsinDailyLists` 字段说明未定义取消/退款状态筛选或销售额净额算法；这些口径必须通过 Windows 与领星同店铺同日期的报表对照确认，完成前预览数字不能进入正式周报。
 - 两个接口均只读。查询金额使用 `Decimal`，请求和响应不写日志或工作簿；错误信息不包含 Token、签名或完整响应。Product Performance 的单店查询间隔按官方说明至少 1 秒。每日统计页面只给出令牌桶容量 5、未给出补充速率；客户端串行执行，收到 HTTP 429 时停止且不自动重发。若响应带整数 `Retry-After`，错误提示会显示建议等待秒数。
@@ -122,6 +123,14 @@ OpenAPI 使用固定官方域名 `https://openapi.lingxing.com`。Token 请求�
 4. 检查业务成功码、返回记录数、`currency_code`，以及 `sessions_total`、广告订单/销售额、曝光、点击、CTR/CVR、评分/评论/排名和 `spend`/SP/SB/SBV/SD 分项。将 `shared_ads_sb_cost` 与 `shared_ads_sbv_cost` 分开核对，不预设值，也不把活动级和商品级费用重复相加。仅当返回币种为 USD 时，才与领星该店铺/商品/日期后台金额比较。
 5. 单独记录广告类型费用是否与同日领星后台一致。当前 UI 的“字段未返回”、`null`、`0` 和没有 SKU 记录分别表示不同状态。历史排名、评分和评论数仍不得回填到过去日期。
 6. 回报本地参数校验、HTTP/业务 code、记录是否返回、币种、哪些字段存在，以及 SB 与后台是否一致；如需脱敏可只反馈“`shared_ads_sb_cost`匹配/不匹配、`shared_ads_sbv_cost`为零/非零/缺失”。不要发送密钥、Token、完整响应或其他 SKU 的业务明细。
+
+### AsinListNew 广告费用口径诊断
+
+1. 选择同一店铺，只输入一个 local SKU；开始日与结束日填写连续三天，例如 `2026-08-28` 至 `2026-08-30`。
+2. 点击“费用口径诊断 4 次只读查询”。程序按站点日期分别请求 28、29、30 日的 SKU 汇总，并额外请求 29 日的 MSKU 汇总；四组请求串行执行并遵守产品表现接口的单店限流。
+3. 对比表格中三个 `sku` 行的 `shared_ads_sb_cost`、`shared_ads_sbv_cost`、`spend`、币种；再对照中间日每个 `msku` 行。保留空白、`null`、显式 `0` 的区别，不能把多个 MSKU 行合并成 SKU 值。
+4. 将 29 日 AsinListNew 产品表现页面的字段与“广告管理”按 SKU 筛选结果、同日全店 SB 活动花费分别核对。该 API 文档确认日期参数为双闭区间且支持两种汇总维度，但没有定义这些费用字段的日期时点或分摊规则。接口结果不含行级报表日期，跨日变化不能独立证明字段统计口径。
+5. 只反馈每个日期/维度的本地校验、接口业务成功状态、费用字段为匹配/不匹配/缺失/零、币种是否一致。不要发送完整响应或敏感业务记录；该诊断不写 Excel。
 
 ### Windows OpenAPI 销售数据生成测试
 

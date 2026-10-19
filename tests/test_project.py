@@ -2096,6 +2096,45 @@ class LingxingOpenApiTests(unittest.TestCase):
                 end_date=day,
             )
 
+    def test_product_performance_parser_resolves_msku_summary_to_requested_local_sku(self) -> None:
+        day = date(2026, 8, 29)
+        first = self._product_metrics_record()
+        first["sku"] = None
+        second = self._product_metrics_record()
+        second["sku"] = None
+        second["price_list"] = [
+            {"local_sku": "local-test-a", "seller_sku": "market-test-2", "sid": "987654"}
+        ]
+        total, rows = parse_product_performance_metrics_page(
+            self._product_response([first, second]),
+            store_sid=987654,
+            requested_skus={"local-test-a"},
+            start_date=day,
+            end_date=day,
+            summary_field="msku",
+        )
+        self.assertEqual(total, 2)
+        self.assertEqual([(row.local_sku, row.summary_field, row.summary_key) for row in rows], [
+            ("local-test-a", "msku", "market-test-1"),
+            ("local-test-a", "msku", "market-test-2"),
+        ])
+
+        ambiguous = self._product_metrics_record()
+        ambiguous["sku"] = None
+        ambiguous["price_list"] = [
+            {"local_sku": "local-test-a", "seller_sku": "market-test-1", "sid": "987654"},
+            {"local_sku": "local-test-b", "seller_sku": "market-test-2", "sid": "987654"},
+        ]
+        with self.assertRaisesRegex(LingxingApiError, "无法唯一匹配一个本店"):
+            parse_product_performance_metrics_page(
+                self._product_response([ambiguous]),
+                store_sid=987654,
+                requested_skus={"local-test-a", "local-test-b"},
+                start_date=day,
+                end_date=day,
+                summary_field="msku",
+            )
+
     def test_product_performance_single_day_query_uses_local_sku_sku_summary_and_paginates(self) -> None:
         app_id = "synthetic-app-id"
         token = "synthetic-token"
@@ -2149,6 +2188,59 @@ class LingxingOpenApiTests(unittest.TestCase):
                 "app_key": app_id,
                 "timestamp": 1639734344,
             }, body, app_id)["sign"]])
+
+    def test_product_performance_cost_diagnostic_sends_three_dates_and_middle_day_msku(self) -> None:
+        token = "synthetic-token"
+        start = date(2026, 8, 28)
+        end = date(2026, 8, 30)
+        requests: list[dict[str, object]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content.decode("utf-8"))
+            requests.append(body)
+            record = self._product_metrics_record()
+            if body["summary_field"] == "msku":
+                record["sku"] = None
+            return httpx.Response(200, json=self._product_response([record]))
+
+        http = httpx.Client(transport=httpx.MockTransport(handler))
+        with patch("amazon_weekly_report.providers.lingxing_api._PRODUCT_PERFORMANCE_LAST_RESPONSE_AT", None), \
+                patch("amazon_weekly_report.providers.lingxing_api.time.time", return_value=1639734344), \
+                patch("amazon_weekly_report.providers.lingxing_api.time.monotonic", return_value=100.0), \
+                patch("amazon_weekly_report.providers.lingxing_api.time.sleep"):
+            with LingxingOpenApiClient("synthetic-app-id", "synthetic-secret", http_client=http) as client:
+                rows = client.query_product_performance_cost_diagnostic(
+                    access_token=token,
+                    store_sid=987654,
+                    local_sku="local-test-a",
+                    start_date=start,
+                    end_date=end,
+                )
+        http.close()
+
+        self.assertEqual(len(requests), 4)
+        self.assertEqual(
+            [(body["start_date"], body["summary_field"]) for body in requests],
+            [("2026-08-28", "sku"), ("2026-08-29", "sku"),
+             ("2026-08-30", "sku"), ("2026-08-29", "msku")],
+        )
+        self.assertTrue(all(body["start_date"] == body["end_date"] for body in requests))
+        self.assertTrue(all(body["search_field"] == "local_sku" for body in requests))
+        self.assertTrue(all(body["search_value"] == ["local-test-a"] for body in requests))
+        self.assertEqual([row.summary_field for row in rows], ["sku", "sku", "sku", "msku"])
+        self.assertEqual([row.start_date for row in rows], [
+            start, start + timedelta(days=1), end, start + timedelta(days=1),
+        ])
+
+        with LingxingOpenApiClient("synthetic-app-id", "synthetic-secret") as client:
+            with self.assertRaisesRegex(LingxingApiError, "连续三天"):
+                client.query_product_performance_cost_diagnostic(
+                    access_token=token,
+                    store_sid=987654,
+                    local_sku="local-test-a",
+                    start_date=start,
+                    end_date=start + timedelta(days=1),
+                )
 
     @staticmethod
     def _daily_record(
@@ -2765,6 +2857,49 @@ class OpenApiPreviewTests(unittest.TestCase):
         self.assertEqual(_product_performance_value(row, "shared_ads_sb_cost"), "0")
         self.assertIn("null", _product_performance_value(row, "shared_ads_sbv_cost"))
         self.assertEqual(_product_performance_value(row, "ads_sd_cost"), "字段未返回")
+
+    def test_cost_diagnostic_preview_shows_date_dimension_and_caveat_without_report_write(self) -> None:
+        app = object.__new__(WeeklyReportApp)
+        app.product_performance_status = self._Value()
+        app.product_performance_tree = self._Tree()
+        start = date(2026, 8, 28)
+        rows = [
+            ProductPerformanceMetrics(
+                store_sid=987654,
+                local_sku="local-test-a",
+                seller_skus=(summary_key,),
+                asins=("ASINTEST0001",),
+                start_date=event_date,
+                end_date=event_date,
+                currency_code="USD",
+                values={"shared_ads_sb_cost": Decimal("3.20"), "currency_code": "USD"},
+                present_fields=frozenset({"shared_ads_sb_cost", "currency_code"}),
+                summary_field=summary_field,
+                summary_key=summary_key,
+            )
+            for event_date, summary_field, summary_key in (
+                (start, "sku", "local-test-a"),
+                (start + timedelta(days=1), "sku", "local-test-a"),
+                (start + timedelta(days=2), "sku", "local-test-a"),
+                (start + timedelta(days=1), "msku", "market-test-1"),
+            )
+        ]
+        app._apply_product_performance_cost_diagnostic({
+            "_product_performance_rows": rows,
+            "_product_performance_skus": ["local-test-a"],
+            "_product_performance_start_date": start,
+            "_product_performance_end_date": start + timedelta(days=2),
+            "_product_performance_store": "Synthetic Store",
+            "_product_performance_sid": 987654,
+        })
+
+        self.assertEqual(len(app.product_performance_tree.rows), 4 * 7)
+        self.assertEqual(app.product_performance_tree.rows[0][:4], (
+            "2026-08-28", "sku", "local-test-a", "local-test-a",
+        ))
+        self.assertEqual(app.product_performance_tree.rows[-7][:2], ("2026-08-29", "msku"))
+        self.assertIn("不能单独证明", app.product_performance_status.value)
+        self.assertNotIn("19.21", str(app.product_performance_tree.rows))
 
 
 if __name__ == "__main__":

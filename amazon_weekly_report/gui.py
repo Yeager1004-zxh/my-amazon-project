@@ -73,6 +73,16 @@ _PRODUCT_PERFORMANCE_FIELD_LABELS = {
     "currency_code": "币种",
 }
 
+_PRODUCT_PERFORMANCE_COST_DIAGNOSTIC_FIELDS = (
+    "spend",
+    "ads_sp_cost",
+    "shared_ads_sb_cost",
+    "shared_ads_sbv_cost",
+    "ads_sd_cost",
+    "shared_cost_of_advertising",
+    "currency_code",
+)
+
 
 def _product_performance_value(row: ProductPerformanceMetrics, field_name: str) -> str:
     if field_name not in row.present_fields:
@@ -200,6 +210,12 @@ class WeeklyReportApp(tk.Tk):
             command=self._query_product_performance_preview,
         )
         self.product_performance_query_button.grid(row=0, column=5, sticky="w", padx=6, pady=4)
+        self.product_performance_cost_diagnostic_button = ttk.Button(
+            query_box,
+            text="费用口径诊断\n4 次只读查询",
+            command=self._query_product_performance_cost_diagnostic,
+        )
+        self.product_performance_cost_diagnostic_button.grid(row=0, column=6, sticky="w", padx=6, pady=4)
         self.report_mapping_status = tk.StringVar(value="商品映射尚未查询。")
         ttk.Label(query_box, textvariable=self.report_mapping_status, wraplength=900).grid(
             row=1, column=0, columnspan=5, sticky="w", padx=4, pady=(0, 5)
@@ -231,26 +247,32 @@ class WeeklyReportApp(tk.Tk):
 
         performance_box = ttk.LabelFrame(
             query_box,
-            text="AsinListNew 产品表现（单日只读预览；不写入 Excel 或日志）",
+            text="AsinListNew 产品表现（只读预览；不写入 Excel 或日志）",
             padding=6,
         )
         performance_box.grid(row=4, column=0, columnspan=6, sticky="nsew", padx=4, pady=(7, 3))
         self.product_performance_status = tk.StringVar(
-            value="请将开始日和结束日设为同一天，再点击“AsinListNew 单日只读查询”。"
+            value="单日预览要求开始日和结束日相同；费用诊断要求连续三天，比较每日 SKU 与中间日 MSKU 汇总。"
         )
         ttk.Label(performance_box, textvariable=self.product_performance_status, wraplength=950).grid(
             row=0, column=0, columnspan=4, sticky="w", padx=4, pady=(0, 4)
         )
-        performance_columns = ("local_sku", "field", "value", "currency", "scope")
+        performance_columns = (
+            "event_date", "summary_field", "summary_key", "local_sku",
+            "field", "value", "currency", "scope",
+        )
         self.product_performance_tree = ttk.Treeview(
             performance_box, columns=performance_columns, show="headings", height=8
         )
         for column, heading, width in (
-            ("local_sku", "本地 SKU", 130),
-            ("field", "API 字段", 190),
-            ("value", "接口返回值（空白 / null / 0 分开显示）", 220),
-            ("currency", "币种", 75),
-            ("scope", "口径核验状态", 430),
+            ("event_date", "请求日期", 92),
+            ("summary_field", "汇总维度", 78),
+            ("summary_key", "维度键", 125),
+            ("local_sku", "本地 SKU", 125),
+            ("field", "API 字段", 180),
+            ("value", "返回值（空白 / null / 0 分开）", 190),
+            ("currency", "币种", 60),
+            ("scope", "口径核验状态", 420),
         ):
             self.product_performance_tree.heading(column, text=heading)
             self.product_performance_tree.column(column, width=width, anchor="w")
@@ -260,6 +282,11 @@ class WeeklyReportApp(tk.Tk):
         )
         performance_scrollbar.grid(row=1, column=4, sticky="ns", pady=3)
         self.product_performance_tree.configure(yscrollcommand=performance_scrollbar.set)
+        performance_xscrollbar = ttk.Scrollbar(
+            performance_box, orient="horizontal", command=self.product_performance_tree.xview
+        )
+        performance_xscrollbar.grid(row=2, column=0, columnspan=4, sticky="ew", padx=4)
+        self.product_performance_tree.configure(xscrollcommand=performance_xscrollbar.set)
         performance_box.columnconfigure(3, weight=1)
         performance_box.rowconfigure(1, weight=1)
 
@@ -657,6 +684,78 @@ class WeeklyReportApp(tk.Tk):
             "AsinListNew 单日只读查询完成。",
         )
 
+    def _query_product_performance_cost_diagnostic(self) -> None:
+        if self._busy:
+            return
+        seller = self._selected_report_seller()
+        if seller is None:
+            messagebox.showwarning("请选择店铺", "请先刷新并选择领星授权店铺。")
+            return
+
+        local_skus = list(dict.fromkeys(
+            value.strip()
+            for value in self.skus_var.get().replace("，", ",").split(",")
+            if value.strip()
+        ))
+        if len(local_skus) != 1:
+            messagebox.showwarning("仅支持单 SKU 诊断", "请输入一个本地 SKU，以避免结果归属混淆。")
+            return
+
+        start_text = self.query_start_date_var.get().strip()
+        end_text = self.query_end_date_var.get().strip()
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", start_text) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", end_text):
+            messagebox.showwarning("日期格式错误", "请输入 YYYY-MM-DD 站点日期。")
+            return
+        try:
+            start_date = date.fromisoformat(start_text)
+            end_date = date.fromisoformat(end_text)
+        except ValueError:
+            messagebox.showwarning("日期格式错误", "请输入有效的 YYYY-MM-DD 站点日期。")
+            return
+        if (end_date - start_date).days != 2:
+            messagebox.showwarning(
+                "诊断日期范围无效",
+                "请设置连续三天，例如 2026-08-28 至 2026-08-30。程序将额外以 MSKU 维度查询中间日。",
+            )
+            return
+        try:
+            app_id, app_secret = self._openapi_credentials()
+        except CredentialStoreError as exc:
+            messagebox.showerror("OpenAPI 配置错误", str(exc))
+            return
+
+        for item_id in self.product_performance_tree.get_children():
+            self.product_performance_tree.delete(item_id)
+        self.product_performance_status.set(
+            "正在执行 4 组串行只读请求：三天 sku 汇总，以及中间日 msku 汇总…"
+        )
+
+        def query() -> dict[str, Any]:
+            with LingxingOpenApiClient(app_id, app_secret) as client:
+                token_result = client.get_access_token()
+                rows = client.query_product_performance_cost_diagnostic(
+                    access_token=token_result.token,
+                    store_sid=seller.sid,
+                    local_sku=local_skus[0],
+                    start_date=start_date,
+                    end_date=end_date,
+                )
+            return {
+                "_product_performance_cost_diagnostic": True,
+                "_product_performance_rows": rows,
+                "_product_performance_skus": local_skus,
+                "_product_performance_start_date": start_date,
+                "_product_performance_end_date": end_date,
+                "_product_performance_store": seller.name,
+                "_product_performance_sid": seller.sid,
+            }
+
+        self._start_task(
+            query,
+            self.product_performance_status,
+            "AsinListNew 日期与汇总维度诊断查询完成。",
+        )
+
     def _apply_product_performance_preview(self, result: dict[str, Any]) -> None:
         rows: list[ProductPerformanceMetrics] = result["_product_performance_rows"]
         requested_skus: list[str] = result["_product_performance_skus"]
@@ -672,7 +771,10 @@ class WeeklyReportApp(tk.Tk):
             row = row_by_sku.get(sku)
             if row is None:
                 self.product_performance_tree.insert(
-                    "", "end", values=(sku, "记录状态", "未返回商品记录（不是零值）", "", "查询范围内没有对应 data.list 记录")
+                    "", "end", values=(
+                        event_date.isoformat(), "sku", sku, sku,
+                        "记录状态", "未返回商品记录（不是零值）", "", "查询范围内没有对应 data.list 记录",
+                    )
                 )
                 continue
             for field_name in PRODUCT_PERFORMANCE_PREVIEW_FIELDS:
@@ -680,6 +782,9 @@ class WeeklyReportApp(tk.Tk):
                     "",
                     "end",
                     values=(
+                        event_date.isoformat(),
+                        row.summary_field,
+                        row.summary_key or "",
                         row.local_sku,
                         _PRODUCT_PERFORMANCE_FIELD_LABELS.get(field_name, field_name),
                         _product_performance_value(row, field_name),
@@ -687,6 +792,58 @@ class WeeklyReportApp(tk.Tk):
                         _product_performance_scope_note(field_name),
                     ),
                 )
+
+    def _apply_product_performance_cost_diagnostic(self, result: dict[str, Any]) -> None:
+        rows: list[ProductPerformanceMetrics] = result["_product_performance_rows"]
+        start_date: date = result["_product_performance_start_date"]
+        end_date: date = result["_product_performance_end_date"]
+        sku = result["_product_performance_skus"][0]
+        middle_date = start_date + (end_date - start_date) / 2
+        self.product_performance_status.set(
+            f"4 组只读查询成功（每页均通过业务 code=0）：店铺 {result['_product_performance_store']} "
+            f"（SID {result['_product_performance_sid']}），SKU {sku}；sku 汇总日期 "
+            f"{start_date.isoformat()}、{middle_date.isoformat()}、{end_date.isoformat()}，另查询 "
+            f"{middle_date.isoformat()} 的 msku 汇总。响应行不含报表日期；日期仅代表请求筛选条件，"
+            "数值变化可帮助排查，但不能单独证明费用字段的统计日期或分摊口径。结果只在本机预览。"
+        )
+        rows_by_query: dict[tuple[date, str], list[ProductPerformanceMetrics]] = {}
+        for row in rows:
+            rows_by_query.setdefault((row.start_date, row.summary_field), []).append(row)
+
+        for event_date, summary_field in (
+            (start_date, "sku"),
+            (middle_date, "sku"),
+            (end_date, "sku"),
+            (middle_date, "msku"),
+        ):
+            query_rows = rows_by_query.get((event_date, summary_field), [])
+            if not query_rows:
+                self.product_performance_tree.insert(
+                    "", "end", values=(
+                        event_date.isoformat(), summary_field, sku, sku,
+                        "记录状态", "未返回商品记录（不是零值）", "", "本次请求没有对应 data.list 记录",
+                    )
+                )
+                continue
+            for row in query_rows:
+                for field_name in _PRODUCT_PERFORMANCE_COST_DIAGNOSTIC_FIELDS:
+                    scope = (
+                        "请求日期筛选；Schema 未定义该费用字段的日期/分摊口径，需与后台同日核对"
+                        if field_name != "currency_code"
+                        else "接口币种字段；须与领星后台金额币种一致"
+                    )
+                    self.product_performance_tree.insert(
+                        "", "end", values=(
+                            event_date.isoformat(),
+                            summary_field,
+                            row.summary_key or "",
+                            row.local_sku,
+                            _PRODUCT_PERFORMANCE_FIELD_LABELS.get(field_name, field_name),
+                            _product_performance_value(row, field_name),
+                            row.currency_code or "",
+                            scope,
+                        ),
+                    )
 
     def _query_report_sku_data(self) -> None:
         if self._busy:
@@ -1034,6 +1191,7 @@ class WeeklyReportApp(tk.Tk):
         self.generate_api_button.configure(state="disabled")
         self.report_query_button.configure(state="disabled")
         self.product_performance_query_button.configure(state="disabled")
+        self.product_performance_cost_diagnostic_button.configure(state="disabled")
         self.report_ad_query_button.configure(state="disabled")
         self.progress.start(10)
         status_var.set("处理中…")
@@ -1082,7 +1240,10 @@ class WeeklyReportApp(tk.Tk):
                     elif status_var is self.report_query_status and isinstance(result, dict):
                         self._apply_daily_sales_preview(result)
                     elif status_var is self.product_performance_status and isinstance(result, dict):
-                        self._apply_product_performance_preview(result)
+                        if result.get("_product_performance_cost_diagnostic"):
+                            self._apply_product_performance_cost_diagnostic(result)
+                        else:
+                            self._apply_product_performance_preview(result)
                     elif status_var is self.report_ad_status and isinstance(result, dict) and result.get("_ad_windows_by_type") is not None:
                         self._apply_ad_spend_preview(result)
                     elif isinstance(result, dict):
@@ -1108,6 +1269,7 @@ class WeeklyReportApp(tk.Tk):
             self.generate_api_button.configure(state="normal")
             self.report_query_button.configure(state="normal")
             self.product_performance_query_button.configure(state="normal")
+            self.product_performance_cost_diagnostic_button.configure(state="normal")
             self.report_ad_query_button.configure(state="normal")
         self.after(150, self._poll_events)
 
