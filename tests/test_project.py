@@ -83,11 +83,21 @@ from amazon_weekly_report.providers.lingxing_signing import (
     generate_signature,
     signed_post_query_parameters,
 )
-from amazon_weekly_report.report_generation import ReportGenerationError, generate_reports
+from amazon_weekly_report.report_generation import (
+    ReportGenerationError,
+    _api_ad_spend_report,
+    generate_reports,
+)
 from amazon_weekly_report.template_expansion import ensure_day_rows
 from amazon_weekly_report.template_inspection import inspect_template
 from amazon_weekly_report.timeline import build_timeline
 from amazon_weekly_report.gui import WeeklyReportApp, _product_performance_value
+from amazon_weekly_report.hsa_attribution_settings import (
+    HsaAdGroupSkuMapping,
+    HsaAttributionSettingsError,
+    load_hsa_ad_group_mappings,
+    save_hsa_ad_group_mapping,
+)
 
 
 HEADERS = [
@@ -480,6 +490,101 @@ class TemplateAndReportTests(unittest.TestCase):
 
 
 class ApiReportGenerationTests(unittest.TestCase):
+    def test_openapi_ad_totals_require_all_three_types_group_ownership_and_basis(self) -> None:
+        report_day = date(2026, 8, 29)
+        mapping = SkuProductMapping("LOCAL-A", ("MSKU-A",), ("ASIN-A",))
+        sp = SpAdSpendWindow(
+            report_day, report_day,
+            (SpCampaignSpend(report_day, "sp-campaign", Decimal("1.00"), "profile-1"),),
+            (SpProductAdSpend(
+                report_day, "MSKU-A", "ASIN-A", "sp-ad", "sp-group", "sp-campaign",
+                Decimal("1.00"), "profile-1",
+            ),), (), (), ad_type="SP", campaign_cost_total=Decimal("1.00"),
+            detail_cost_total=Decimal("1.00"), report_complete=True,
+        )
+        hsa = SpAdSpendWindow(
+            report_day, report_day,
+            (SpCampaignSpend(report_day, "hsa-campaign", Decimal("2.00"), "profile-1"),),
+            (), (), (), ad_type="HSA",
+            ad_group_rows=(SbAdGroupSpend(report_day, "hsa-campaign", "hsa-group", Decimal("2.00"), "profile-1"),),
+            campaign_cost_total=Decimal("2.00"), detail_cost_total=Decimal("2.00"), report_complete=True,
+        )
+        sd = SpAdSpendWindow(
+            report_day, report_day,
+            (SpCampaignSpend(report_day, "sd-campaign", Decimal("3.00"), "profile-1"),),
+            (SpProductAdSpend(
+                report_day, "MSKU-A", "ASIN-A", "sd-ad", "sd-group", "sd-campaign",
+                Decimal("3.00"), "profile-1",
+            ),), (), (), ad_type="SD", campaign_cost_total=Decimal("3.00"),
+            detail_cost_total=Decimal("3.00"), report_complete=True,
+        )
+        confirmation = HsaAdGroupSkuMapping(
+            10, "profile-1", "hsa-campaign", "hsa-group", "LOCAL-A", report_day, report_day,
+        )
+        args = dict(
+            windows_by_type={"SP": [sp], "HSA": [hsa], "SD": [sd]},
+            mappings=[mapping], confirmed_hsa_mappings=[confirmation], skus=["LOCAL-A"],
+            store_sid=10, expected_dates={report_day},
+        )
+        unverified = _api_ad_spend_report(**args, currency_and_date_basis_verified=False)
+        self.assertEqual(unverified.coverage_scope, "PARTIAL_OR_UNKNOWN")
+        self.assertEqual(unverified.rows_by_sku_date, {"local-a": {}})
+        self.assertTrue(any("币种" in item for item in unverified.warnings or []))
+
+        verified = _api_ad_spend_report(**args, currency_and_date_basis_verified=True)
+        self.assertEqual(verified.coverage_scope, "ALL_AD_TYPES_TOTAL_CONFIRMED")
+        self.assertEqual(
+            verified.rows_by_sku_date["local-a"][report_day]["actual_spend"], Decimal("6.00")
+        )
+        self.assertEqual(verified.source_total_spend, Decimal("6.00"))
+
+        sales_row = SkuDailySales(
+            10, "LOCAL-A", "MSKU-A", "ASIN-A", report_day, "USD", 1, 1, Decimal("10.00")
+        )
+        sales_window = SkuDailySalesWindow(report_day, report_day, (mapping,), (sales_row,))
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            template = root / "template.xlsx"
+            create_template(template)
+            result = generate_reports(
+                template_path=template,
+                data_folder=None,
+                mapping_path=None,
+                skus=["LOCAL-A"],
+                output_path=root / "generated.xlsx",
+                d01_dates={"LOCAL-A": report_day},
+                d01_confirmed=True,
+                api_sales_windows=[sales_window],
+                api_store_sid=10,
+                api_store_name="Synthetic Shop",
+                api_ad_spend_windows_by_type={"SP": [sp], "HSA": [hsa], "SD": [sd]},
+                api_ad_sku_mappings=[mapping],
+                api_hsa_ad_group_mappings=[confirmation],
+                api_ad_currency_and_date_basis_verified=True,
+            )
+            workbook = load_workbook(result.output_path, data_only=False)
+            self.assertEqual(workbook["LOCAL-A"]["U6"].value, 6)
+            self.assertEqual(result.sku_results[0].status, "success")
+            workbook.close()
+
+        shared_hsa = SpAdSpendWindow(
+            report_day, report_day,
+            (SpCampaignSpend(report_day, "hsa-campaign", Decimal("2.50"), "profile-1"),),
+            (), (), (), ad_type="HSA",
+            ad_group_rows=(
+                SbAdGroupSpend(report_day, "hsa-campaign", "hsa-group", Decimal("2.00"), "profile-1"),
+                SbAdGroupSpend(report_day, "hsa-campaign", "unmapped-group", Decimal("0.50"), "profile-1"),
+            ),
+            campaign_cost_total=Decimal("2.50"), detail_cost_total=Decimal("2.50"), report_complete=True,
+        )
+        incomplete = _api_ad_spend_report(
+            **{**args, "windows_by_type": {"SP": [sp], "HSA": [shared_hsa], "SD": [sd]}},
+            currency_and_date_basis_verified=True,
+        )
+        self.assertEqual(incomplete.coverage_scope, "PARTIAL_OR_UNKNOWN")
+        self.assertEqual(incomplete.rows_by_sku_date, {"local-a": {}})
+        self.assertTrue(any("HSA 至少有一个广告组" in item for item in incomplete.anomalies or []))
+
     def test_openapi_sales_generate_template_d61_and_keep_missing_distinct_from_zero(self) -> None:
         start = date(2026, 1, 1)
         end = start + timedelta(days=61)
@@ -526,7 +631,7 @@ class ApiReportGenerationTests(unittest.TestCase):
             )
             self.assertEqual(result.sku_results[0].status, "partial")
             self.assertEqual(result.sku_results[0].days, 62)
-            self.assertTrue(any("未确认覆盖 SP、SB、SD" in warning for warning in result.sku_results[0].warnings))
+            self.assertTrue(any("未确认覆盖 SP、HSA、SD" in warning for warning in result.sku_results[0].warnings))
             workbook = load_workbook(output, data_only=False)
             sheet = workbook["API-TEST"]
             self.assertEqual(sheet["E6"].value, 0)
@@ -683,7 +788,7 @@ class ApiReportGenerationTests(unittest.TestCase):
             self.assertEqual(d02["ad_spend_coverage_scope"], "PARTIAL_OR_UNKNOWN")
             self.assertIsNone(d02["actual_ad_spend"])
             sku = next(item for item in daily if item.get("record_type") == "sku")
-            self.assertTrue(any("未确认覆盖 SP、SB、SD" in warning for warning in sku["warnings"]))
+            self.assertTrue(any("未确认覆盖 SP、HSA、SD" in warning for warning in sku["warnings"]))
 
 
 class D01SettingsTests(unittest.TestCase):
@@ -715,6 +820,50 @@ class D01SettingsTests(unittest.TestCase):
             save_d01_dates(True, {"SKU_A": date(2026, 1, 1)}, path=Path("unused.json"))
         with self.assertRaises(D01SettingsError):
             save_d01_dates(510226, {"SKU_A": "2026-01-01"}, path=Path("unused.json"))  # type: ignore[arg-type]
+
+
+class HsaAttributionSettingsTests(unittest.TestCase):
+    def test_hsa_group_confirmations_persist_by_store_and_effective_dates(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "hsa_mappings.json"
+            mapping = HsaAdGroupSkuMapping(
+                123, "profile-a", "campaign-a", "group-a", "LOCAL-A",
+                date(2026, 8, 29), date(2026, 9, 30),
+            )
+            saved_path = save_hsa_ad_group_mapping(mapping, path=path)
+            self.assertEqual(saved_path, path)
+            self.assertEqual(load_hsa_ad_group_mappings(path), (mapping,))
+            text = path.read_text(encoding="utf-8")
+            self.assertNotIn("appsecret", text.casefold())
+            self.assertNotIn("token", text.casefold())
+            self.assertEqual(text.count('"campaign_id"'), 1)
+
+    def test_overlapping_conflicting_sku_mapping_is_rejected_without_overwrite(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "hsa_mappings.json"
+            first = HsaAdGroupSkuMapping(
+                123, "profile-a", "campaign-a", "group-a", "LOCAL-A",
+                date(2026, 8, 1), date(2026, 8, 31),
+            )
+            conflicting = HsaAdGroupSkuMapping(
+                123, "PROFILE-A", "campaign-a", "group-a", "LOCAL-B",
+                date(2026, 8, 29), date(2026, 9, 2),
+            )
+            save_hsa_ad_group_mapping(first, path=path)
+            before = path.read_text(encoding="utf-8")
+            with self.assertRaises(HsaAttributionSettingsError):
+                save_hsa_ad_group_mapping(conflicting, path=path)
+            self.assertEqual(path.read_text(encoding="utf-8"), before)
+
+    def test_invalid_hsa_mapping_dates_and_sid_are_rejected(self) -> None:
+        with self.assertRaises(HsaAttributionSettingsError):
+            save_hsa_ad_group_mapping(HsaAdGroupSkuMapping(
+                True, "p", "c", "g", "SKU", date(2026, 1, 1), date(2026, 1, 2)
+            ), path=Path("unused.json"))
+        with self.assertRaises(HsaAttributionSettingsError):
+            save_hsa_ad_group_mapping(HsaAdGroupSkuMapping(
+                123, "p", "c", "g", "SKU", date(2026, 1, 2), date(2026, 1, 1)
+            ), path=Path("unused.json"))
 
 
 class SpAdApiTests(unittest.TestCase):
@@ -914,7 +1063,7 @@ class SpAdApiTests(unittest.TestCase):
         self.assertEqual(window.sku_daily_spends, ())
         http.close()
 
-    def test_current_sb_catalog_is_candidate_only_for_historical_report_date(self) -> None:
+    def test_current_hsa_catalog_is_diagnostic_only_for_historical_report_date(self) -> None:
         report_day = date(2026, 8, 29)
         requests: list[str] = []
         campaign = [{"campaign_id": 10, "profile_id": 20, "cost": 7.31, "report_date": report_day.isoformat()}]
@@ -959,16 +1108,42 @@ class SpAdApiTests(unittest.TestCase):
             store_sid=77, requested_skus=["LOCAL-A"], start_date=report_day, end_date=report_day,
         )
         sku_row = next(row for row in summaries if row.local_sku == "LOCAL-A")
-        catalog_row = next(row for row in details if row.report_level.startswith("当前商品目录"))
-        self.assertEqual(sku_row.sb_cost, "")
-        self.assertIn("历史", sku_row.integrity)
+        catalog_row = next(row for row in details if row.report_level.startswith("当前创意目录"))
+        self.assertEqual(sku_row.hsa_cost, "")
+        self.assertIn("没有已确认归属", sku_row.integrity)
         self.assertEqual(catalog_row.local_sku, "LOCAL-A")
         self.assertEqual(catalog_row.cost, "")
-        self.assertEqual(catalog_row.ad_type, "SBV候选")
+        self.assertEqual(catalog_row.ad_type, "HSA")
         self.assertIn("不参与费用归属", catalog_row.integrity)
-        title_only = next(row for row in details if row.campaign_id == "13" and row.report_level.startswith("当前商品目录"))
-        self.assertEqual(title_only.ad_type, "HSA创意候选")
-        self.assertNotIn("SBV 类型候选", title_only.integrity)
+        title_only = next(row for row in details if row.campaign_id == "13" and row.report_level.startswith("当前创意目录"))
+        self.assertEqual(title_only.ad_type, "HSA")
+        self.assertNotIn("SBV", title_only.integrity)
+        http.close()
+
+    def test_hsa_history_query_is_not_blocked_by_current_catalog_failure(self) -> None:
+        report_day = date(2026, 8, 29)
+        requests: list[str] = []
+        campaign = [{"campaign_id": 10, "profile_id": 20, "cost": 7.31, "report_date": report_day.isoformat()}]
+        groups = [{"campaign_id": 10, "ad_group_id": 11, "profile_id": 20, "cost": 7.31, "report_date": report_day.isoformat()}]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request.url.path)
+            if request.url.path == SB_PRODUCT_ADS_PATH:
+                return httpx.Response(503)
+            if request.url.path == SB_CAMPAIGN_REPORTS_PATH:
+                return httpx.Response(200, json=self._envelope(campaign))
+            return httpx.Response(200, json=self._envelope(groups))
+
+        http = httpx.Client(transport=httpx.MockTransport(handler))
+        with LingxingOpenApiClient("1234567890123456", "fixture-app-secret", http_client=http) as client:
+            windows = client.query_sb_ad_spend_history(
+                access_token="fixture-token", store_sid=77,
+                start_date=report_day, end_date=report_day,
+            )
+        self.assertEqual(requests, [SB_PRODUCT_ADS_PATH, SB_CAMPAIGN_REPORTS_PATH, SB_AD_GROUP_REPORTS_PATH])
+        self.assertTrue(windows[0].report_complete)
+        self.assertFalse(windows[0].promotion_catalog_complete)
+        self.assertEqual(windows[0].campaign_cost_total, Decimal("7.31"))
         http.close()
 
     def test_sd_product_cost_is_mapped_only_after_campaign_reconciliation(self) -> None:
@@ -1235,10 +1410,10 @@ class AdPreviewTests(unittest.TestCase):
             (), ad_type="SP", campaign_cost_total=Decimal("1.50"),
             detail_cost_total=Decimal("1.50"), unattributed_cost=Decimal("0.50"), report_complete=True,
         )
-        sb = SpAdSpendWindow(
+        hsa = SpAdSpendWindow(
             report_day, report_day,
-            (SpCampaignSpend(report_day, "2", Decimal("4.00")),), (), (), (),
-            ad_type="HSA", ad_group_rows=(SbAdGroupSpend(report_day, "2", "21", Decimal("4.00")),),
+            (SpCampaignSpend(report_day, "2", Decimal("4.00"), "profile-2"),), (), (), (),
+            ad_type="HSA", ad_group_rows=(SbAdGroupSpend(report_day, "2", "21", Decimal("4.00"), "profile-2"),),
             campaign_cost_total=Decimal("4.00"), detail_cost_total=Decimal("4.00"),
             unattributed_cost=Decimal("4.00"), report_complete=True,
         )
@@ -1254,73 +1429,123 @@ class AdPreviewTests(unittest.TestCase):
             detail_cost_total=Decimal("2.25"), unattributed_cost=Decimal("0.25"), report_complete=True,
         )
         summaries, details = build_ad_spend_preview(
-            windows_by_type={"SP": [sp], "HSA": [sb], "SD": [sd]},
+            windows_by_type={"SP": [sp], "HSA": [hsa], "SD": [sd]},
             mappings=[mapping], requested_skus=["LOCAL-A"],
             store_sid=1,
             start_date=report_day, end_date=report_day,
         )
         sku_row, unallocated_row = summaries
-        self.assertEqual((sku_row.sp_cost, sku_row.sb_cost, sku_row.sd_cost), ("1.00", "", "2.00"))
+        self.assertEqual((sku_row.sp_cost, sku_row.hsa_cost, sku_row.sd_cost), ("1.00", "", "2.00"))
         self.assertEqual(sku_row.confirmed_total, "")
         self.assertEqual(sku_row.unattributed_cost, "")
-        self.assertIn("HSA（普通 SB/SBV 未拆分）", sku_row.integrity)
-        self.assertIn("HSA普通SB/SBV未拆分=4.00", unallocated_row.unattributed_cost)
-        self.assertIn("币种/日期口径/历史映射时效尚未全部验收", sku_row.integrity)
-        self.assertEqual((unallocated_row.sp_cost, unallocated_row.sb_cost, unallocated_row.sbv_cost, unallocated_row.sd_cost), ("0.50", "", "", "0.25"))
+        self.assertIn("HSA 活动与广告组成本已核平", sku_row.integrity)
+        self.assertIn("HSA未归属=4.00", unallocated_row.unattributed_cost)
+        self.assertIn("跨类型币种/日期口径", sku_row.integrity)
+        self.assertEqual((unallocated_row.sp_cost, unallocated_row.hsa_cost, unallocated_row.sd_cost), ("0.50", "4.00", "0.25"))
         self.assertEqual(unallocated_row.confirmed_total, "")
-        self.assertIn("HSA 活动费用暂不拆成普通 SB/SBV", unallocated_row.integrity)
+        self.assertIn("活动总额仅用于核对", unallocated_row.integrity)
         self.assertTrue(any(row.report_level == "活动总额（仅核对）" and "不与明细相加" in row.integrity for row in details))
         self.assertTrue(any(
-            row.ad_type == "HSA" and row.report_level == "广告组记录（不重复计费）" and not row.local_sku and row.cost == "4.00"
+            row.ad_type == "HSA" and row.report_level == "广告组实际花费（未归属）" and not row.local_sku and row.cost == "4.00"
             for row in details
         ))
         self.assertTrue(any(row.report_sku == "UNKNOWN" and row.local_sku == "" for row in details))
 
-    def test_combined_hsa_product_rows_are_not_assigned_to_ordinary_sb_or_sbv(self) -> None:
+    def test_hsa_requires_historical_or_date_scoped_operator_ownership(self) -> None:
         report_day = date(2026, 8, 29)
-        sb = SpAdSpendWindow(
+        hsa = SpAdSpendWindow(
             report_day, report_day,
             (SpCampaignSpend(report_day, "campaign-1", Decimal("7.31"), "profile-1"),),
-            (SpProductAdSpend(report_day, "", "ASIN-A", "ad-1", "group-1", "campaign-1", Decimal("7.31"), "profile-1"),),
-            (), (), ad_type="HSA", campaign_cost_total=Decimal("7.31"),
-            detail_cost_total=Decimal("7.31"), unattributed_cost=Decimal("0"), report_complete=True,
+            (), (), (), ad_type="HSA", campaign_cost_total=Decimal("7.31"),
+            ad_group_rows=(SbAdGroupSpend(report_day, "campaign-1", "group-1", Decimal("7.31"), "profile-1"),),
+            detail_cost_total=Decimal("7.31"), unattributed_cost=Decimal("7.31"), report_complete=True,
+            promotion_targets=(PromotionTargetEvidence(
+                "HSA", 77, report_day, "profile-1", "campaign-1", "group-1", "ad-1", "", "ASIN-A",
+                identity_valid_for_report=False,
+            ),),
+            promotion_catalog_complete=True,
+        )
+        mappings = [SkuProductMapping("LOCAL-A", (), ("ASIN-A",))]
+        unconfirmed, unconfirmed_details = build_ad_spend_preview(
+            windows_by_type={"HSA": [hsa]}, mappings=mappings, store_sid=77,
+            requested_skus=["LOCAL-A"], start_date=report_day, end_date=report_day,
+        )
+        sku_row = next(row for row in unconfirmed if row.local_sku == "LOCAL-A")
+        group_row = next(row for row in unconfirmed_details if "未归属" in row.report_level)
+        self.assertEqual(sku_row.hsa_cost, "")
+        self.assertEqual(group_row.cost, "7.31")
+        self.assertIn("当前快照", group_row.integrity)
+
+        confirmation = HsaAdGroupSkuMapping(
+            77, "profile-1", "campaign-1", "group-1", "LOCAL-A", report_day, report_day,
         )
         summaries, details = build_ad_spend_preview(
-            windows_by_type={"HSA": [sb]},
-            mappings=[SkuProductMapping("LOCAL-A", (), ("ASIN-A",))],
-            store_sid=77,
-            requested_skus=["LOCAL-A"],
-            start_date=report_day,
-            end_date=report_day,
+            windows_by_type={"HSA": [hsa]}, mappings=mappings, store_sid=77,
+            requested_skus=["LOCAL-A"], start_date=report_day, end_date=report_day,
+            confirmed_hsa_mappings=[confirmation],
         )
         sku_row = next(row for row in summaries if row.local_sku == "LOCAL-A")
-        sb_detail = next(row for row in details if row.ad_type == "HSA" and row.report_level == "商品/分摊明细")
-        self.assertEqual((sku_row.sb_cost, sku_row.sbv_cost), ("", ""))
-        self.assertEqual((sb_detail.local_sku, sb_detail.asin, sb_detail.ad_id), ("", "ASIN-A", "ad-1"))
-        self.assertIn("类型未拆分", sb_detail.integrity)
+        group_row = next(row for row in details if "已归属" in row.report_level)
+        self.assertEqual(sku_row.hsa_cost, "7.31")
+        self.assertEqual(sku_row.confirmed_total, "")
+        self.assertEqual(group_row.local_sku, "LOCAL-A")
+        self.assertIn("运营确认", group_row.integrity)
 
-    def test_preview_automatically_attributes_verified_exclusive_sbv_ad_group(self) -> None:
+    def test_preview_applies_hsa_confirmation_only_within_its_date_range(self) -> None:
         report_day = date(2026, 8, 29)
-        sb = SpAdSpendWindow(
+        hsa = SpAdSpendWindow(
             report_day, report_day,
             (SpCampaignSpend(report_day, "campaign-1", Decimal("7.31"), "profile-1"),),
-            (), (), (), ad_type="SBV",
+            (), (), (), ad_type="HSA",
             ad_group_rows=(SbAdGroupSpend(report_day, "campaign-1", "group-1", Decimal("7.31"), "profile-1"),),
             campaign_cost_total=Decimal("7.31"), detail_cost_total=Decimal("7.31"),
             unattributed_cost=Decimal("7.31"), report_complete=True,
-            promotion_targets=(
-                PromotionTargetEvidence("SBV", 77, report_day, "profile-1", "campaign-1", "group-1", "ad-1", "", "ASIN-A", identity_valid_for_report=True),
-            ),
-            promotion_catalog_complete=True,
+        )
+        confirmation = HsaAdGroupSkuMapping(
+            77, "profile-1", "campaign-1", "group-1", "LOCAL-A",
+            report_day - timedelta(days=1), report_day + timedelta(days=1),
         )
         summaries, details = build_ad_spend_preview(
-            windows_by_type={"SBV": [sb]}, mappings=[SkuProductMapping("LOCAL-A", (), ("ASIN-A",))],
+            windows_by_type={"HSA": [hsa]}, mappings=[SkuProductMapping("LOCAL-A", (), ("ASIN-A",))],
             store_sid=77, requested_skus=["LOCAL-A"], start_date=report_day, end_date=report_day,
+            confirmed_hsa_mappings=[confirmation],
         )
         sku_row = next(row for row in summaries if row.local_sku == "LOCAL-A")
-        group_row = next(row for row in details if row.report_level == "广告组费用")
-        self.assertEqual((sku_row.sb_cost, sku_row.sbv_cost), ("", "7.31"))
+        group_row = next(row for row in details if "已归属" in row.report_level)
+        self.assertEqual(sku_row.hsa_cost, "7.31")
         self.assertEqual(group_row.local_sku, "LOCAL-A")
+
+    def test_hsa_preview_sums_confirmed_groups_without_adding_campaign_totals(self) -> None:
+        report_day = date(2026, 8, 29)
+        campaigns = (
+            SpCampaignSpend(report_day, "campaign-a", Decimal("1.23"), "profile-1"),
+            SpCampaignSpend(report_day, "campaign-b", Decimal("2.34"), "profile-1"),
+            SpCampaignSpend(report_day, "campaign-shared", Decimal("0.56"), "profile-1"),
+        )
+        groups = (
+            SbAdGroupSpend(report_day, "campaign-a", "group-a", Decimal("1.23"), "profile-1"),
+            SbAdGroupSpend(report_day, "campaign-b", "group-b", Decimal("2.34"), "profile-1"),
+            SbAdGroupSpend(report_day, "campaign-shared", "group-shared", Decimal("0.56"), "profile-1"),
+        )
+        hsa = SpAdSpendWindow(
+            report_day, report_day, campaigns, (), (), (), ad_type="HSA", ad_group_rows=groups,
+            campaign_cost_total=Decimal("4.13"), detail_cost_total=Decimal("4.13"),
+            unattributed_cost=Decimal("4.13"), report_complete=True,
+        )
+        confirmations = [
+            HsaAdGroupSkuMapping(77, "profile-1", "campaign-a", "group-a", "LOCAL-A", report_day, report_day),
+            HsaAdGroupSkuMapping(77, "profile-1", "campaign-b", "group-b", "LOCAL-A", report_day, report_day),
+        ]
+        summaries, _details = build_ad_spend_preview(
+            windows_by_type={"HSA": [hsa]}, mappings=[SkuProductMapping("LOCAL-A", (), ("ASIN-A",))],
+            store_sid=77, requested_skus=["LOCAL-A"], start_date=report_day, end_date=report_day,
+            confirmed_hsa_mappings=confirmations,
+        )
+        sku_row = next(row for row in summaries if row.local_sku == "LOCAL-A")
+        unallocated_row = next(row for row in summaries if row.local_sku == "未归属（店铺级）")
+        self.assertEqual(sku_row.hsa_cost, "3.57")
+        self.assertEqual(unallocated_row.hsa_cost, "0.56")
+        self.assertEqual(sku_row.confirmed_total, "")
 
     def test_missing_report_is_not_zero_and_explicit_sku_zero_is_displayed(self) -> None:
         report_day = date(2026, 8, 29)
@@ -1339,10 +1564,10 @@ class AdPreviewTests(unittest.TestCase):
         )
         sku_row, unallocated_row = summaries
         self.assertEqual(sku_row.sp_cost, "0")
-        self.assertIn("SB 查询结果缺失（未知）", sku_row.integrity)
-        self.assertIn("SD 查询结果缺失（未知）", sku_row.integrity)
-        self.assertIn("SB=查询结果缺失", unallocated_row.unattributed_cost)
-        self.assertEqual(unallocated_row.sb_cost, "")
+        self.assertIn("HSA 查询结果缺失（未知，不视为零）", sku_row.integrity)
+        self.assertIn("SD 查询结果缺失（未知，不视为零）", sku_row.integrity)
+        self.assertIn("HSA=查询结果缺失（未知）", unallocated_row.unattributed_cost)
+        self.assertEqual(unallocated_row.hsa_cost, "")
 
     def test_sd_activity_without_historical_product_rows_remains_unknown(self) -> None:
         report_day = date(2026, 8, 29)
@@ -1362,7 +1587,7 @@ class AdPreviewTests(unittest.TestCase):
         )
         sku_row = next(row for row in summaries if row.local_sku == "LOCAL-A")
         self.assertEqual(sku_row.sd_cost, "")
-        self.assertIn("SD 活动报表有 1 条记录，商品报表无记录", sku_row.integrity)
+        self.assertIn("SD 活动报表有记录，商品报表无记录", sku_row.integrity)
         self.assertIn("SKU 花费未知", sku_row.integrity)
 
 
@@ -1484,14 +1709,14 @@ class AdAttributionTests(unittest.TestCase):
         self.assertEqual(result.rows[0].local_sku, "LOCAL-A")
 
         unverified = AdCostEvidence(
-            "SB", 10, first, "profile-1", "sb-campaign", Decimal("7.31"), "", "", "", "ASIN-A",
+            "HSA", 10, first, "profile-1", "hsa-campaign", Decimal("7.31"), "", "", "", "ASIN-A",
             source="verified_asin_allocation", allocation_verified=False,
         )
         blocked = attribute_ad_costs(
             store_sid=10,
             mappings=[AttributionMapping("LOCAL-A", (), ("ASIN-A",))],
             product_costs=[unverified],
-            campaign_costs=[CampaignCostEvidence("SB", 10, first, "profile-1", "sb-campaign", Decimal("7.31"))],
+            campaign_costs=[CampaignCostEvidence("HSA", 10, first, "profile-1", "hsa-campaign", Decimal("7.31"))],
         )
         self.assertFalse(blocked.rows[0].local_sku)
         self.assertIn("来源无效", blocked.rows[0].status)
@@ -1500,22 +1725,22 @@ class AdAttributionTests(unittest.TestCase):
             store_sid=10,
             mappings=[AttributionMapping("LOCAL-A", (), ("ASIN-A",))],
             product_costs=[AdCostEvidence(
-                "SB", 10, first, "profile-1", "sb-campaign", Decimal("7.31"),
+                "HSA", 10, first, "profile-1", "hsa-campaign", Decimal("7.31"),
                 asin="ASIN-A", source="verified_asin_allocation", allocation_verified=True,
             )],
-            campaign_costs=[CampaignCostEvidence("SB", 10, first, "profile-1", "sb-campaign", Decimal("7.31"))],
+            campaign_costs=[CampaignCostEvidence("HSA", 10, first, "profile-1", "hsa-campaign", Decimal("7.31"))],
         )
         self.assertEqual(verified.rows[0].local_sku, "LOCAL-A")
 
     def test_exclusive_ad_group_targets_assign_actual_group_spend_only_with_complete_catalog(self) -> None:
         report_day = date(2026, 8, 29)
-        campaigns = [CampaignCostEvidence("SB", 10, report_day, "profile-1", "campaign-1", Decimal("7.31"))]
+        campaigns = [CampaignCostEvidence("HSA", 10, report_day, "profile-1", "campaign-1", Decimal("7.31"))]
         groups = [
-            AdGroupCostEvidence("SB", 10, report_day, "profile-1", "campaign-1", "group-a", Decimal("7.31")),
+            AdGroupCostEvidence("HSA", 10, report_day, "profile-1", "campaign-1", "group-a", Decimal("7.31")),
         ]
         targets = [
-            PromotionTargetEvidence("SB", 10, report_day, "profile-1", "campaign-1", "group-a", "ad-a", "", "ASIN-A", identity_valid_for_report=True),
-            PromotionTargetEvidence("SB", 10, report_day, "profile-1", "campaign-1", "group-a", "ad-b", "", "ASIN-A2", identity_valid_for_report=True),
+            PromotionTargetEvidence("HSA", 10, report_day, "profile-1", "campaign-1", "group-a", "ad-a", "", "ASIN-A", identity_valid_for_report=True),
+            PromotionTargetEvidence("HSA", 10, report_day, "profile-1", "campaign-1", "group-a", "ad-b", "", "ASIN-A2", identity_valid_for_report=True),
         ]
         result = attribute_exclusive_ad_group_costs(
             store_sid=10,
@@ -1526,7 +1751,7 @@ class AdAttributionTests(unittest.TestCase):
             promotion_catalog_complete=True,
         )
         self.assertEqual(result.rows[0].local_sku, "LOCAL-A")
-        self.assertEqual(result.daily_costs()[("SB", report_day, "local-a")], Decimal("7.31"))
+        self.assertEqual(result.daily_costs()[("HSA", report_day, "local-a")], Decimal("7.31"))
 
         incomplete = attribute_exclusive_ad_group_costs(
             store_sid=10,
@@ -1548,11 +1773,11 @@ class AdAttributionTests(unittest.TestCase):
                 AttributionMapping("LOCAL-B", (), ("ASIN-B",)),
             ],
             promoted_targets=[
-                PromotionTargetEvidence("SB", 10, report_day, "profile-1", "campaign-1", "group-a", asin="ASIN-A", identity_valid_for_report=True),
-                PromotionTargetEvidence("SB", 10, report_day, "profile-1", "campaign-1", "group-a", asin="ASIN-B", identity_valid_for_report=True),
+                PromotionTargetEvidence("HSA", 10, report_day, "profile-1", "campaign-1", "group-a", asin="ASIN-A", identity_valid_for_report=True),
+                PromotionTargetEvidence("HSA", 10, report_day, "profile-1", "campaign-1", "group-a", asin="ASIN-B", identity_valid_for_report=True),
             ],
-            ad_group_costs=[AdGroupCostEvidence("SB", 10, report_day, "profile-1", "campaign-1", "group-a", Decimal("7.31"))],
-            campaign_costs=[CampaignCostEvidence("SB", 10, report_day, "profile-1", "campaign-1", Decimal("7.31"))],
+            ad_group_costs=[AdGroupCostEvidence("HSA", 10, report_day, "profile-1", "campaign-1", "group-a", Decimal("7.31"))],
+            campaign_costs=[CampaignCostEvidence("HSA", 10, report_day, "profile-1", "campaign-1", Decimal("7.31"))],
             promotion_catalog_complete=True,
         )
         self.assertFalse(result.rows[0].local_sku)
@@ -1560,17 +1785,64 @@ class AdAttributionTests(unittest.TestCase):
 
     def test_duplicate_promotion_catalog_rows_block_exclusive_group_assignment(self) -> None:
         report_day = date(2026, 8, 29)
-        target = PromotionTargetEvidence("SB", 10, report_day, "profile-1", "campaign-1", "group-a", "ad-a", "", "ASIN-A", identity_valid_for_report=True)
+        target = PromotionTargetEvidence("HSA", 10, report_day, "profile-1", "campaign-1", "group-a", "ad-a", "", "ASIN-A", identity_valid_for_report=True)
         result = attribute_exclusive_ad_group_costs(
             store_sid=10,
             mappings=[AttributionMapping("LOCAL-A", (), ("ASIN-A",))],
             promoted_targets=[target, target],
-            ad_group_costs=[AdGroupCostEvidence("SB", 10, report_day, "profile-1", "campaign-1", "group-a", Decimal("7.31"))],
-            campaign_costs=[CampaignCostEvidence("SB", 10, report_day, "profile-1", "campaign-1", Decimal("7.31"))],
+            ad_group_costs=[AdGroupCostEvidence("HSA", 10, report_day, "profile-1", "campaign-1", "group-a", Decimal("7.31"))],
+            campaign_costs=[CampaignCostEvidence("HSA", 10, report_day, "profile-1", "campaign-1", Decimal("7.31"))],
             promotion_catalog_complete=True,
         )
         self.assertFalse(result.rows[0].local_sku)
         self.assertIn("重复记录", result.rows[0].status)
+
+    def test_hsa_operator_confirmation_binds_exact_ids_and_effective_dates(self) -> None:
+        report_day = date(2026, 8, 29)
+        confirmation = HsaAdGroupSkuMapping(
+            10, "profile-1", "campaign-1", "group-a", "LOCAL-A",
+            report_day, report_day,
+        )
+        result = attribute_exclusive_ad_group_costs(
+            store_sid=10,
+            mappings=[AttributionMapping("LOCAL-A", (), ("ASIN-A",))],
+            promoted_targets=[
+                PromotionTargetEvidence(
+                    "HSA", 10, report_day, "profile-1", "campaign-1", "group-a",
+                    asin="ASIN-A", identity_valid_for_report=False,
+                )
+            ],
+            ad_group_costs=[AdGroupCostEvidence(
+                "HSA", 10, report_day, "profile-1", "campaign-1", "group-a", Decimal("7.31")
+            )],
+            campaign_costs=[CampaignCostEvidence(
+                "HSA", 10, report_day, "profile-1", "campaign-1", Decimal("7.31")
+            )],
+            promotion_catalog_complete=False,
+            confirmed_mappings=[confirmation],
+        )
+        self.assertEqual(result.rows[0].local_sku, "LOCAL-A")
+        self.assertIn("运营确认", result.rows[0].status)
+        self.assertEqual(result.daily_costs()[("HSA", report_day, "local-a")], Decimal("7.31"))
+
+        outside_range = HsaAdGroupSkuMapping(
+            10, "profile-1", "campaign-1", "group-a", "LOCAL-A",
+            report_day + timedelta(days=1), report_day + timedelta(days=2),
+        )
+        blocked = attribute_exclusive_ad_group_costs(
+            store_sid=10,
+            mappings=[AttributionMapping("LOCAL-A", (), ("ASIN-A",))],
+            promoted_targets=[],
+            ad_group_costs=[AdGroupCostEvidence(
+                "HSA", 10, report_day, "profile-1", "campaign-1", "group-a", Decimal("7.31")
+            )],
+            campaign_costs=[CampaignCostEvidence(
+                "HSA", 10, report_day, "profile-1", "campaign-1", Decimal("7.31")
+            )],
+            promotion_catalog_complete=False,
+            confirmed_mappings=[outside_range],
+        )
+        self.assertFalse(blocked.rows[0].local_sku)
 
 
 class McpClientTests(unittest.TestCase):

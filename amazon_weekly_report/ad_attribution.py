@@ -13,6 +13,8 @@ from datetime import date
 from decimal import Decimal
 from typing import Iterable, Mapping, Sequence
 
+from .hsa_attribution_settings import HsaAdGroupSkuMapping
+
 
 @dataclass(frozen=True)
 class AttributionMapping:
@@ -223,14 +225,14 @@ def attribute_exclusive_ad_group_costs(
     ad_group_costs: Iterable[AdGroupCostEvidence],
     campaign_costs: Iterable[CampaignCostEvidence],
     promotion_catalog_complete: bool,
+    confirmed_mappings: Sequence[HsaAdGroupSkuMapping] = (),
 ) -> AdGroupAttributionResult:
-    """Attribute an ad group's spend only when every promoted item maps uniquely.
+    """Attribute HSA group spend from historical product evidence or confirmation.
 
-    This is suitable for SB or SBV when official, date-valid product-ad data
-    proves complete campaign/ad-group target coverage. The caller must
-    establish subtype and coverage from the official endpoint contract;
-    incomplete or current-only catalogs never trigger a full group-cost
-    assignment.
+    Current HSA creative catalogs are not historical proof. A local,
+    date-scoped operator confirmation may establish a group-to-SKU mapping;
+    otherwise only date-valid, complete product-target evidence can authorize
+    attribution. Campaign costs reconcile group costs and are never added.
     """
     if isinstance(store_sid, bool) or not isinstance(store_sid, int) or store_sid <= 0:
         raise ValueError("store_sid must be a positive integer.")
@@ -308,6 +310,25 @@ def attribute_exclusive_ad_group_costs(
         if len(bindings) > 1:
             duplicate_target_groups.update(binding[0] for binding in bindings)
 
+    confirmed_by_group: dict[tuple[str, str, str, int, date, str], set[str]] = defaultdict(set)
+    for mapping in confirmed_mappings:
+        if mapping.store_sid != store_sid:
+            continue
+        if mapping.valid_through < mapping.valid_from:
+            raise ValueError("HSA 归属确认的有效结束日期早于开始日期。")
+        for group in groups:
+            if (
+                group.store_sid == store_sid
+                and _norm(group.profile_id) == _norm(mapping.profile_id)
+                and _norm(group.campaign_id) == _norm(mapping.campaign_id)
+                and _norm(group.ad_group_id) == _norm(mapping.ad_group_id)
+                and mapping.valid_from <= group.report_date <= mapping.valid_through
+            ):
+                confirmed_by_group[
+                    (group.ad_type.upper(), _norm(group.profile_id), _norm(group.campaign_id), store_sid, group.report_date)
+                    + (_norm(group.ad_group_id),)
+                ].add(mapping.local_sku)
+
     result: list[ExclusiveAdGroupAttribution] = []
     for group in groups:
         if group.store_sid != store_sid:
@@ -320,6 +341,48 @@ def attribute_exclusive_ad_group_costs(
             continue
         if campaign_key not in reconciled:
             result.append(ExclusiveAdGroupAttribution(group, status="活动成本与广告组汇总未核平，阻止归属"))
+            continue
+        confirmation_key = (
+            group.ad_type.upper(), _norm(group.profile_id), _norm(group.campaign_id),
+            store_sid, group.report_date, _norm(group.ad_group_id),
+        )
+        confirmed_owners = confirmed_by_group.get(confirmation_key, set())
+        if len(confirmed_owners) > 1:
+            result.append(ExclusiveAdGroupAttribution(group, status="本地有效期确认记录冲突，阻止归属"))
+            continue
+        if len(confirmed_owners) == 1:
+            confirmed_sku = next(iter(confirmed_owners))
+            # A source explicitly marked historically valid can veto a local
+            # confirmation if it proves a different product. Current snapshots
+            # remain diagnostic and do not override the operator's dated record.
+            historical_targets = [
+                target for target in targets_by_group.get(group_key, ())
+                if target.identity_valid_for_report
+            ]
+            resolved_historical: set[str] = set()
+            historical_error = ""
+            for target in historical_targets:
+                resolved, _matched_by, error = _resolve_identity(
+                    report_day=target.report_date,
+                    seller_sku=target.seller_sku,
+                    asin=target.asin,
+                    msku_owners=msku_owners,
+                    asin_owners=asin_owners,
+                )
+                if error:
+                    historical_error = error
+                    break
+                resolved_historical.add(resolved)
+            if historical_error or (resolved_historical and resolved_historical != {confirmed_sku.casefold()}):
+                result.append(ExclusiveAdGroupAttribution(
+                    group, status=historical_error or "有效期内的历史商品记录与本地确认不一致，阻止归属"
+                ))
+                continue
+            result.append(ExclusiveAdGroupAttribution(
+                group,
+                local_sku=confirmed_sku,
+                status="按运营确认的店铺/Profile/Campaign/Ad Group 与有效期归属；活动总额仅用于核对",
+            ))
             continue
         if not promotion_catalog_complete:
             result.append(ExclusiveAdGroupAttribution(group, status="商品广告目录完整性未核验，不能推定广告组只推广单一 SKU"))
@@ -406,14 +469,14 @@ def attribute_ad_costs(
     seen_ad_ids: dict[tuple[str, int, date, str, str], tuple[tuple[object, ...], int]] = {}
     for index, line in enumerate(lines):
         _validate_cost(line.cost, "product")
-        if line.ad_type.upper() not in {"SP", "SB", "SBV", "SD"}:
+        if line.ad_type.upper() not in {"SP", "HSA", "SD"}:
             invalid_lines.add(index)
             continue
         if line.store_sid != store_sid:
             invalid_lines.add(index)
             continue
         if line.source == "verified_asin_allocation" and (
-            not line.allocation_verified or line.ad_type.upper() not in {"SB", "SBV"}
+            not line.allocation_verified or line.ad_type.upper() != "HSA"
         ):
             invalid_lines.add(index)
             continue

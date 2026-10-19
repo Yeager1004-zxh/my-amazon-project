@@ -364,7 +364,7 @@ def parse_sb_campaign_report_page(
     *,
     report_date: date,
 ) -> tuple[int, list[SpCampaignSpend]]:
-    return _parse_campaign_report_page(payload, report_date=report_date, endpoint="SB 广告活动报表")
+    return _parse_campaign_report_page(payload, report_date=report_date, endpoint="HSA 品牌广告活动报表")
 
 
 def parse_sd_campaign_report_page(
@@ -437,7 +437,7 @@ def parse_sb_product_ads_page(payload: Any) -> tuple[int, list[AdProductCatalogR
             raise LingxingApiError(f"{endpoint}响应字段 asin 必须是非空字符串组成的数组。")
         # video_creatives is an explicit documented field, so it can provide a
         # format candidate without relying on a campaign name. It is still a
-        # current catalog snapshot and does not prove historical SBV identity.
+        # current catalog snapshot and does not prove historical HSA ownership.
         raw_video_creatives = item.get("video_creatives", [])
         if not isinstance(raw_video_creatives, list) or any(not isinstance(entry, dict) for entry in raw_video_creatives):
             raise LingxingApiError(f"{endpoint}响应字段 video_creatives 必须是对象数组。")
@@ -513,7 +513,7 @@ def parse_sb_ad_group_report_page(
     *,
     report_date: date,
 ) -> tuple[int, list[SbAdGroupSpend]]:
-    endpoint = "SB 广告组报表"
+    endpoint = "HSA 品牌广告组报表"
     total, records = _report_page_records(payload, endpoint)
     parsed: list[SbAdGroupSpend] = []
     for item in records:
@@ -1926,21 +1926,27 @@ class LingxingOpenApiClient:
         start_date: date,
         end_date: date,
     ) -> list[SpAdSpendWindow]:
-        """Compare combined HSA campaign/ad-group cost; subtype and SKU are unknown."""
+        """Read combined HSA campaign/ad-group cost; campaign totals only reconcile."""
         if not isinstance(access_token, str) or not access_token.strip():
-            raise LingxingApiError("Access Token 为空，未发送 SB 广告报表查询。")
+            raise LingxingApiError("Access Token 为空，未发送 HSA 品牌广告报表查询。")
         if isinstance(store_sid, bool) or not isinstance(store_sid, int):
-            raise LingxingApiError("SB 广告报表查询必须使用动态店铺 SID。")
+            raise LingxingApiError("HSA 品牌广告报表查询必须使用动态店铺 SID。")
         self._validate_query_range(start_date, end_date)
-        catalog_rows = self.query_sb_product_ads(access_token=access_token, store_sid=store_sid)
-        catalog_complete = True  # The pagination helper returns only after total is fully read.
+        # The creative catalog is a current snapshot, not historical ownership
+        # proof. It is diagnostic only and must not block historical cost reads.
+        try:
+            catalog_rows = self.query_sb_product_ads(access_token=access_token, store_sid=store_sid)
+            catalog_complete = True
+        except LingxingApiError:
+            catalog_rows = ()
+            catalog_complete = False
         windows: list[SpAdSpendWindow] = []
         day_count = (end_date - start_date).days + 1
         for day_offset in range(day_count):
             report_day = start_date + timedelta(days=day_offset)
             campaigns = self._query_ad_report_pages(
                 path=SB_CAMPAIGN_REPORTS_PATH,
-                endpoint_label="SB 广告活动报表",
+                endpoint_label="HSA 品牌广告活动报表",
                 access_token=access_token.strip(),
                 store_sid=store_sid,
                 report_date=report_day,
@@ -1950,7 +1956,7 @@ class LingxingOpenApiClient:
             )
             ad_groups = self._query_ad_report_pages(
                 path=SB_AD_GROUP_REPORTS_PATH,
-                endpoint_label="SB 广告组报表",
+                endpoint_label="HSA 品牌广告组报表",
                 access_token=access_token.strip(),
                 store_sid=store_sid,
                 report_date=report_day,
@@ -1983,15 +1989,14 @@ class LingxingOpenApiClient:
                 product_rows=(),
                 sku_daily_spends=(),
                 discrepancies=tuple(discrepancies),
-                # HSA reports currently combine ordinary Sponsored Brands
-                # and Sponsored Brands Video without an explicit subtype.
+                # HSA groups brand advertising together; subtype does not gate
+                # SKU ownership or cost attribution.
                 ad_type="HSA",
                 ad_group_rows=tuple(ad_groups),
                 campaign_cost_total=campaign_total,
                 detail_cost_total=detail_total,
-                # SB schemas contain no SKU/ASIN key. Reconciled campaign cost
-                # remains unallocated at store level until an official mapping
-                # contract is available.
+                # The preview applies date-scoped operator confirmations to
+                # ad-group rows. Never allocate the activity amount itself.
                 unattributed_cost=campaign_total if report_complete else None,
                 report_complete=report_complete,
                 promotion_targets=tuple(

@@ -12,7 +12,16 @@ from typing import Any
 from openpyxl import load_workbook
 from openpyxl.utils.cell import column_index_from_string
 
+from .ad_attribution import (
+    AdCostEvidence,
+    AdGroupCostEvidence,
+    AttributionMapping,
+    CampaignCostEvidence,
+    attribute_ad_costs,
+    attribute_exclusive_ad_group_costs,
+)
 from .audit import write_validation_log
+from .hsa_attribution_settings import HsaAdGroupSkuMapping
 from .mapping import load_mapping, validate_mapping
 from .source_reader import MappedRows, SourceReadError, read_mapped_table
 from .template_expansion import TemplateExpansionError, ensure_day_rows, write_timeline_rows
@@ -25,7 +34,12 @@ from .template_preparation import (
     prepare_sku_workbook,
 )
 from .timeline import LaunchDay, build_timeline
-from .providers.lingxing_api import MAX_PRODUCT_QUERY_DAYS, SkuDailySalesWindow
+from .providers.lingxing_api import (
+    MAX_PRODUCT_QUERY_DAYS,
+    SpAdSpendWindow,
+    SkuDailySalesWindow,
+    SkuProductMapping,
+)
 
 
 class ReportGenerationError(RuntimeError):
@@ -629,6 +643,180 @@ def _api_sales_report(
     )
 
 
+def _api_ad_spend_report(
+    *,
+    windows_by_type: dict[str, list[SpAdSpendWindow]],
+    mappings: list[SkuProductMapping],
+    confirmed_hsa_mappings: list[HsaAdGroupSkuMapping],
+    skus: list[str],
+    store_sid: int,
+    expected_dates: set[date],
+    query_errors: dict[str, str] | None = None,
+    currency_and_date_basis_verified: bool = False,
+) -> ReportData:
+    """Convert only complete SP + HSA + SD coverage into workbook spend.
+
+    An HSA activity total is never added to group rows. HSA is complete for a
+    date only when every activity is reconciled to its ad groups and every
+    group has a date-valid ownership assignment. SP/SD must reconcile to their
+    product rows. Currency and report-date basis require an explicit verified
+    assertion from the caller; otherwise the formal total stays unavailable.
+    """
+    requested = {sku.casefold(): sku for sku in skus}
+    mapping_rows = [AttributionMapping(item.local_sku, item.seller_skus, item.asins) for item in mappings]
+    indexed: dict[str, dict[date, SpAdSpendWindow]] = {kind: {} for kind in ("SP", "HSA", "SD")}
+    anomalies: list[str] = []
+    for kind in indexed:
+        for window in windows_by_type.get(kind, []):
+            if window.ad_type != kind or window.start_date != window.end_date:
+                anomalies.append(f"{kind} 包含类型错误或非单日报表窗口。")
+                continue
+            if window.start_date in indexed[kind]:
+                anomalies.append(f"{kind} 存在重复报表日期。")
+                continue
+            indexed[kind][window.start_date] = window
+
+    complete_dates: set[date] = set()
+    costs_by_sku_date: dict[str, dict[date, Decimal]] = {key: {} for key in requested}
+    store_totals_by_date: dict[date, Decimal] = {}
+    per_date_notes: dict[date, list[str]] = {}
+    for report_day in sorted(expected_dates):
+        day_notes: list[str] = []
+        day_costs: dict[str, Decimal] = {key: Decimal("0") for key in requested}
+        store_total = Decimal("0")
+        day_complete = currency_and_date_basis_verified
+        if not currency_and_date_basis_verified:
+            day_notes.append("广告币种与站点日期口径尚未完成正式验收。")
+        for kind in ("SP", "HSA", "SD"):
+            window = indexed[kind].get(report_day)
+            if window is None:
+                day_complete = False
+                day_notes.append(f"{kind} 缺少该日期的成功报表窗口；缺失不视为零。")
+                continue
+            if not window.report_complete:
+                day_complete = False
+                day_notes.append(f"{kind} 活动与明细未完整核平。")
+                continue
+            if window.campaign_cost_total is None or window.detail_cost_total is None:
+                day_complete = False
+                day_notes.append(f"{kind} 活动或明细总额缺失。")
+                continue
+            store_total += window.campaign_cost_total
+            if kind == "HSA":
+                if not window.ad_group_rows:
+                    day_complete = False
+                    day_notes.append("HSA 没有可核验的广告组费用行；未将活动总额分配给 SKU。")
+                    continue
+                result = attribute_exclusive_ad_group_costs(
+                    store_sid=store_sid,
+                    mappings=mapping_rows,
+                    promoted_targets=window.promotion_targets,
+                    ad_group_costs=[
+                        AdGroupCostEvidence(
+                            "HSA", store_sid, row.report_date, row.profile_id,
+                            row.campaign_id, row.ad_group_id, row.cost,
+                        )
+                        for row in window.ad_group_rows
+                    ],
+                    campaign_costs=[
+                        CampaignCostEvidence(
+                            "HSA", store_sid, row.report_date, row.profile_id, row.campaign_id, row.cost,
+                        )
+                        for row in window.campaign_rows
+                    ],
+                    promotion_catalog_complete=window.promotion_catalog_complete,
+                    confirmed_mappings=confirmed_hsa_mappings,
+                )
+                if len(result.rows) != len(window.ad_group_rows) or any(not row.local_sku for row in result.rows):
+                    day_complete = False
+                    day_notes.append("HSA 至少有一个广告组未能唯一归属；该日总广告花费保持空白。")
+                for row in result.rows:
+                    key = row.local_sku.casefold()
+                    if key in day_costs:
+                        day_costs[key] += row.evidence.cost
+            else:
+                result = attribute_ad_costs(
+                    store_sid=store_sid,
+                    mappings=mapping_rows,
+                    product_costs=[
+                        AdCostEvidence(
+                            ad_type=kind,
+                            store_sid=store_sid,
+                            report_date=row.report_date,
+                            profile_id=row.profile_id,
+                            campaign_id=row.campaign_id,
+                            ad_group_id=row.ad_group_id,
+                            ad_id=row.ad_id,
+                            seller_sku=row.sku,
+                            asin=row.asin,
+                            cost=row.cost,
+                            source=row.source,
+                            allocation_verified=row.allocation_verified,
+                        )
+                        for row in window.product_rows
+                    ],
+                    campaign_costs=[
+                        CampaignCostEvidence(
+                            kind, store_sid, row.report_date, row.profile_id, row.campaign_id, row.cost,
+                        )
+                        for row in window.campaign_rows
+                    ],
+                )
+                if len(result.rows) != len(window.product_rows) or any(
+                    not row.campaign_reconciled or "冲突" in row.status or "阻止" in row.status
+                    for row in result.rows
+                ):
+                    day_complete = False
+                    day_notes.append(f"{kind} 商品行存在未核平、重复或归属冲突。")
+                for row in result.rows:
+                    if row.local_sku and row.local_sku.casefold() in day_costs:
+                        day_costs[row.local_sku.casefold()] += row.evidence.cost
+                    elif not row.evidence.seller_sku.strip() and not row.evidence.asin.strip():
+                        day_complete = False
+                        day_notes.append(f"{kind} 存在缺少 MSKU/ASIN 的商品费用行。")
+        if day_complete:
+            complete_dates.add(report_day)
+            store_totals_by_date[report_day] = store_total
+            for key, amount in day_costs.items():
+                costs_by_sku_date[key][report_day] = amount
+        per_date_notes[report_day] = day_notes
+
+    full_scope = bool(expected_dates) and complete_dates == expected_dates
+    rows_by_sku_date = {
+        key: {day: {"actual_spend": value} for day, value in values.items()}
+        for key, values in costs_by_sku_date.items()
+    }
+    coverage = {key: set(values) for key, values in costs_by_sku_date.items()}
+    total = sum(store_totals_by_date.values(), Decimal("0")) if store_totals_by_date else None
+    notes = [
+        "广告总额仅在 SP、HSA、SD 同日全量核平、所有 HSA 广告组均已归属且币种/日期口径已验收后写入。",
+    ]
+    if query_errors:
+        notes.extend(f"{kind} 查询失败：{message}" for kind, message in sorted(query_errors.items()))
+    if not currency_and_date_basis_verified:
+        notes.append("API 广告报表未提供统一的币种/站点日期证明；跨类型正式总花费保持空白。")
+    if not full_scope:
+        notes.append("至少一个请求日期的 SP/HSA/SD 覆盖或归属未完成；相关广告总花费保持空白。")
+    for report_day, day_notes in per_date_notes.items():
+        if day_notes:
+            anomalies.extend(f"{report_day.isoformat()}：{note}" for note in day_notes)
+    return ReportData(
+        name="actual_ad_spend",
+        rows_by_sku_date=rows_by_sku_date,
+        coverage=coverage,
+        source_files=[],
+        source_total_spend=total,
+        accepted_total_spend=total,
+        accepted_spend_by_sku_date={
+            key: dict(values) for key, values in costs_by_sku_date.items()
+        },
+        all_skus=set(requested),
+        warnings=notes,
+        anomalies=anomalies,
+        coverage_scope="ALL_AD_TYPES_TOTAL_CONFIRMED" if full_scope else "PARTIAL_OR_UNKNOWN",
+    )
+
+
 def generate_reports(
     *,
     template_path: Path,
@@ -643,6 +831,11 @@ def generate_reports(
     api_sales_windows: list[SkuDailySalesWindow] | None = None,
     api_store_sid: int | None = None,
     api_store_name: str | None = None,
+    api_ad_spend_windows_by_type: dict[str, list[SpAdSpendWindow]] | None = None,
+    api_ad_sku_mappings: list[SkuProductMapping] | None = None,
+    api_hsa_ad_group_mappings: list[HsaAdGroupSkuMapping] | None = None,
+    api_ad_query_errors: dict[str, str] | None = None,
+    api_ad_currency_and_date_basis_verified: bool = False,
 ) -> GenerationResult:
     """Build from explicit file mappings or completed, validated OpenAPI windows."""
     template_path = template_path.expanduser().resolve()
@@ -708,11 +901,24 @@ def generate_reports(
     reports: dict[str, ReportData] = {}
     if api_mode:
         reports["sales"] = _api_sales_report(api_sales_windows or [], skus=skus, store_sid=api_store_sid)
-        reports["actual_ad_spend"] = ReportData(
-            "actual_ad_spend", {}, {}, [],
-            warnings=["本次 OpenAPI 流程尚未接入已核验的广告活动实际花费；相关单元格保持空白。"],
-            anomalies=[], coverage_scope="PARTIAL_OR_UNKNOWN",
-        )
+        if api_ad_spend_windows_by_type is not None and api_ad_sku_mappings is not None:
+            expected_ad_dates = set().union(*reports["sales"].coverage.values())
+            reports["actual_ad_spend"] = _api_ad_spend_report(
+                windows_by_type=api_ad_spend_windows_by_type,
+                mappings=api_ad_sku_mappings,
+                confirmed_hsa_mappings=api_hsa_ad_group_mappings or [],
+                skus=skus,
+                store_sid=api_store_sid,
+                expected_dates=expected_ad_dates,
+                query_errors=api_ad_query_errors,
+                currency_and_date_basis_verified=api_ad_currency_and_date_basis_verified,
+            )
+        else:
+            reports["actual_ad_spend"] = ReportData(
+                "actual_ad_spend", {}, {}, [],
+                warnings=["OpenAPI 未提供完整 SP/HSA/SD 报表数据；广告花费单元格保持空白。"],
+                anomalies=[], coverage_scope="PARTIAL_OR_UNKNOWN",
+            )
     else:
         reports_config = mapping["reports"]
         reports["sales"] = _load_report(data_folder, "sales", reports_config["sales"], required=True)
@@ -962,7 +1168,7 @@ def generate_reports(
             sku_warnings = list(info["warnings"])
             if not ad_total_scope_confirmed:
                 sku_warnings.append(
-                    "广告来源未确认覆盖 SP、SB、SD 全部广告类型；总广告花费和 ACOS 保持空白，不能视为 0。"
+                    "广告来源未确认覆盖 SP、HSA、SD 全部费用；总广告花费和 ACOS 保持空白，不能视为 0。"
                 )
             elif ad_spend_incomplete_dates:
                 sku_warnings.append(
@@ -1031,7 +1237,11 @@ def generate_reports(
                     "store_sid": api_store_sid,
                     "queried_start": api_sales_windows[0].start_date.isoformat(),
                     "queried_end": api_sales_windows[-1].end_date.isoformat(),
-                    "data_status": "sales_only_partial; ad_actual_spend_not_verified",
+                    "data_status": (
+                        "sales_plus_sp_hsa_sd_complete"
+                        if reports["actual_ad_spend"].coverage_scope == "ALL_AD_TYPES_TOTAL_CONFIRMED"
+                        else "sales_generated; ad_total_partial_or_unverified"
+                    ),
                     "d01_status": "manually_confirmed_by_user_for_store_sku_site_date",
                 }
                 if api_mode and api_sales_windows else None

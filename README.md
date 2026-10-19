@@ -1,6 +1,6 @@
 # 亚马逊新品推广周报工具
 
-面向 Windows 10/11 的本地新品推广周报工具。V1.0 数据路线为：领星 OpenAPI 作为主数据接口、官方 MCP 作为辅助查询/交叉核验、领星 Excel/CSV 导入作为应急备用。Windows 动态店铺列表已通过真实验收；用户报告每日销售、订单量和销售额查询与领星后台一致。当前分支支持用户按店铺和 SKU 手动确认并持久化 D01，且 OpenAPI 销售数据可生成模板工作簿；完整工作簿生成仍待 Windows 本地验收。用户已报告 SP 实际花费以及 SD 历史商品报表在指定日期的结果与后台核对一致。此前按普通 SB 研究的 SKU 专属花费已由用户纠正为 SBV 视频广告；HSA 报表未区分普通 SB/SBV，SBV 自动归属仍需历史商品关系和费用口径证据。上述真实验收为用户反馈，仓库未保存原始响应或业务明细。
+面向 Windows 10/11 的本地新品推广周报工具。V1.0 数据路线为：领星 OpenAPI 作为主数据接口、官方 MCP 作为辅助查询/交叉核验、领星 Excel/CSV 导入作为应急备用。Windows 动态店铺列表及每日销售、订单量、销售额已由用户报告真实验收通过；按店铺/SKU 手动确认的 D01 和销售数据可以写入原模板。SP 与部分日期的 SD 商品级实际花费也已由用户报告和后台核对一致。当前开发分支新增统一 HSA 广告组归属确认、预览及 Excel 的完整覆盖门槛；HSA 当前目录不证明历史 SKU 关系，币种/日期口径也尚未通过 Windows 验收，因此广告总花费仍保持空白。真实业务响应和金额不存放在仓库。
 
 V1.0 分阶段任务、模块输入/输出、依赖、测试和验收门槛见 [正式实施清单](docs/V1_IMPLEMENTATION_PLAN.md)。当前版本仅聚焦新品推广周报。
 
@@ -14,12 +14,12 @@ V1.0 分阶段任务、模块输入/输出、依赖、测试和验收门槛见 [
 - 校验日志为 JSONL，记录来源文件名、SKU 的 D01、最新数据覆盖日、销量/销售额/广告花费汇总和异常提示。关闭日期后的实际花费只有在来源提供并映射 `campaign_disabled_at` 时才提示。
 - Windows 本地 MCP 客户端支持 MCP 初始化连接、工具列表分页、工具目录发现，以及按业务 Schema 核验的只读 action 查询。请求带 `X-Mcp-Key`、MCP session 和协议版本；常规工具仍要求 `readOnlyHint=true`。
 - OpenAPI Token 请求使用 multipart/form-data；Access Token 仅在本机内存中按响应明确提供的有效期缓存，并在有效期临近时刷新。未返回可识别有效期的 Token 不缓存。
-- 周报页可使用当前动态选择的店铺 SID，按 local SKU 查询产品表现映射，再按站点自然日读取每日销售额、销量和订单量。点击“领星 OpenAPI 查询并生成”会直接生成销售周报；查询日期按最多 92 天连续分段。每段映射单独核验，任何映射、分页、业务码或限流失败都会停止，不生成部分历史结果。广告总花费在跨 SP、SB、SD 完整性未核验前留空，并在结果及校验日志标记为“部分完成”；销售工作簿不会因 SB 暂缺而被阻止。
+- 周报页可使用当前动态选择的店铺 SID，按 local SKU 查询产品表现映射，再按站点自然日读取每日销售额、销量和订单量。点击“领星 OpenAPI 查询并生成”会读取销售数据及 SP、HSA、SD 广告报表；广告类型请求失败会单独记录，销售仍可生成。广告总花费只有在 SP/HSA/SD 同店铺、同日期的明细完整核平、HSA 广告组均已归属，且币种/日期口径通过验收后才写入；否则花费和 ACOS 留空并在校验日志标记“部分完成”。
 - 每日 API 的无记录指标保持空白；仅显式返回的 `map_value: 0` 显示为零。销量和订单量是不同指标。商品表现返回的 ASIN 候选不会被假设为与 MSKU 一一对应；表格中的 ASIN 只取自相同每日 MSKU 记录。
 - 每日统计字段说明没有单独定义取消订单/退款处理；用户已报告 ex3106 每日销量、订单量和销售额与领星后台一致。D01 固定为用户手动确认，订单列表不再是 V1.0 的 D01 依赖。
-- 新增 `ad_attribution.py` 自动归属层：按 SID、站点日期、profile_id、campaign_id 核平，再用精确 MSKU/ASIN 映射归属商品级成本；MSKU 与 ASIN 冲突、映射重复、活动差异、重复数据和未识别商品分别隔离。SP、SD 仍走已核验的历史商品报表；HSA 活动/广告组费用若不能区分普通 SB 与 SBV，只保留为未分类店铺级金额。`hsaProductAds.video_creatives[].creative_type=VIDEO` 仅显示 SBV 候选，当前目录不证明历史类型或 SKU 归属。SB 分摊接口 Schema 错位，客户端在发送前阻止。活动级 cost 仅作核对基准，不与商品或广告组明细重复相加；未核验的总广告花费不会进入周报。
+- 新增 `ad_attribution.py` 自动归属层：按 SID、站点日期、profile_id、campaign_id 核平，再用精确 MSKU/ASIN 映射归属 SP/SD 商品级成本；HSA 使用活动与广告组级 cost 核对。HSA 不区分普通品牌广告与视频广告。当前创意目录只作诊断；历史 SKU 归属可由运营一次确认并保存 SID、Profile/Campaign/Ad Group、SKU 与有效日期，之后自动复用。共享组、过期映射、成本差异、重复数据和无归属记录均被隔离。活动级 cost 仅作核对基准，不与商品或广告组明细重复相加；未核验的总广告花费不会进入周报。
 - SP/SD 历史商品报表按其自身报表日期提供的 MSKU、ASIN、广告 ID、活动 ID 和 cost 进行 SKU 归属，并按 campaign 核对；SD 历史归属不依赖当前 `sdProductAds` 目录。用户报告若干指定日期的 SD 商品花费已与后台核对一致。若历史报表中的 MSKU 与 ASIN 冲突、多重映射或活动总额未核平，对应行仍未归属。当前费用仍不能单独作为模板总花费，因为 SB 覆盖和跨类型总额完整性尚未通过。
-- `hsaProductAds` 和 `sdProductAds` 的用户提供 Schema 已接入只读当前目录分页查询；SB 顶层 ASIN、SD 的 MSKU/ASIN 与广告 ID 仅用于预览候选及交叉核验，不被误当作历史目录。`sbDivideAsinReports` 的表格与示例字段错位，`spends`/`percent` 数组没有元素结构或金额语义，因此本地在发请求前阻止调用。继续自动归属 SB 所缺资料列在 `docs/AD_ATTRIBUTION_ENGINE.md`。
+- `hsaProductAds` 与 `sdProductAds` 当前目录仅用于诊断，不被误当作历史映射。HSA 归属不依赖 `sbDivideAsinReports`；该接口的 `spends`/`percent` Schema 仍不明确，客户端在发请求前阻止调用。HSA 运营确认规则见 `docs/AD_ATTRIBUTION_ENGINE.md`。
 - 销量预览中可提示所选窗口内最早的明确正销量日，但这不会参与 D01 设置。产品创建日期和订单接口也不会覆盖用户的手动确认。查询日期表示请求已成功执行，不证明空白指标为零，也不证明最近一天已经结算。
 
 模板来自用户上传的《新品推广周报.xlsx》：第 5 行表头，D01–D60 在第 6–65 行，24 列，无公式。样例 SKU 为 ex3107；生成新 SKU 时会清空其样例数据。模板没有“日销售额”列，销售金额会写入校验日志，模板中的“售价”只写来源售价或根据销售额/销量计算的单价，不会把销售金额误填进售价列。原模板没有历史类目、排名、评分、评论数的日期字段，这些值会保持空白，避免把当前快照伪装成历史数据。
@@ -93,7 +93,7 @@ OpenAPI 使用固定官方域名 `https://openapi.lingxing.com`。Token 请求�
 - 用户提供的两个页面没有完整历史首单日期字段/覆盖声明。`product_create_time` 表示商品创建时间，不是首单时间。因此界面只列出本次输入范围内最早的明确正销量日，不会据此填写 D01。
 - 「查询周报」页增加 AsinListNew 单日只读预览：只允许开始/结束日期相同；使用动态店铺 SID、`search_field=local_sku`、`summary_field=sku`，结果展示字段是否缺失、`null` 或明确为零，不写工作簿或日志。返回行没有日期字段，且评分、评论、排名缺少经证明的历史时点，因此这些字段仍不用于历史周报。
 - 增加 AsinListNew 广告费用口径诊断：输入一个 SKU 和连续三天后，串行执行 3 个按日 `summary_field=sku` 请求及中间日 1 个 `summary_field=msku` 请求。显示日期、汇总键、广告费用分项和币种；不把不同维度相加、不写周报或日志。MSKU 记录须经 `price_list` 唯一匹配所选店铺和本地 SKU，否则失败关闭。
-- `sessions_total`、广告订单/销售额、展示/点击/CTR/CVR 与 `spend`、SP/SB/SBV/SD 花费字段均只作为本地单日预览候选。尤其 `shared_ads_sb_cost` 与 `shared_ads_sbv_cost` 尚需核对币种、SKU 级归属及同日领星报表，未完成 Windows 实测前不接入 Excel。完整模板字段映射和接口限制见 [AsinListNew 字段映射表](docs/ASIN_LIST_NEW_FIELD_MAPPING.md)。
+- `sessions_total`、广告订单/销售额、展示/点击/CTR/CVR 与 AsinListNew 的费用字段只作为本地单日诊断候选；它们不替代 HSA/SP/SD 实际活动与明细报表，也不直接进入正式广告总花费。完整模板字段映射和接口限制见 [AsinListNew 字段映射表](docs/ASIN_LIST_NEW_FIELD_MAPPING.md)。
 - 用户提供的 `AsinDailyLists` 字段说明未定义取消/退款状态筛选或销售额净额算法；这些口径必须通过 Windows 与领星同店铺同日期的报表对照确认，完成前预览数字不能进入正式周报。
 - 两个接口均只读。查询金额使用 `Decimal`，请求和响应不写日志或工作簿；错误信息不包含 Token、签名或完整响应。Product Performance 的单店查询间隔按官方说明至少 1 秒。每日统计页面只给出令牌桶容量 5、未给出补充速率；客户端串行执行，收到 HTTP 429 时停止且不自动重发。若响应带整数 `Retry-After`，错误提示会显示建议等待秒数。
 - 合成 HTTP 测试覆盖 POST 签名、参数结构、SKU 映射、站点日期、显式零/缺失、分页及限流停止；这些测试不能证明领星真实业务请求成功。
@@ -120,7 +120,7 @@ OpenAPI 使用固定官方域名 `https://openapi.lingxing.com`。Token 请求�
 1. 更新 `feature/weekly-report-v1` 并启动新版 GUI；确认 OpenAPI 凭证仍由当前电脑的 Windows Credential Manager 提供。
 2. 在“生成周报”页选择已授权的 EX 店铺，输入本地 SKU `ex3114`，将开始日和结束日都设为 `2026-08-29`。
 3. 点击“AsinListNew 单日只读查询”。该按钮使用 `local_sku` 搜索、`sku` 汇总、所选 SID，并请求单日站点日期；不会写 Excel 或校验日志。
-4. 检查业务成功码、返回记录数、`currency_code`，以及 `sessions_total`、广告订单/销售额、曝光、点击、CTR/CVR、评分/评论/排名和 `spend`/SP/SB/SBV/SD 分项。将 `shared_ads_sb_cost` 与 `shared_ads_sbv_cost` 分开核对，不预设值，也不把活动级和商品级费用重复相加。仅当返回币种为 USD 时，才与领星该店铺/商品/日期后台金额比较。
+4. 检查业务成功码、返回记录数、`currency_code`，以及 `sessions_total`、广告订单/销售额、曝光、点击、CTR/CVR、评分/评论/排名和产品表现费用诊断字段。费用字段只用于口径研究；正式广告总花费以 SP/HSA/SD 活动及明细报表核对为准，不重复累计活动与明细金额。
 5. 单独记录广告类型费用是否与同日领星后台一致。当前 UI 的“字段未返回”、`null`、`0` 和没有 SKU 记录分别表示不同状态。历史排名、评分和评论数仍不得回填到过去日期。
 6. 回报本地参数校验、HTTP/业务 code、记录是否返回、币种、哪些字段存在，以及 SB 与后台是否一致；如需脱敏可只反馈“`shared_ads_sb_cost`匹配/不匹配、`shared_ads_sbv_cost`为零/非零/缺失”。不要发送密钥、Token、完整响应或其他 SKU 的业务明细。
 
@@ -143,11 +143,9 @@ OpenAPI 使用固定官方域名 `https://openapi.lingxing.com`。Token 请求�
 5. 检查 D61+、周次、原模板样式，以及 `A2` 推广阶段、`G2` 发货时间、`M` 列日目标销量和已有人工内容。广告预览当前不会写入周报，本阶段生成状态仍为“部分完成”。
 6. 更新已有周报时选择原周报，输出必须是新文件。真实验收只回报每个数据阶段成功/失败、是否与后台一致及脱敏错误，不发送凭证或原始业务明细。
 
-### SP、SB、SD 广告费用预览
+### SP、HSA、SD 广告费用预览
 
-选择店铺和 SKU，输入查询日期后点击“查询 SP / SB / SD 广告费用并预览”。查询按天读取各广告类型的活动报表及商品/广告组报表；广告报表使用 `X-API-VERSION: 2` 和 offset 分页，SB 创意目录按官方 next_token/offset 分页。SP、SD 商品行按报表日的 MSKU 和/或 ASIN 做忽略大小写的精确映射；两项标识指向不同本地 SKU、共享标识非唯一或活动成本不相等时，相关行不会归属。SD 历史 `sdProductAdReports` 是指定日期的商品费用依据，直接使用其 SKU、ASIN、广告 ID、活动 ID 和 cost 做匹配；`sdProductAds` 当前目录只是补充诊断，不会决定历史归属，也不会阻断历史报表查询。广告活动名称和广告归因销售额不参与映射。SB 当前创意目录的 ASIN 和广告组/活动/创意 ID 会显示成候选关系，但接口不提供报表日历史快照，所以 SB 活动费用仍保持未归属。
-
-活动报表 cost 是核对基准；汇总不会把活动 cost 再加到商品/广告组 cost。未归属的 SP、SB、SBV、SD 明细分别显示；HSA 合并活动/广告组费用不能区分普通 SB 与 SBV 时，保留在未分类说明中。官方 Schema 未说明统一 cost 币种与 `report_date` 站点日期对账方式，因此未经完整核验时，广告总花费留空；SBV 类型与历史创意映射仍待官方确认。`sbDivideAsinReports` 由于返回字段结构不可靠，不发送请求或猜测金额。空数据、查询失败、费用差异、冲突映射、未映射和行内明确 cost=0 有不同状态。用户已在 Windows 对 SP 与部分日期的 SD 历史费用进行后台核对；用户已纠正曾作为普通 SB 研究的 SKU 专属花费属于 SBV，但软件尚未自动归属。具体店铺、SKU、日期和金额不记录在仓库。广告预览不写正式周报；销售数据可独立生成周报。详情设计见 [广告自动归属规则](docs/AD_ATTRIBUTION_ENGINE.md)。
+选择店铺和 SKU，输入查询日期后点击“查询 SP / HSA 品牌广告 / SD 花费并预览”。查询按日读取活动报表与商品/广告组报表，广告报表使用 `X-API-VERSION: 2` 和 offset 分页。SP、SD 商品行按报表日 MSKU/ASIN 精确匹配；SD 历史商品报表是日期费用和归属依据，当前目录仅供诊断。HSA 活动总额与广告组明细核平；活动总额不重复累计。当前创意目录不能证明历史推广商品关系，因此在广告组明细中选中对应 HSA 组，点击“确认选中 HSA 广告组归属…”，输入本地 SKU 和有效日期范围。确认保存在 `%APPDATA%\MyAmazonProject\hsa_ad_group_mappings.json`，仅在 SID/Profile/Campaign/Ad Group 与日期均匹配时复用；共享广告组不得确认成单 SKU。未归属金额、报表缺失、查询失败、成本差异和明确零值分别显示。跨类型总花费目前因币种/日期口径未完成 Windows 验收而留空；销售工作簿可独立生成。详情见 [广告自动归属规则](docs/AD_ATTRIBUTION_ENGINE.md)。
 
 ## 配置 Excel/CSV 字段映射
 
@@ -158,7 +156,7 @@ OpenAPI 使用固定官方域名 `https://openapi.lingxing.com`。Token 请求�
 - `source_headers`：源文件的完整列名。CSV 日期若不是 ISO 格式，填写真实日期格式，例如 `%m/%d/%Y`。
 - `actual_ad_spend.source_headers.sku` 必须映射到报表中能唯一对应 SKU 的字段；活动级总花费重复出现在多个 SKU 的报表不得标为 `SKU_LEVEL_CONFIRMED`。
 - 如果还没有广告实际花费导出，可先把 `status` 设为 `SALES_ONLY_READY` 并保留广告花费映射空白。对应花费单元格会留空，日志会标明数据缺失；这不代表花费为 0。
-- 样本数据确认后，有广告实际花费映射的配置才可设为 `READY_FOR_REVIEW`，且 `sku_scope` 必须是 `SKU_LEVEL_CONFIRMED`。若源文件只含已核实的部分广告类型，设置 `coverage_scope=PARTIAL_OR_UNKNOWN`：来源金额保留在本地校验记录中，但模板总广告花费/ACOS 必须空白。只有人工核对源文件对相同日期和 SKU 包含所需全部广告类型（SP、SB、SD，及所需视频广告范围）后，才可设置 `coverage_scope=ALL_AD_TYPES_TOTAL_CONFIRMED`。这是用户对源报表粒度和覆盖范围的确认，不是程序自动推断。
+- 样本数据确认后，有广告实际花费映射的配置才可设为 `READY_FOR_REVIEW`，且 `sku_scope` 必须是 `SKU_LEVEL_CONFIRMED`。若源文件只含部分广告来源，设置 `coverage_scope=PARTIAL_OR_UNKNOWN`：来源金额保留在本地校验记录中，但模板总广告花费/ACOS 必须空白。只有相同日期和 SKU 的 SP、HSA、SD 覆盖、币种与日期口径均经人工核对后，才可设置 `coverage_scope=ALL_AD_TYPES_TOTAL_CONFIRMED`。
 
 CSV 支持 UTF-8、UTF-8 BOM 和 GB18030；XLSX/XLSM 支持明确指定工作表和表头行。旧版 XLS 请先另存为 XLSX。
 
@@ -211,4 +209,4 @@ CSV 支持 UTF-8、UTF-8 BOM 和 GB18030；XLSX/XLSM 支持明确指定工作表
 
 ## 验证范围与待实测项目
 
-`tests/` 使用合成夹具验证 D61 扩行、手动字段保留、店铺/SKU 级 D01 保存、D01 日期变更确认、SP/HSA/SBV/SD 广告费用核对、分页、错误与数据缺失状态、MCP 协议、OpenAPI 请求签名、商品映射、每日查询及 API→Excel 适配。用户报告 Windows 动态店铺列表、每日销售查询以及 SP 和指定日期 SD 历史商品花费真实验收通过；本分支 D01 持久化、完整的 API→Excel Windows 操作、SB/SBV 自动归属和跨类型广告总额仍待验收。广告报表币种、日期时区、SBV 类型与历史推广商品覆盖待确认；广告正式写入、EXE、可信版本清单及第二台 Windows 电脑验收尚未完成。云端模拟测试不代表真实数据验收。
+`tests/` 使用合成夹具验证 D61 扩行、手动字段保留、店铺/SKU 级 D01 保存、HSA 广告组有效期确认、SP/HSA/SD 花费核对、缺失与零值处理、分页、MCP 协议、OpenAPI 请求签名和 API→Excel 适配。用户报告 Windows 动态店铺列表、每日销售查询、SP 和部分日期 SD 商品花费验收通过；新 HSA 广告组归属、币种/日期口径、完整广告总花费写入及 Windows API→Excel 回归仍待验收。EXE、可信版本清单及第二台 Windows 电脑验收尚未完成。云端合成测试不代表真实数据验收。
