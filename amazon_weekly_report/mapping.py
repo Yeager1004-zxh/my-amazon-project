@@ -75,12 +75,11 @@ def validate_mapping(mapping: dict[str, Any]) -> list[str]:
                     "必须先核实原始实际花费记录可唯一对应一个 SKU，禁止按活动或广告组重复分摊"
                 )
             if report.get("coverage_scope", "PARTIAL_OR_UNKNOWN") not in {
-                "PARTIAL_OR_UNKNOWN",
-                "ALL_AD_TYPES_TOTAL_CONFIRMED",
+                "PARTIAL_OR_UNKNOWN", "SP_SD_ONLY_CONFIRMED",
             }:
                 issues.append(
                     "actual_ad_spend.coverage_scope 必须为 PARTIAL_OR_UNKNOWN 或 "
-                    "ALL_AD_TYPES_TOTAL_CONFIRMED"
+                    "SP_SD_ONLY_CONFIRMED"
                 )
 
         patterns = report.get("file_patterns")
@@ -122,6 +121,10 @@ def validate_mapping(mapping: dict[str, Any]) -> list[str]:
             for join_field in ("store", "sku", "date"):
                 if not mapped.get(join_field):
                     issues.append(f"{report_name}.{join_field} 必须配置，才能按店铺/SKU/日期连接数据")
+        if report_name == "ad_performance" and optional.get("coverage_scope", "PARTIAL_OR_UNKNOWN") not in {
+            "PARTIAL_OR_UNKNOWN", "SP_SD_ONLY_CONFIRMED",
+        }:
+            issues.append("ad_performance.coverage_scope 必须为 PARTIAL_OR_UNKNOWN 或 SP_SD_ONLY_CONFIRMED")
         if not isinstance(optional.get("header_row"), int) or optional["header_row"] < 1:
             issues.append(f"{report_name}.header_row 必须是从 1 开始的实际表头行号")
         patterns = optional.get("file_patterns")

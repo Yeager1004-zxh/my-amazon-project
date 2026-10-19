@@ -19,6 +19,9 @@ from .ad_attribution import (
 )
 from .hsa_attribution_settings import HsaAdGroupSkuMapping
 from .providers.lingxing_api import SpAdSpendWindow, SkuProductMapping
+from .statistics_scope import SP_SD_AD_TYPES, SP_SD_ONLY_CONFIRMED
+
+LEGACY_AD_DIAGNOSTIC_SCOPE = "LEGACY_SP_HSA_SD_DIAGNOSTIC"
 
 
 @dataclass(frozen=True)
@@ -164,6 +167,8 @@ def build_ad_spend_preview(
     start_date: date,
     end_date: date,
     confirmed_hsa_mappings: Sequence[HsaAdGroupSkuMapping] = (),
+    scope: str = SP_SD_ONLY_CONFIRMED,
+    currency_and_date_basis_verified: bool = False,
 ) -> tuple[list[AdSpendSummaryPreview], list[AdSpendDetailPreview]]:
     """Build a preview without adding activity, group, or product levels twice.
 
@@ -174,9 +179,11 @@ def build_ad_spend_preview(
     """
     if end_date < start_date:
         raise ValueError("广告预览日期范围无效。")
+    if scope not in {SP_SD_ONLY_CONFIRMED, LEGACY_AD_DIAGNOSTIC_SCOPE}:
+        raise ValueError("广告预览统计范围无效；拒绝调用或汇总未明确配置的广告类型。")
     if isinstance(store_sid, bool) or not isinstance(store_sid, int) or store_sid <= 0:
         raise ValueError("广告预览必须使用所选店铺的有效 SID。")
-    kinds = ("SP", "HSA", "SD")
+    kinds = SP_SD_AD_TYPES if scope == SP_SD_ONLY_CONFIRMED else ("SP", "HSA", "SD")
     by_kind_date: dict[str, dict[date, SpAdSpendWindow]] = {}
     outcomes_by_window: dict[tuple[str, date], _WindowAttribution] = {}
     mapped_costs: dict[tuple[str, date, str], Decimal] = {}
@@ -224,6 +231,51 @@ def build_ad_spend_preview(
                 owners.add(mapping.local_sku)
         return tuple(sorted(owners, key=str.casefold))
 
+    mapping_by_key = {mapping.local_sku.casefold(): mapping for mapping in mappings}
+
+    def sku_scope_is_complete(day: date, sku_key: str) -> bool:
+        if scope != SP_SD_ONLY_CONFIRMED or not currency_and_date_basis_verified:
+            return False
+        mapping = mapping_by_key.get(sku_key)
+        if mapping is None or not (mapping.seller_skus or mapping.asins):
+            return False
+        target_mskus = {value.casefold() for value in mapping.seller_skus}
+        target_asins = {value.casefold() for value in mapping.asins}
+        for kind in SP_SD_AD_TYPES:
+            window = by_kind_date[kind].get(day)
+            if (
+                window is None
+                or not window.report_complete
+                or window.campaign_cost_total is None
+                or window.detail_cost_total is None
+                or window.campaign_cost_total != window.detail_cost_total
+            ):
+                return False
+            outcomes = outcomes_by_window.get((kind, day), _WindowAttribution())
+            if len(outcomes.product_rows) != len(window.product_rows) or any(
+                not attributed.campaign_reconciled
+                or "冲突" in attributed.status
+                or "阻止" in attributed.status
+                for attributed in outcomes.product_rows
+            ):
+                return False
+            for attributed in outcomes.product_rows:
+                evidence = attributed.evidence
+                matches_target = (
+                    evidence.seller_sku.casefold() in target_mskus
+                    or evidence.asin.casefold() in target_asins
+                )
+                if not matches_target:
+                    continue
+                if (
+                    attributed.local_sku.casefold() != sku_key
+                    or not attributed.campaign_reconciled
+                    or "冲突" in attributed.status
+                    or "阻止" in attributed.status
+                ):
+                    return False
+        return True
+
     summaries: list[AdSpendSummaryPreview] = []
     details: list[AdSpendDetailPreview] = []
     day_count = (end_date - start_date).days + 1
@@ -239,15 +291,28 @@ def build_ad_spend_preview(
                 key = (kind, report_day, sku_key)
                 values[kind] = _money(mapped_costs.get(key))
                 states.append(_type_state(kind, day_windows[kind], matched_rows=matched_counts.get(key, 0)))
+            current_scope_complete = sku_scope_is_complete(report_day, sku_key)
+            confirmed_total = ""
+            if current_scope_complete:
+                total_value = sum(
+                    (mapped_costs.get((kind, report_day, sku_key), Decimal("0")) for kind in SP_SD_AD_TYPES),
+                    Decimal("0"),
+                )
+                confirmed_total = _money(total_value)
+                states.append("统计范围 SP+SD 已核平并按商品级费用归属")
+            elif scope == SP_SD_ONLY_CONFIRMED:
+                states.append("SP+SD 任一类型缺失、未核平或币种/日期未确认；合计留空")
             summaries.append(AdSpendSummaryPreview(
                 report_date=day_text,
                 local_sku=local_sku,
                 sp_cost=values["SP"],
-                hsa_cost=values["HSA"],
+                hsa_cost=values.get("HSA", ""),
                 sd_cost=values["SD"],
-                confirmed_total="",
+                confirmed_total=confirmed_total,
                 unattributed_cost="",
-                integrity="；".join(states + ["预览合计留空：跨类型币种/日期口径与完整覆盖尚未共同验收"]),
+                integrity="；".join(
+                    states + (["本版统计口径：SP+SD；SB/SBV 不在 V1.0 统计范围"] if scope == SP_SD_ONLY_CONFIRMED else ["预览合计留空：跨类型币种/日期口径与完整覆盖尚未共同验收"])
+                ),
             ))
 
         unallocated_parts: list[str] = []
@@ -266,7 +331,7 @@ def build_ad_spend_preview(
             report_date=day_text,
             local_sku="未归属（店铺级）",
             sp_cost=unallocated_values["SP"],
-            hsa_cost=unallocated_values["HSA"],
+            hsa_cost=unallocated_values.get("HSA", ""),
             sd_cost=unallocated_values["SD"],
             confirmed_total="",
             unattributed_cost="；".join(unallocated_parts),

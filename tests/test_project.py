@@ -4,6 +4,7 @@ import csv
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -406,7 +407,7 @@ class TemplateAndReportTests(unittest.TestCase):
                     },
                     "actual_ad_spend": {
                         "header_row": 1, "sheet_name": "", "sku_scope": "SKU_LEVEL_CONFIRMED",
-                        "coverage_scope": "ALL_AD_TYPES_TOTAL_CONFIRMED",
+                        "coverage_scope": "SP_SD_ONLY_CONFIRMED",
                         "file_patterns": ["ads.csv"], "date_format": "%Y-%m-%d",
                         "source_headers": {"store": "店铺", "sku": "SKU", "date": "日期", "actual_spend": "实际花费", "campaign_id": "活动ID", "campaign_disabled_at": "关闭日期"},
                     },
@@ -464,7 +465,7 @@ class TemplateAndReportTests(unittest.TestCase):
                     },
                     "actual_ad_spend": {
                         "header_row": 1, "sheet_name": "", "sku_scope": "SKU_LEVEL_CONFIRMED",
-                        "coverage_scope": "ALL_AD_TYPES_TOTAL_CONFIRMED",
+                        "coverage_scope": "SP_SD_ONLY_CONFIRMED",
                         "file_patterns": ["ads.csv"],
                         "source_headers": {"store": "店铺", "sku": "SKU", "date": "日期", "actual_spend": "实际花费", "campaign_id": "活动ID"},
                     },
@@ -493,7 +494,7 @@ class TemplateAndReportTests(unittest.TestCase):
 
 
 class ApiReportGenerationTests(unittest.TestCase):
-    def test_openapi_ad_totals_require_all_three_types_group_ownership_and_basis(self) -> None:
+    def test_openapi_ad_totals_require_complete_sp_and_sd_but_ignore_hsa(self) -> None:
         report_day = date(2026, 8, 29)
         mapping = SkuProductMapping("LOCAL-A", ("MSKU-A",), ("ASIN-A",))
         sp = SpAdSpendWindow(
@@ -529,17 +530,17 @@ class ApiReportGenerationTests(unittest.TestCase):
             mappings=[mapping], confirmed_hsa_mappings=[confirmation], skus=["LOCAL-A"],
             store_sid=10, expected_dates={report_day},
         )
-        unverified = _api_ad_spend_report(**args, currency_and_date_basis_verified=False)
+        unverified = _api_ad_spend_report(**args, currency_and_date_basis_verified=False, currency_code="USD")
         self.assertEqual(unverified.coverage_scope, "PARTIAL_OR_UNKNOWN")
         self.assertEqual(unverified.rows_by_sku_date, {"local-a": {}})
         self.assertTrue(any("币种" in item for item in unverified.warnings or []))
 
-        verified = _api_ad_spend_report(**args, currency_and_date_basis_verified=True)
-        self.assertEqual(verified.coverage_scope, "ALL_AD_TYPES_TOTAL_CONFIRMED")
+        verified = _api_ad_spend_report(**args, currency_and_date_basis_verified=True, currency_code="USD")
+        self.assertEqual(verified.coverage_scope, "SP_SD_ONLY_CONFIRMED")
         self.assertEqual(
-            verified.rows_by_sku_date["local-a"][report_day]["actual_spend"], Decimal("6.00")
+            verified.rows_by_sku_date["local-a"][report_day]["actual_spend"], Decimal("4.00")
         )
-        self.assertEqual(verified.source_total_spend, Decimal("6.00"))
+        self.assertEqual(verified.source_total_spend, Decimal("4.00"))
 
         sales_row = SkuDailySales(
             10, "LOCAL-A", "MSKU-A", "ASIN-A", report_day, "USD", 1, 1, Decimal("10.00")
@@ -566,7 +567,10 @@ class ApiReportGenerationTests(unittest.TestCase):
                 api_ad_currency_and_date_basis_verified=True,
             )
             workbook = load_workbook(result.output_path, data_only=False)
-            self.assertEqual(workbook["LOCAL-A"]["U6"].value, 6)
+            self.assertEqual(workbook["LOCAL-A"]["U6"].value, 4)
+            self.assertEqual(workbook["LOCAL-A"]["U5"].value, "广告花费（SP+SD）\n($)")
+            self.assertIsNone(workbook["LOCAL-A"]["V6"].value)
+            self.assertIsNone(workbook["LOCAL-A"]["X6"].value)
             self.assertEqual(result.sku_results[0].status, "success")
             workbook.close()
 
@@ -582,11 +586,69 @@ class ApiReportGenerationTests(unittest.TestCase):
         )
         incomplete = _api_ad_spend_report(
             **{**args, "windows_by_type": {"SP": [sp], "HSA": [shared_hsa], "SD": [sd]}},
-            currency_and_date_basis_verified=True,
+            currency_and_date_basis_verified=True, currency_code="USD",
         )
-        self.assertEqual(incomplete.coverage_scope, "PARTIAL_OR_UNKNOWN")
-        self.assertEqual(incomplete.rows_by_sku_date, {"local-a": {}})
-        self.assertTrue(any("HSA 至少有一个广告组" in item for item in incomplete.anomalies or []))
+        self.assertEqual(incomplete.coverage_scope, "SP_SD_ONLY_CONFIRMED")
+        self.assertEqual(incomplete.rows_by_sku_date["local-a"][report_day]["actual_spend"], Decimal("4.00"))
+        self.assertFalse(any("HSA" in item for item in incomplete.anomalies or []))
+
+        missing_sd = SpAdSpendWindow(
+            report_day, report_day, (), (), (), (), ad_type="SD", report_complete=False,
+        )
+        blocked = _api_ad_spend_report(
+            **{**args, "windows_by_type": {"SP": [sp], "SD": [missing_sd]}},
+            currency_and_date_basis_verified=True, currency_code="USD",
+        )
+        self.assertEqual(blocked.coverage_scope, "PARTIAL_OR_UNKNOWN")
+        self.assertEqual(blocked.rows_by_sku_date, {"local-a": {}})
+        self.assertTrue(any("SD" in item for item in blocked.anomalies or []))
+
+        next_day = report_day + timedelta(days=1)
+        sp_next = SpAdSpendWindow(
+            next_day, next_day,
+            (SpCampaignSpend(next_day, "sp-campaign", Decimal("1.00"), "profile-1"),),
+            (SpProductAdSpend(
+                next_day, "MSKU-A", "ASIN-A", "sp-ad", "sp-group", "sp-campaign",
+                Decimal("1.00"), "profile-1",
+            ),), (), (), ad_type="SP", campaign_cost_total=Decimal("1.00"),
+            detail_cost_total=Decimal("1.00"), report_complete=True,
+        )
+        two_day_sales = SkuDailySalesWindow(
+            report_day, next_day, (mapping,), (
+                sales_row,
+                SkuDailySales(10, "LOCAL-A", "MSKU-A", "ASIN-A", next_day, "USD", 1, 1, Decimal("10.00")),
+            ),
+        )
+        per_day = _api_ad_spend_report(
+            windows_by_type={"SP": [sp, sp_next], "SD": [sd]},
+            mappings=[mapping], skus=["LOCAL-A"], store_sid=10,
+            expected_dates={report_day, next_day},
+            currency_and_date_basis_verified=True, currency_code="USD",
+        )
+        self.assertEqual(per_day.coverage_scope, "PARTIAL_OR_UNKNOWN")
+        self.assertEqual(
+            per_day.coverage_scope_by_sku_date["local-a"][report_day],
+            "SP_SD_ONLY_CONFIRMED",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            template = root / "template.xlsx"
+            create_template(template)
+            result = generate_reports(
+                template_path=template, data_folder=None, mapping_path=None,
+                skus=["LOCAL-A"], output_path=root / "partial-range.xlsx",
+                d01_dates={"LOCAL-A": report_day}, d01_confirmed=True,
+                api_sales_windows=[two_day_sales], api_store_sid=10,
+                api_store_name="Synthetic Shop",
+                api_ad_spend_windows_by_type={"SP": [sp, sp_next], "SD": [sd]},
+                api_ad_sku_mappings=[mapping],
+                api_ad_currency_and_date_basis_verified=True,
+            )
+            workbook = load_workbook(result.output_path, data_only=False)
+            self.assertEqual(workbook["LOCAL-A"]["U6"].value, 4)
+            self.assertIsNone(workbook["LOCAL-A"]["U7"].value)
+            self.assertEqual(result.sku_results[0].status, "partial")
+            workbook.close()
 
     def test_openapi_sales_generate_template_d61_and_keep_missing_distinct_from_zero(self) -> None:
         start = date(2026, 1, 1)
@@ -634,7 +696,7 @@ class ApiReportGenerationTests(unittest.TestCase):
             )
             self.assertEqual(result.sku_results[0].status, "partial")
             self.assertEqual(result.sku_results[0].days, 62)
-            self.assertTrue(any("未确认覆盖 SP、HSA、SD" in warning for warning in result.sku_results[0].warnings))
+            self.assertTrue(any("SP+SD 统计范围未覆盖整个查询期" in warning for warning in result.sku_results[0].warnings))
             workbook = load_workbook(output, data_only=False)
             sheet = workbook["API-TEST"]
             self.assertEqual(sheet["E6"].value, 0)
@@ -791,7 +853,7 @@ class ApiReportGenerationTests(unittest.TestCase):
             self.assertEqual(d02["ad_spend_coverage_scope"], "PARTIAL_OR_UNKNOWN")
             self.assertIsNone(d02["actual_ad_spend"])
             sku = next(item for item in daily if item.get("record_type") == "sku")
-            self.assertTrue(any("未确认覆盖 SP、HSA、SD" in warning for warning in sku["warnings"]))
+            self.assertTrue(any("SP+SD 统计范围未覆盖整个查询期" in warning for warning in sku["warnings"]))
 
 
 class D01SettingsTests(unittest.TestCase):
@@ -1180,6 +1242,7 @@ class SpAdApiTests(unittest.TestCase):
             windows_by_type={"HSA": windows},
             mappings=[SkuProductMapping("LOCAL-A", (), ("ASIN-A", "ASIN-A2"))],
             store_sid=77, requested_skus=["LOCAL-A"], start_date=report_day, end_date=report_day,
+            scope="LEGACY_SP_HSA_SD_DIAGNOSTIC",
         )
         sku_row = next(row for row in summaries if row.local_sku == "LOCAL-A")
         catalog_row = next(row for row in details if row.report_level.startswith("当前创意目录"))
@@ -1256,6 +1319,7 @@ class SpAdApiTests(unittest.TestCase):
                 access_token="fixture-token", store_sid=987654,
                 mappings=[SkuProductMapping("LOCAL-A", ("MSKU-A",), ("ASINTEST0001",))],
                 start_date=report_day, end_date=report_day,
+                include_catalog=True,
             )
         window = windows[0]
         self.assertEqual([item[0] for item in requests], [SD_CAMPAIGN_REPORTS_PATH, SD_PRODUCT_AD_REPORTS_PATH, SD_PRODUCT_ADS_PATH])
@@ -1267,6 +1331,33 @@ class SpAdApiTests(unittest.TestCase):
         self.assertEqual(window.detail_cost_total, Decimal("3.00"))
         self.assertEqual(window.sku_daily_spends[0].actual_spend, Decimal("2.25"))
         self.assertEqual(window.unattributed_cost, Decimal("0.75"))
+        http.close()
+
+    def test_sd_daily_cost_query_skips_current_catalog_by_default(self) -> None:
+        report_day = date(2026, 10, 10)
+        paths: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            paths.append(request.url.path)
+            row = {"campaign_id": 1, "profile_id": 2, "cost": 1.25, "report_date": report_day.isoformat()}
+            if request.url.path == SD_CAMPAIGN_REPORTS_PATH:
+                return httpx.Response(200, json=self._envelope([row]))
+            product = {
+                "ad_id": 3, "asin": "ASIN-A", "sku": "MSKU-A", "ad_group_id": 4,
+                "profile_id": 2, "campaign_id": 1, "cost": 1.25, "report_date": report_day.isoformat(),
+            }
+            return httpx.Response(200, json=self._envelope([product]))
+
+        http = httpx.Client(transport=httpx.MockTransport(handler))
+        with LingxingOpenApiClient("1234567890123456", "fixture-app-secret", http_client=http) as client:
+            window = client.query_sd_ad_spend_history(
+                access_token="fixture-token", store_sid=77,
+                mappings=[SkuProductMapping("LOCAL-A", ("MSKU-A",), ("ASIN-A",))],
+                start_date=report_day, end_date=report_day,
+            )[0]
+        self.assertEqual(paths, [SD_CAMPAIGN_REPORTS_PATH, SD_PRODUCT_AD_REPORTS_PATH])
+        self.assertTrue(window.report_complete)
+        self.assertEqual(window.sku_daily_spends[0].actual_spend, Decimal("1.25"))
         http.close()
 
     def test_sd_historical_product_rows_attribute_without_catalog_and_block_identity_conflicts(self) -> None:
@@ -1305,6 +1396,7 @@ class SpAdApiTests(unittest.TestCase):
             windows = client.query_sd_ad_spend_history(
                 access_token="fixture-token", store_sid=987654, mappings=mappings,
                 start_date=first_day, end_date=second_day,
+                include_catalog=True,
             )
         self.assertEqual(len(windows), 2)
         self.assertEqual(request_paths, [
@@ -1478,6 +1570,89 @@ class SpAdApiTests(unittest.TestCase):
 
 
 class AdPreviewTests(unittest.TestCase):
+    def test_v1_sp_sd_zero_requires_both_explicit_complete_reports(self) -> None:
+        report_day = date(2026, 8, 29)
+        mapping = SkuProductMapping("LOCAL-A", ("MSKU-A",), ("ASIN-A",))
+
+        def zero_window(kind: str, campaign_id: str, ad_id: str) -> SpAdSpendWindow:
+            return SpAdSpendWindow(
+                report_day, report_day,
+                (SpCampaignSpend(report_day, campaign_id, Decimal("0.00"), "p1"),),
+                (SpProductAdSpend(
+                    report_day, "MSKU-A", "ASIN-A", ad_id, "group", campaign_id,
+                    Decimal("0.00"), "p1",
+                ),), (), (), ad_type=kind, campaign_cost_total=Decimal("0.00"),
+                detail_cost_total=Decimal("0.00"), report_complete=True,
+            )
+
+        sp = zero_window("SP", "sp-campaign", "sp-ad")
+        sd = zero_window("SD", "sd-campaign", "sd-ad")
+        complete, _ = build_ad_spend_preview(
+            windows_by_type={"SP": [sp], "SD": [sd]}, mappings=[mapping], store_sid=10,
+            requested_skus=["LOCAL-A"], start_date=report_day, end_date=report_day,
+            scope="SP_SD_ONLY_CONFIRMED", currency_and_date_basis_verified=True,
+        )
+        self.assertEqual(complete[0].confirmed_total, "0.00")
+
+        missing, _ = build_ad_spend_preview(
+            windows_by_type={"SP": [sp]}, mappings=[mapping], store_sid=10,
+            requested_skus=["LOCAL-A"], start_date=report_day, end_date=report_day,
+            scope="SP_SD_ONLY_CONFIRMED", currency_and_date_basis_verified=True,
+        )
+        self.assertEqual(missing[0].sp_cost, "0.00")
+        self.assertEqual(missing[0].sd_cost, "")
+        self.assertEqual(missing[0].confirmed_total, "")
+
+        cost_mismatch = replace(sd, campaign_cost_total=Decimal("0.01"))
+        unreconciled, _ = build_ad_spend_preview(
+            windows_by_type={"SP": [sp], "SD": [cost_mismatch]}, mappings=[mapping], store_sid=10,
+            requested_skus=["LOCAL-A"], start_date=report_day, end_date=report_day,
+            scope="SP_SD_ONLY_CONFIRMED", currency_and_date_basis_verified=True,
+        )
+        self.assertEqual(unreconciled[0].sp_cost, "0.00")
+        self.assertEqual(unreconciled[0].sd_cost, "0.00")
+        self.assertEqual(unreconciled[0].confirmed_total, "")
+
+    def test_v1_sp_sd_preview_sums_only_two_verified_types_and_ignores_hsa(self) -> None:
+        report_day = date(2026, 8, 29)
+        mapping = SkuProductMapping("LOCAL-A", ("MSKU-A",), ("ASIN-A",))
+        sp = SpAdSpendWindow(
+            report_day, report_day,
+            (SpCampaignSpend(report_day, "sp-campaign", Decimal("1.25"), "p1"),),
+            (SpProductAdSpend(
+                report_day, "MSKU-A", "ASIN-A", "sp-ad", "sp-group", "sp-campaign",
+                Decimal("1.25"), "p1",
+            ),), (), (), ad_type="SP", campaign_cost_total=Decimal("1.25"),
+            detail_cost_total=Decimal("1.25"), report_complete=True,
+        )
+        sd = SpAdSpendWindow(
+            report_day, report_day,
+            (SpCampaignSpend(report_day, "sd-campaign", Decimal("2.75"), "p1"),),
+            (SpProductAdSpend(
+                report_day, "MSKU-A", "ASIN-A", "sd-ad", "sd-group", "sd-campaign",
+                Decimal("2.75"), "p1",
+            ),), (), (), ad_type="SD", campaign_cost_total=Decimal("2.75"),
+            detail_cost_total=Decimal("2.75"), report_complete=True,
+        )
+        hsa = SpAdSpendWindow(
+            report_day, report_day,
+            (SpCampaignSpend(report_day, "hsa-campaign", Decimal("99.00"), "p1"),),
+            (), (), (), ad_type="HSA", campaign_cost_total=Decimal("99.00"),
+            detail_cost_total=Decimal("99.00"), report_complete=True,
+        )
+        summaries, details = build_ad_spend_preview(
+            windows_by_type={"SP": [sp], "SD": [sd], "HSA": [hsa]},
+            mappings=[mapping], requested_skus=["LOCAL-A"], store_sid=10,
+            start_date=report_day, end_date=report_day,
+            scope="SP_SD_ONLY_CONFIRMED", currency_and_date_basis_verified=True,
+        )
+        sku_row, unallocated_row = summaries
+        self.assertEqual((sku_row.sp_cost, sku_row.hsa_cost, sku_row.sd_cost), ("1.25", "", "2.75"))
+        self.assertEqual(sku_row.confirmed_total, "4.00")
+        self.assertEqual(unallocated_row.confirmed_total, "")
+        self.assertEqual({row.ad_type for row in details}, {"SP", "SD"})
+        self.assertIn("SB/SBV 不在 V1.0", sku_row.integrity)
+
     def test_summary_shows_sku_candidates_and_type_separated_unallocated_costs(self) -> None:
         report_day = date(2026, 8, 28)
         mapping = SkuProductMapping("LOCAL-A", ("MSKU-A",), ())
@@ -1515,6 +1690,7 @@ class AdPreviewTests(unittest.TestCase):
             mappings=[mapping], requested_skus=["LOCAL-A"],
             store_sid=1,
             start_date=report_day, end_date=report_day,
+            scope="LEGACY_SP_HSA_SD_DIAGNOSTIC",
         )
         sku_row, unallocated_row = summaries
         self.assertEqual((sku_row.sp_cost, sku_row.hsa_cost, sku_row.sd_cost), ("1.00", "", "2.00"))
@@ -1551,6 +1727,7 @@ class AdPreviewTests(unittest.TestCase):
         unconfirmed, unconfirmed_details = build_ad_spend_preview(
             windows_by_type={"HSA": [hsa]}, mappings=mappings, store_sid=77,
             requested_skus=["LOCAL-A"], start_date=report_day, end_date=report_day,
+            scope="LEGACY_SP_HSA_SD_DIAGNOSTIC",
         )
         sku_row = next(row for row in unconfirmed if row.local_sku == "LOCAL-A")
         group_row = next(row for row in unconfirmed_details if row.report_level == "广告组实际花费（SKU候选）")
@@ -1576,6 +1753,7 @@ class AdPreviewTests(unittest.TestCase):
         auto_summaries, auto_details = build_ad_spend_preview(
             windows_by_type={"HSA": [historical_hsa]}, mappings=mappings, store_sid=77,
             requested_skus=["LOCAL-A"], start_date=report_day, end_date=report_day,
+            scope="LEGACY_SP_HSA_SD_DIAGNOSTIC",
         )
         auto_sku_row = next(row for row in auto_summaries if row.local_sku == "LOCAL-A")
         auto_group_row = next(row for row in auto_details if row.report_level == "广告组实际花费（已归属）")
@@ -1589,6 +1767,7 @@ class AdPreviewTests(unittest.TestCase):
             windows_by_type={"HSA": [hsa]}, mappings=mappings, store_sid=77,
             requested_skus=["LOCAL-A"], start_date=report_day, end_date=report_day,
             confirmed_hsa_mappings=[confirmation],
+            scope="LEGACY_SP_HSA_SD_DIAGNOSTIC",
         )
         sku_row = next(row for row in summaries if row.local_sku == "LOCAL-A")
         group_row = next(row for row in details if "已归属" in row.report_level)
@@ -1615,6 +1794,7 @@ class AdPreviewTests(unittest.TestCase):
             windows_by_type={"HSA": [hsa]}, mappings=[SkuProductMapping("LOCAL-A", (), ("ASIN-A",))],
             store_sid=77, requested_skus=["LOCAL-A"], start_date=report_day, end_date=report_day,
             confirmed_hsa_mappings=[confirmation],
+            scope="LEGACY_SP_HSA_SD_DIAGNOSTIC",
         )
         sku_row = next(row for row in summaries if row.local_sku == "LOCAL-A")
         group_row = next(row for row in details if "已归属" in row.report_level)
@@ -1646,6 +1826,7 @@ class AdPreviewTests(unittest.TestCase):
             windows_by_type={"HSA": [hsa]}, mappings=[SkuProductMapping("LOCAL-A", (), ("ASIN-A",))],
             store_sid=77, requested_skus=["LOCAL-A"], start_date=report_day, end_date=report_day,
             confirmed_hsa_mappings=confirmations,
+            scope="LEGACY_SP_HSA_SD_DIAGNOSTIC",
         )
         sku_row = next(row for row in summaries if row.local_sku == "LOCAL-A")
         unallocated_row = next(row for row in summaries if row.local_sku == "未归属（店铺级）")
@@ -1667,6 +1848,7 @@ class AdPreviewTests(unittest.TestCase):
             windows_by_type={"SP": [zero]}, mappings=[SkuProductMapping("LOCAL-A", ("MSKU-A",), ())],
             store_sid=1,
             requested_skus=["LOCAL-A"], start_date=report_day, end_date=report_day,
+            scope="LEGACY_SP_HSA_SD_DIAGNOSTIC",
         )
         sku_row, unallocated_row = summaries
         self.assertEqual(sku_row.sp_cost, "0")
@@ -1690,6 +1872,7 @@ class AdPreviewTests(unittest.TestCase):
         summaries, _details = build_ad_spend_preview(
             windows_by_type={"SD": [sd]}, mappings=[SkuProductMapping("LOCAL-A", ("MSKU-A",), ("ASIN-A",))],
             store_sid=77, requested_skus=["LOCAL-A"], start_date=report_day, end_date=report_day,
+            scope="LEGACY_SP_HSA_SD_DIAGNOSTIC",
         )
         sku_row = next(row for row in summaries if row.local_sku == "LOCAL-A")
         self.assertEqual(sku_row.sd_cost, "")

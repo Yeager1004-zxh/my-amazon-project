@@ -1763,8 +1763,9 @@ class LingxingOpenApiClient:
         mappings: list[SkuProductMapping],
         start_date: date,
         end_date: date,
+        include_catalog: bool = False,
     ) -> list[SpAdSpendWindow]:
-        """Read historical SD product costs first; current catalog is diagnostic only."""
+        """Read historical SD product costs; current catalog is optional diagnostic context."""
         windows = self._query_product_ad_spend_history(
             ad_type="SD",
             campaign_path=SD_CAMPAIGN_REPORTS_PATH,
@@ -1781,11 +1782,10 @@ class LingxingOpenApiClient:
         # campaign/ad identifiers and cost. A present-day catalog is not required
         # to attribute that date-scoped row. Keep the catalog as best-effort
         # preview context only, after the historical query has succeeded.
+        if not include_catalog:
+            return windows
         try:
-            catalog_rows = self.query_sd_product_ads(
-                access_token=access_token,
-                store_sid=store_sid,
-            )
+            catalog_rows = self.query_sd_product_ads(access_token=access_token, store_sid=store_sid)
         except LingxingApiError:
             catalog_rows = []
         return [replace(window, product_catalog_rows=catalog_rows) for window in windows]

@@ -21,8 +21,6 @@ from .d01_settings import D01SettingsError, get_d01_dates, save_d01_dates
 from .hsa_attribution_settings import (
     HsaAdGroupSkuMapping,
     HsaAttributionSettingsError,
-    load_hsa_ad_group_mappings,
-    record_hsa_creative_catalog_snapshot,
     save_hsa_ad_group_mappings,
 )
 from .local_settings import LocalSettingsError, load_settings, save_settings, validate_mcp_endpoint
@@ -49,6 +47,7 @@ from .providers.lingxing_api import (
     SkuProductMapping,
 )
 from .report_generation import ReportGenerationError, generate_reports, read_existing_d01_dates
+from .statistics_scope import SP_SD_ONLY_CONFIRMED
 
 
 _PRODUCT_PERFORMANCE_FIELD_LABELS = {
@@ -305,30 +304,24 @@ class WeeklyReportApp(tk.Tk):
         query_box.rowconfigure(3, weight=1)
         self.report_ad_query_button = ttk.Button(
             query_box,
-            text="查询 SP / HSA 品牌广告 / SD 花费并预览",
+            text="查询 SP + SD 广告花费并预览",
             command=self._query_report_ad_data,
         )
         self.report_ad_query_button.grid(row=5, column=0, sticky="w", padx=4, pady=(8, 3))
-        self.hsa_candidate_review_button = ttk.Button(
-            query_box,
-            text="批量核验 HSA SKU 候选…",
-            command=self._review_hsa_candidates,
-        )
-        self.hsa_candidate_review_button.grid(row=5, column=1, sticky="w", padx=4, pady=(8, 3))
-        ttk.Label(query_box, text="广告费用汇总与明细（只读预览；仅完整核验后才进入周报）").grid(
-            row=5, column=2, columnspan=3, sticky="w", padx=4, pady=(8, 3)
+        ttk.Label(query_box, text="V1.0 统计范围：广告花费（SP+SD）；不含普通 SB / SBV。完整核验后才写入周报。").grid(
+            row=5, column=1, columnspan=4, sticky="w", padx=4, pady=(8, 3)
         )
         self.report_ad_status = tk.StringVar(
-            value="SP/SD 使用历史商品报表；HSA 将品牌广告活动/广告组作为统一费用来源。"
+            value="SP 和 SD 均按历史商品报表归属 SKU；活动级花费仅用于核对。"
         )
         ttk.Label(query_box, textvariable=self.report_ad_status, wraplength=900).grid(
             row=6, column=0, columnspan=5, sticky="w", padx=4, pady=(0, 3)
         )
-        ttk.Label(query_box, text="按日期及 SKU 汇总；HSA 活动费仅用于核对，广告组费用只计一次。未归属金额保持单列。", wraplength=900).grid(
+        ttk.Label(query_box, text="按站点日期及 SKU 汇总；SP+SD 商品级费用各计一次，活动报表仅核对。缺失、失败、未归属和明确零值分别显示。预览不查询每日销售币种，因此合计暂留空；正式生成会用同店铺币种核验。", wraplength=900).grid(
             row=7, column=0, columnspan=5, sticky="w", padx=4, pady=(2, 2)
         )
         ad_summary_columns = (
-            "report_date", "local_sku", "sp_cost", "hsa_cost", "sd_cost",
+            "report_date", "local_sku", "sp_cost", "sd_cost",
             "confirmed_total", "unattributed_cost", "integrity",
         )
         self.report_ad_summary_tree = ttk.Treeview(
@@ -338,9 +331,8 @@ class WeeklyReportApp(tk.Tk):
             ("report_date", "报表日期", 95),
             ("local_sku", "本地 SKU / 范围", 155),
             ("sp_cost", "SP 实际花费", 100),
-            ("hsa_cost", "HSA 品牌广告花费", 130),
             ("sd_cost", "SD 实际花费", 100),
-            ("confirmed_total", "已确认归属合计", 115),
+            ("confirmed_total", "已核验花费（SP+SD）", 145),
             ("unattributed_cost", "未归属花费", 300),
             ("integrity", "完整性 / 核对状态", 420),
         ):
@@ -989,13 +981,7 @@ class WeeklyReportApp(tk.Tk):
         for tree in (self.report_ad_summary_tree, self.report_ad_detail_tree):
             for item_id in tree.get_children():
                 tree.delete(item_id)
-        try:
-            confirmed_hsa_mappings = load_hsa_ad_group_mappings()
-        except HsaAttributionSettingsError as exc:
-            messagebox.showerror("HSA 归属确认设置错误", str(exc))
-            return
-        self.report_ad_status.set("正在读取 SP、HSA 和 SD 报表并逐日核对；查询失败时费用保持未知……")
-        self._invalidate_hsa_candidate_review()
+        self.report_ad_status.set("正在读取 SP 和 SD 商品报表并逐日核对；SB/SBV 不在 V1.0 统计范围……")
 
         def query() -> dict[str, Any]:
             with LingxingOpenApiClient(app_id, app_secret) as client:
@@ -1016,61 +1002,40 @@ class WeeklyReportApp(tk.Tk):
                 if missing:
                     raise LingxingApiError("以下 SKU 没有可用于广告识别的 MSKU/ASIN 映射：" + ", ".join(missing))
                 selected_mappings = [by_sku[sku.casefold()] for sku in local_skus]
-                windows_by_type = {
-                    "SP": client.query_sp_ad_spend_history(
-                        access_token=token_result.token,
-                        store_sid=seller.sid,
-                        mappings=selected_mappings,
-                        start_date=start_date,
-                        end_date=end_date,
-                    ),
-                    "HSA": client.query_sb_ad_spend_history(
-                        access_token=token_result.token,
-                        store_sid=seller.sid,
-                        start_date=start_date,
-                        end_date=end_date,
-                    ),
-                    "SD": client.query_sd_ad_spend_history(
-                        access_token=token_result.token,
-                        store_sid=seller.sid,
-                        mappings=selected_mappings,
-                        start_date=start_date,
-                        end_date=end_date,
-                    ),
-                }
-            hsa_snapshot_count = 0
-            hsa_snapshot_warning = ""
-            hsa_windows = windows_by_type.get("HSA", [])
-            if hsa_windows and hsa_windows[0].product_catalog_rows:
-                try:
-                    _snapshot_path, hsa_snapshot_count = record_hsa_creative_catalog_snapshot(
-                        seller.sid,
-                        hsa_windows[0].product_catalog_rows,
-                        observed_at=hsa_windows[0].product_catalog_observed_at,
-                    )
-                except HsaAttributionSettingsError:
-                    hsa_snapshot_warning = "本机未能保存本次 HSA 关系快照；历史归属仍不会从目录推断。"
+                windows_by_type: dict[str, list[Any]] = {"SP": [], "SD": []}
+                errors: dict[str, str] = {}
+                for kind, query_method in (
+                    ("SP", client.query_sp_ad_spend_history),
+                    ("SD", client.query_sd_ad_spend_history),
+                ):
+                    try:
+                        windows_by_type[kind] = query_method(
+                            access_token=token_result.token,
+                            store_sid=seller.sid,
+                            mappings=selected_mappings,
+                            start_date=start_date,
+                            end_date=end_date,
+                            **({"include_catalog": False} if kind == "SD" else {}),
+                        )
+                    except LingxingApiError as exc:
+                        errors[kind] = f"查询失败：{exc}"
             return {
                 "_ad_windows_by_type": windows_by_type,
                 "_ad_mappings": mappings,
+                "_ad_query_errors": errors,
                 "_ad_store_sid": seller.sid,
                 "_ad_requested_skus": local_skus,
                 "_ad_store_name": seller.name,
                 "_ad_start": start_date,
                 "_ad_end": end_date,
-                "_ad_review_context": (
-                    seller.sid,
-                    tuple(sorted(sku.casefold() for sku in local_skus)),
-                    start_date,
-                    end_date,
-                ),
-                "_confirmed_hsa_mappings": confirmed_hsa_mappings,
-                "_hsa_snapshot_count": hsa_snapshot_count,
-                "_hsa_snapshot_warning": hsa_snapshot_warning,
-                "message": "SP、HSA、SD 广告费用预览查询完成；未完整核验的金额不会写入周报。",
+                # This preview does not query the daily sales endpoint for a
+                # currency check. Keep component costs visible, but do not
+                # present a combined amount without currency/date evidence.
+                "_ad_currency_and_date_basis_verified": False,
+                "message": "SP+SD 广告费用预览查询完成；缺少同店铺币种核验时合计保持空白。",
             }
 
-        self._start_task(query, self.report_ad_status, "SP、HSA、SD 广告费用查询完成。")
+        self._start_task(query, self.report_ad_status, "SP+SD 广告费用查询完成。")
 
     def _review_hsa_candidates(self) -> None:
         """Review all unique current-catalog candidates in one date-scoped batch."""
@@ -1229,51 +1194,15 @@ class WeeklyReportApp(tk.Tk):
             requested_skus=result["_ad_requested_skus"],
             start_date=result["_ad_start"],
             end_date=result["_ad_end"],
-            confirmed_hsa_mappings=result["_confirmed_hsa_mappings"],
+            scope=SP_SD_ONLY_CONFIRMED,
+            currency_and_date_basis_verified=result["_ad_currency_and_date_basis_verified"],
         )
-        candidate_groups: dict[tuple[str, str, str], dict[str, Any]] = {}
-        conflicted_groups: set[tuple[str, str, str]] = set()
-        for row in details:
-            if (
-                row.ad_type != "HSA"
-                or row.report_level != "广告组实际花费（SKU候选）"
-                or not row.candidate_resolution_complete
-                or len(row.candidate_local_skus) != 1
-            ):
-                continue
-            key = (row.profile_id.casefold(), row.campaign_id.casefold(), row.ad_group_id.casefold())
-            candidate = candidate_groups.get(key)
-            if candidate is None:
-                candidate_groups[key] = {
-                    "profile_id": row.profile_id,
-                    "campaign_id": row.campaign_id,
-                    "ad_group_id": row.ad_group_id,
-                    "local_sku": row.candidate_local_skus[0],
-                    "creative_ids": set(filter(None, row.ad_creative_id.split(", "))),
-                    "asins": set(filter(None, row.asin.split(", "))),
-                    "query_dates": {row.report_date},
-                }
-            elif candidate["local_sku"].casefold() != row.candidate_local_skus[0].casefold():
-                conflicted_groups.add(key)
-            else:
-                candidate["creative_ids"].update(filter(None, row.ad_creative_id.split(", ")))
-                candidate["asins"].update(filter(None, row.asin.split(", ")))
-                candidate["query_dates"].add(row.report_date)
-        self._pending_hsa_candidates = tuple(
-            {
-                **candidate,
-                "creative_ids": tuple(sorted(candidate["creative_ids"], key=str.casefold)),
-                "asins": tuple(sorted(candidate["asins"], key=str.casefold)),
-                "query_dates": tuple(sorted(candidate["query_dates"])),
-            }
-            for key, candidate in candidate_groups.items()
-            if key not in conflicted_groups
-        )
-        self._pending_hsa_candidate_context = result.get("_ad_review_context")
+        self._pending_hsa_candidates = ()
+        self._pending_hsa_candidate_context = None
         for row in summaries:
             self.report_ad_summary_tree.insert(
                 "", "end", values=(
-                    row.report_date, row.local_sku, row.sp_cost, row.hsa_cost, row.sd_cost,
+                    row.report_date, row.local_sku, row.sp_cost, row.sd_cost,
                     row.confirmed_total, row.unattributed_cost, row.integrity,
                 )
             )
@@ -1289,61 +1218,33 @@ class WeeklyReportApp(tk.Tk):
         windows_by_type = result["_ad_windows_by_type"]
         complete_by_type = {
             kind: sum(1 for window in windows_by_type[kind] if window.report_complete)
-            for kind in ("SP", "HSA", "SD")
+            for kind in ("SP", "SD")
         }
         discrepancies = {
             kind: sum(len(window.discrepancies) for window in windows_by_type[kind])
-            for kind in ("SP", "HSA", "SD")
-        }
-        catalog_counts = {
-            kind: (len(windows_by_type[kind][0].product_catalog_rows) if windows_by_type[kind] else 0)
-            for kind in ("HSA", "SD")
+            for kind in ("SP", "SD")
         }
         report_row_counts = {
             "SP": (
                 sum(len(window.campaign_rows) for window in windows_by_type["SP"]),
                 sum(len(window.product_rows) for window in windows_by_type["SP"]),
             ),
-            "HSA": (
-                sum(len(window.campaign_rows) for window in windows_by_type["HSA"]),
-                sum(len(window.ad_group_rows) for window in windows_by_type["HSA"]),
-            ),
             "SD": (
                 sum(len(window.campaign_rows) for window in windows_by_type["SD"]),
                 sum(len(window.product_rows) for window in windows_by_type["SD"]),
             ),
         }
-        hsa_attributed_rows = [
-            row for row in details
-            if row.ad_type == "HSA" and row.report_level == "广告组实际花费（已归属）"
-        ]
-        auto_attributed_rows = [row for row in hsa_attributed_rows if "自动归属" in row.integrity]
-        confirmed_attributed_rows = [row for row in hsa_attributed_rows if "运营确认" in row.integrity]
-        hsa_attributed_amount = sum((Decimal(row.cost) for row in hsa_attributed_rows), Decimal("0"))
-        hsa_unallocated_rows = [
-            row for row in summaries
-            if row.local_sku == "未归属（店铺级）" and row.hsa_cost != ""
-        ]
-        hsa_unknown_days = sum(
-            1 for row in summaries
-            if row.local_sku == "未归属（店铺级）" and row.hsa_cost == ""
-        )
-        hsa_unallocated_amount = sum((Decimal(row.hsa_cost) for row in hsa_unallocated_rows), Decimal("0"))
+        errors = result.get("_ad_query_errors", {})
+        error_text = "；".join(f"{kind}：{message}" for kind, message in sorted(errors.items()))
         self.report_ad_status.set(
             f"店铺 {result['_ad_store_name']}：{result['_ad_start'].isoformat()} 至 "
-            f"{result['_ad_end'].isoformat()}（报表日期）。已核平日期数 SP/HSA/SD="
-            f"{complete_by_type['SP']}/{complete_by_type['HSA']}/{complete_by_type['SD']}；"
-            f"差异 campaign 数 SP/HSA/SD={discrepancies['SP']}/{discrepancies['HSA']}/{discrepancies['SD']}。"
+            f"{result['_ad_end'].isoformat()}（报表日期）。SP/SD 已核平日期数="
+            f"{complete_by_type['SP']}/{complete_by_type['SD']}；"
+            f"差异 campaign 数 SP/SD={discrepancies['SP']}/{discrepancies['SD']}。"
             f"接口成功返回的活动/明细行数 SP={report_row_counts['SP'][0]}/{report_row_counts['SP'][1]}、"
-            f"HSA={report_row_counts['HSA'][0]}/{report_row_counts['HSA'][1]}、"
             f"SD={report_row_counts['SD'][0]}/{report_row_counts['SD'][1]}。"
-            f"SP/SD 按历史商品报表中的 MSKU/ASIN 精确标识预览；HSA 当前创意目录 {catalog_counts['HSA']} 条仅用于定位，SD 当前商品目录 {catalog_counts['SD']} 条仅供对照。"
-            "HSA 不区分普通品牌广告与视频品牌广告；广告组需有日期有效的本地确认或可信历史商品证据才会归属，活动费用只用于核对。"
-            f"当前目录与 SKU 映射得到 {len(self._pending_hsa_candidates)} 个唯一候选广告组；已记录关系快照 {result.get('_hsa_snapshot_count', 0)} 条，快照间隔不视为历史连续证明。"
-            f"HSA 已归属 {len(hsa_attributed_rows)} 个组日（自动 {len(auto_attributed_rows)}、本地确认 {len(confirmed_attributed_rows)}），合计 {hsa_attributed_amount}；"
-            f"未归属已核明金额 {hsa_unallocated_amount}，另有 {hsa_unknown_days} 个日期金额未知。"
-            f"{result.get('_hsa_snapshot_warning', '')}"
-            "表中 HSA 未归属额显示未能映射到 SKU 的广告组花费；跨类型合计在币种/日期口径与完整覆盖共同核验前保持空白。"
+            "商品报表中的 MSKU/ASIN 精确匹配 SKU；活动级金额仅用于核对，不重复相加。普通 SB/SBV 不属于 V1.0 范围。"
+            f"{error_text}"
         )
 
     def _apply_daily_sales_preview(self, result: dict[str, Any]) -> None:
@@ -1454,7 +1355,6 @@ class WeeklyReportApp(tk.Tk):
         self.product_performance_query_button.configure(state="disabled")
         self.product_performance_cost_diagnostic_button.configure(state="disabled")
         self.report_ad_query_button.configure(state="disabled")
-        self.hsa_candidate_review_button.configure(state="disabled")
         self.progress.start(10)
         status_var.set("处理中…")
 
@@ -1515,7 +1415,7 @@ class WeeklyReportApp(tk.Tk):
                 else:
                     status_var, error = payload
                     if status_var is self.report_ad_status:
-                        status_var.set("广告查询失败；SP/HSA/SD 花费均保持未知，不作为零值或正式周报数据。")
+                        status_var.set("广告查询失败；SP+SD 花费保持未知，不作为零值或正式周报数据。")
                     elif status_var is self.product_performance_status:
                         status_var.set("AsinListNew 查询失败；没有数据写入周报或日志。")
                     else:
@@ -1533,7 +1433,6 @@ class WeeklyReportApp(tk.Tk):
             self.product_performance_query_button.configure(state="normal")
             self.product_performance_cost_diagnostic_button.configure(state="normal")
             self.report_ad_query_button.configure(state="normal")
-            self.hsa_candidate_review_button.configure(state="normal")
         self.after(150, self._poll_events)
 
     def _show_mcp_result(self, value: Any) -> None:
@@ -2060,12 +1959,6 @@ class WeeklyReportApp(tk.Tk):
         except CredentialStoreError as exc:
             messagebox.showerror("OpenAPI 配置错误", str(exc))
             return
-        try:
-            confirmed_hsa_mappings = list(load_hsa_ad_group_mappings())
-        except HsaAttributionSettingsError as exc:
-            messagebox.showerror("HSA 归属确认设置错误", str(exc))
-            return
-
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         output_path = output_dir / f"新品推广周报_OpenAPI_{timestamp}.xlsx"
         template_path = Path(self.template_var.get())
@@ -2095,11 +1988,10 @@ class WeeklyReportApp(tk.Tk):
                     )
                     for key, values in aliases_by_sku.items()
                 ]
-                ad_windows: dict[str, list[Any]] = {"SP": [], "HSA": [], "SD": []}
+                ad_windows: dict[str, list[Any]] = {"SP": [], "SD": []}
                 ad_errors: dict[str, str] = {}
                 for kind, query_method in (
                     ("SP", client.query_sp_ad_spend_history),
-                    ("HSA", client.query_sb_ad_spend_history),
                     ("SD", client.query_sd_ad_spend_history),
                 ):
                     try:
@@ -2109,24 +2001,21 @@ class WeeklyReportApp(tk.Tk):
                             "start_date": query_start,
                             "end_date": query_end,
                         }
-                        if kind in {"SP", "SD"}:
-                            arguments["mappings"] = ad_mappings
+                        arguments["mappings"] = ad_mappings
+                        if kind == "SD":
+                            arguments["include_catalog"] = False
                         ad_windows[kind] = query_method(**arguments)
                     except LingxingApiError as exc:
                         # Keep sales generation available, but carry a visible
                         # failure state so missing ad data can never become zero.
                         ad_errors[kind] = f"查询失败：{exc}"
-                hsa_snapshot_count = 0
-                hsa_snapshot_warning = ""
-                if ad_windows["HSA"] and ad_windows["HSA"][0].product_catalog_rows:
-                    try:
-                        _snapshot_path, hsa_snapshot_count = record_hsa_creative_catalog_snapshot(
-                            seller.sid,
-                            ad_windows["HSA"][0].product_catalog_rows,
-                            observed_at=ad_windows["HSA"][0].product_catalog_observed_at,
-                        )
-                    except HsaAttributionSettingsError:
-                        hsa_snapshot_warning = "；HSA 关系快照未能保存在本机"
+                sales_currency_codes = {
+                    row.currency_code.strip().upper()
+                    for sales_window in windows
+                    for row in sales_window.rows
+                    if row.sid == seller.sid and row.currency_code.strip()
+                }
+                ad_currency_basis_verified = len(sales_currency_codes) == 1
             result = generate_reports(
                 template_path=template_path,
                 data_folder=None,
@@ -2142,21 +2031,19 @@ class WeeklyReportApp(tk.Tk):
                 api_store_name=seller.name,
                 api_ad_spend_windows_by_type=ad_windows,
                 api_ad_sku_mappings=ad_mappings,
-                api_hsa_ad_group_mappings=confirmed_hsa_mappings,
                 api_ad_query_errors=ad_errors,
-                # The ad report schemas contain no currency field and the
-                # cross-type date/currency basis has not yet been certified.
-                api_ad_currency_and_date_basis_verified=False,
+                # Ads APIs have no currency field; use the unique currency from
+                # the same selected SID's daily sales response as the store currency.
+                api_ad_currency_and_date_basis_verified=ad_currency_basis_verified,
             )
             complete = sum(item.status == "success" for item in result.sku_results)
             partial = sum(item.status == "partial" for item in result.sku_results)
             failed = sum(item.status == "failed" for item in result.sku_results)
             state = "部分完成" if partial or failed else "完成"
             message = (
-                f"{state}：完整 {complete} 个、仅销售数据 {partial} 个、失败 {failed} 个。\n"
+                f"{state}：完整 {complete} 个、部分数据 {partial} 个、失败 {failed} 个。\n"
                 f"查询日期：{query_start.isoformat()} 至 {query_end.isoformat()}（站点日期，按不超过 92 天分段）\n"
-                f"已查询 SP/HSA/SD 报表并核对活动与明细；未达到完整归属、币种及日期口径验收条件的广告花费保持空白。\n"
-                f"本次记录 HSA 创意关系快照 {hsa_snapshot_count} 条；快照间隔不代表历史关系连续。{hsa_snapshot_warning}\n"
+                f"广告统计范围：SP+SD。两类报表分别按商品行与活动总额核对；任一类型失败、缺失、未归属、币种不唯一或未核平的日期，广告花费保持空白。\n"
                 f"周报：{result.output_path}\n校验日志：{result.audit_path}"
             )
             return {"message": message, "output": str(result.output_path)}
